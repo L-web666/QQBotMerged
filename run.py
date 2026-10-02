@@ -23,10 +23,20 @@ import time
 
 
 def _bootstrap_paths():
-    """把程序根目录加入搜索路径，并切换工作目录（保证 config.json / data/ 定位正确）。"""
-    base = os.path.dirname(os.path.abspath(__file__))
-    if base not in sys.path:
-        sys.path.insert(0, base)
+    """把程序根目录加入搜索路径，并切换工作目录（保证 config.json / data/ 定位正确）。
+
+    打包成 exe 后：代码与内置资源在 PyInstaller 的解包目录（`sys._MEIPASS`），
+    而 `config.json` / `data/` / `plugins/` 要写在 **exe 旁边**，所以工作目录切到 exe 所在目录。
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+        for item in (getattr(sys, "_MEIPASS", ""), base):
+            if item and item not in sys.path:
+                sys.path.insert(0, item)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+        if base not in sys.path:
+            sys.path.insert(0, base)
     try:
         os.chdir(base)
     except OSError:

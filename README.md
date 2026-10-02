@@ -24,7 +24,8 @@
 8. [测试与自检](#八测试与自检)
 9. [常见问题](#九常见问题)
 10. [打包分发](#十打包分发)
-11. [用 Git 上传到 GitHub](#十一用-git-上传到-github)
+11. [打包成 exe（Windows 可执行文件）](#十一打包成-exewindows-可执行文件)
+12. [用 Git 上传到 GitHub](#十二用-git-上传到-github)
 
 ---
 
@@ -98,6 +99,7 @@ python tests/simulate_message.py --type group --text "你好"   # 注入模拟�
 ```
 QQBotMerged/
 ├── run.py                     # 启动入口（单实例保护 + 网页服务）
+├── build_exe.py / build_exe.bat  # 打包成 Windows exe（PyInstaller）
 ├── start.bat / start.sh       # 依赖检查 + 崩溃自动重启
 ├── requirements.txt           # flask / requests / websocket-client
 ├── config.json                # 首次运行自动生成（含全部配置，默认不进 Git）
@@ -357,7 +359,76 @@ python run.py          # 或双击 start.bat
 
 ---
 
-## 十一、用 Git 上传到 GitHub
+## 十一、打包成 exe（Windows 可执行文件）
+
+用 **PyInstaller** 把程序打成免安装的 Windows 可执行文件，对方电脑**不需要装 Python**。
+
+### 1. 准备（只做一次）
+
+```powershell
+python -m pip install pyinstaller     # 本项目已用 6.22.0 实测通过
+```
+
+### 2. 一键打包
+
+**最简单**：双击项目里的 **`build_exe.bat`**，按提示选 1（单文件）或 2（文件夹版）。
+
+**或者用命令行**：
+
+```powershell
+cd C:\Users\L\Desktop\DeepSeek\QQBotMerged
+python build_exe.py --onefile     # 单文件 exe（默认）→ dist\QQBotMerged.exe
+python build_exe.py --onedir      # 文件夹版        → dist\QQBotMerged\QQBotMerged.exe
+python build_exe.py --clean-only  # 只清理 build\ 与 dist\
+python build_exe.py --icon icon.ico   # 想换图标就放一个 .ico
+```
+
+实测结果（本机 Python 3.14.7 + PyInstaller 6.22.0）：
+
+| 方式 | 产物 | 体积 | 特点 |
+|---|---|---|---|
+| 单文件 `--onefile` | `dist\QQBotMerged.exe` | **19.2 MB** | 只有一个文件，最好分发；首次启动多花 2~4 秒解包 |
+| 文件夹版 `--onedir` | `dist\QQBotMerged\`（exe 7.4 MB + `_internal\`） | 整个文件夹约 25 MB | **启动更快**，长期挂机推荐；整个文件夹一起拷 |
+
+### 3. 怎么用
+
+1. 把 exe（文件夹版的整个文件夹）放到一个**可写的目录**里，例如 `D:\QQBotMerged\`；
+2. 双击运行 —— 首次运行会在 exe **旁边**自动生成：
+   - `config.json`：配置（含 AppID/AppSecret/AI Key），网页后台里改；
+   - `data\`：消息库、留存媒体、日志、上下文；
+   - `plugins\`：会自动释放 4 个内置示例插件（骰子 / 签到 / 示例 / Ollama）；
+3. 浏览器打开 <http://127.0.0.1:8666/>，到「设置」里填自己的机器人信息即可。
+
+> 命令行参数和源码版完全一样：`QQBotMerged.exe --check`、`--port 9000`、`--no-bots`。
+
+### 4. 已验证的行为
+
+打包后我逐项跑过：
+
+- `QQBotMerged.exe --check` → 退出码 **0**（配置 17 分组 / 107 项、4 个插件、路由全部就绪）；
+- `QQBotMerged.exe --no-bots --port 8770` → `/health`、`/`（内置模板）、
+  `/static/css/app.css`、`/static/js/chat.js` 全部 **HTTP 200**（前端资源确实打进了 exe）；
+- 首次运行在 exe 旁边生成了 `config.json`、`data/`、`plugins/`（内置插件自动释放）；
+- 网页「关闭程序」能正常退出，不留残留进程。
+
+### 5. 注意事项
+
+- **必须放在可写目录**：程序要在旁边写 `data/`，放只读目录 / 光盘里会启动失败；
+- **杀毒软件 / SmartScreen 可能误报**（PyInstaller 单文件 exe 的通病）：选「更多信息 → 仍要运行」；
+  想少点误报就用**文件夹版**，或自己加个 `--icon`；
+- **控制台窗口不要关**：关掉窗口 = 关闭程序；不想看日志可以用 `--noconsole` 打包，但出问题就看不到报错；
+- **端口与单实例**：默认 `127.0.0.1:8666`，同一台机器只允许跑一个实例（锁机制与源码版一致）；
+  换端口：`QQBotMerged.exe --port 9000`；
+- **想改前端不用重新打包**：在 exe 旁边放一个 `web\` 目录（含 `templates\`、`static\`），
+  程序会优先用外部的；`plugins\` 同理，插件随便加；
+- **跨机器**：exe 里带的是打包那台机器的 Python 运行时，Windows 之间可以直接拷；
+  目标机器如果是 ARM 或 32 位，需要在那台机器上用源码重新打包；
+- 打包脚本会自动排除 `data/`（不会把你的聊天记录/密钥打进去）；
+  `dist\README.md` 会自动复制一份说明文件。
+
+---
+
+## 十二、用 Git 上传到 GitHub
 
 ### 0. 准备
 
