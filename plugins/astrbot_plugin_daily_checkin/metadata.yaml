@@ -1,0 +1,9 @@
+name: astrbot_plugin_daily_checkin
+display_name: 每日签到
+desc: /签到 领积分（今日第几个）、/积分 /查询 查询、/抽奖 趣味抽奖（奖项概率可配置）
+version: 6.1.0
+author: L-web666
+short_desc: 每日签到领积分，连签加成与趣味抽奖
+astrbot_version: ">=4.0.0"
+support_platforms:
+  - qq_official

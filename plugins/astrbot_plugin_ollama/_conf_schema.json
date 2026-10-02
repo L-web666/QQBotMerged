@@ -1,0 +1,56 @@
+{
+  "host": {
+    "description": "Ollama 服务地址",
+    "type": "string",
+    "default": "http://127.0.0.1:11434",
+    "hint": "可只写 11434 或 127.0.0.1:11434，插件会自动补全"
+  },
+  "model": {
+    "description": "使用的模型名",
+    "type": "string",
+    "default": "qwen2.5",
+    "hint": "先在本机执行 ollama list 查看已有模型"
+  },
+  "think": {
+    "description": "是否让思考型模型先思考再回答",
+    "type": "string",
+    "default": "false",
+    "options": ["false", "true", "none"],
+    "hint": "false=关闭（推荐）；true=开启；none=请求不带该参数"
+  },
+  "history": {
+    "description": "每个用户/群记住最近几轮对话",
+    "type": "int",
+    "default": 6,
+    "hint": "0=不记忆，建议 0~10"
+  },
+  "timeout": {
+    "description": "单次请求超时时间（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "CPU 跑大模型可调大，如 600"
+  },
+  "force_takeover": {
+    "description": "是否强制接管所有普通消息",
+    "type": "bool",
+    "default": false,
+    "hint": "false（推荐）=内置 AI 可用时让给内置 AI，仅在它不可用时才用本地 Ollama；true=所有普通消息都由本地 Ollama 回答"
+  },
+  "max_sessions": {
+    "description": "最多同时记住多少个会话",
+    "type": "int",
+    "default": 200,
+    "hint": "0=不限制；超出后丢弃最久未使用的会话"
+  },
+  "temperature": {
+    "description": "回答随机度（0~1）",
+    "type": "float",
+    "default": 0.7,
+    "hint": "越小越稳定，越大越发散"
+  },
+  "system_prompt": {
+    "description": "系统提示词（人设）",
+    "type": "text",
+    "default": "你是一个乐于助人的 AI 助手，请用简洁清晰的中文回答问题。"
+  }
+}

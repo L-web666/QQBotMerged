@@ -1,0 +1,16 @@
+# 运行时数据与本地配置（不要提交到版本库）
+config.json
+config配置说明文件.txt
+data/
+*.pyc
+__pycache__/
+*.log
+.venv/
+venv/
+*.tmp
+
+# 打包产物与个人笔记
+*.zip
+dist/
+build/
+*.bak

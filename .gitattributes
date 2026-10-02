@@ -1,0 +1,12 @@
+# 统一换行符，避免 Windows 上提交后 Linux/服务器拉下来跑不了
+* text=auto
+*.py   text eol=lf
+*.sh   text eol=lf
+*.js   text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.bat  text eol=crlf
