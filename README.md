@@ -396,22 +396,44 @@ python build_exe.py --icon icon.ico   # 想换图标就放一个 .ico
 2. 双击运行 —— 首次运行会在 exe **旁边**自动生成：
    - `config.json`：配置（含 AppID/AppSecret/AI Key），网页后台里改；
    - `data\`：消息库、留存媒体、日志、上下文；
-   - `plugins\`：会自动释放 4 个内置示例插件（骰子 / 签到 / 示例 / Ollama）；
+   - `plugins\`：**空目录**，插件由你自己放进去（见下一节）；
 3. 浏览器打开 <http://127.0.0.1:8666/>，到「设置」里填自己的机器人信息即可。
 
 > 命令行参数和源码版完全一样：`QQBotMerged.exe --check`、`--port 9000`、`--no-bots`。
 
-### 4. 已验证的行为
+### 4. 插件要自己加（exe 不附带任何插件）
+
+打包出来的 exe **不含插件、也不会自动释放插件**，`plugins\` 一直是空的，等你放东西：
+
+1. 从插件来源（AstrBot 插件市场 / 作者提供的压缩包 / 本仓库源码里的 `plugins\`）拿到插件目录；
+2. 把整个插件目录复制到 exe 旁边的 `plugins\` 下，结构必须是：
+
+   ```
+   plugins\
+   └── astrbot_plugin_xxx\
+       ├── metadata.yaml      ← 必需
+       ├── main.py            ← 必需
+       ├── _conf_schema.json  ← 可选（插件配置项定义）
+       └── requirements.txt   ← 可选（插件自己的依赖，装了才生效）
+   ```
+
+3. 网页「插件管理」→ 点右上角「丢弃修改并重载」；加载失败时页面会直接写明原因
+   （缺文件、语法错误、没有处理器、少依赖等）。
+
+> 想用仓库里自带的 3 个示例插件（骰子 / 签到 / Ollama），把源码目录 `QQBotMerged\plugins\`
+> 下的对应文件夹拷到 exe 旁边的 `plugins\` 里就行 —— 它们在**源码**里有，只是**不随 exe 打包**。
+
+### 5. 已验证的行为
 
 打包后我逐项跑过：
 
-- `QQBotMerged.exe --check` → 退出码 **0**（配置 17 分组 / 107 项、4 个插件、路由全部就绪）；
+- `QQBotMerged.exe --check` → 退出码 **0**（配置 17 分组 / 107 项、路由全部就绪）；
 - `QQBotMerged.exe --no-bots --port 8770` → `/health`、`/`（内置模板）、
   `/static/css/app.css`、`/static/js/chat.js` 全部 **HTTP 200**（前端资源确实打进了 exe）；
-- 首次运行在 exe 旁边生成了 `config.json`、`data/`、`plugins/`（内置插件自动释放）；
+- 首次运行在 exe 旁边生成了 `config.json`、`data/` 与**空的** `plugins/`（不释放任何插件）；
 - 网页「关闭程序」能正常退出，不留残留进程。
 
-### 5. 注意事项
+### 6. 注意事项
 
 - **必须放在可写目录**：程序要在旁边写 `data/`，放只读目录 / 光盘里会启动失败；
 - **杀毒软件 / SmartScreen 可能误报**（PyInstaller 单文件 exe 的通病）：选「更多信息 → 仍要运行」；
@@ -423,8 +445,8 @@ python build_exe.py --icon icon.ico   # 想换图标就放一个 .ico
   程序会优先用外部的；`plugins\` 同理，插件随便加；
 - **跨机器**：exe 里带的是打包那台机器的 Python 运行时，Windows 之间可以直接拷；
   目标机器如果是 ARM 或 32 位，需要在那台机器上用源码重新打包；
-- 打包脚本会自动排除 `data/`（不会把你的聊天记录/密钥打进去）；
-  `dist\README.md` 会自动复制一份说明文件。
+- 打包脚本会自动排除 `data/`（不会把你的聊天记录/密钥打进去），也**不打包 `plugins/`**
+  （插件由使用者自行添加）；`dist\README.md` 会自动复制一份说明文件。
 
 ---
 

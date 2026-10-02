@@ -3,12 +3,12 @@
 
 打包（exe）后的约定：
 - **程序根目录** = exe 所在目录（`config.json`、`data/`、`plugins/` 都放这里，用户看得见、能改）；
-- **资源目录** = 打进 exe 内部的那份（`sys._MEIPASS`，含 web/ 与示例插件）；
-- 前端资源优先用 exe 旁边的 `web/`（想改样式/脚本就直接改），没有才用 exe 内置的那份。
+- **资源目录** = 打进 exe 内部的那份（`sys._MEIPASS`，只有前端 `web/`）；
+- 前端资源优先用 exe 旁边的 `web/`（想改样式/脚本就直接改），没有才用 exe 内置的那份；
+- **插件不随 exe 附带**：`plugins/` 只会被创建成空目录，插件由用户自己放进去。
 """
 
 import os
-import shutil
 import sys
 
 
@@ -55,45 +55,16 @@ TEMPLATE_DIR = resource_path("web", "templates")
 
 
 def ensure_dirs():
-    """创建运行所需目录（幂等），并把内置的示例插件释放到 plugins/。"""
+    """创建运行所需目录（幂等）。
+
+    `plugins/` 只会被建成**空目录**：插件由用户自己放进 `plugins/<插件名>/`，
+    程序不附带、也不自动释放任何插件。
+    """
     for path in (DATA_DIR, LOG_DIR, MEDIA_DIR, UPLOAD_DIR, PLUGIN_DIR):
         try:
             os.makedirs(path, exist_ok=True)
         except OSError:
             pass
-    try:
-        seed_default_plugins()
-    except OSError:
-        pass
-
-
-def seed_default_plugins() -> int:
-    """首次运行时，把打进 exe 的示例插件复制到 exe 旁边的 plugins/（已存在的不动）。
-
-    返回复制的插件个数（开发环境或没有内置插件时返回 0）。
-    """
-    if not is_frozen():
-        return 0
-    source = os.path.join(RESOURCE_DIR, "plugins")
-    target = PLUGIN_DIR
-    if not os.path.isdir(source) or os.path.abspath(source) == os.path.abspath(target):
-        return 0
-    copied = 0
-    try:
-        names = sorted(os.listdir(source))
-    except OSError:
-        return 0
-    for name in names:
-        src = os.path.join(source, name)
-        dst = os.path.join(target, name)
-        if not os.path.isdir(src) or os.path.exists(dst):
-            continue
-        try:
-            shutil.copytree(src, dst)
-            copied += 1
-        except OSError:
-            continue
-    return copied
 
 
 def rel(path: str) -> str:

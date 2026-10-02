@@ -14,7 +14,9 @@
     ├── QQBotMerged.exe     ← 双击即用（网页后台在 exe 旁边生成 config.json / data/ / plugins/）
     └── README.md           ← 说明文件（脚本自动复制）
 
-- `web/`（前端模板、CSS、JS）和示例插件会被打进 exe；首次运行会把示例插件释放到 exe 旁边的 `plugins/`；
+- 只把前端（`web/` 模板、CSS、JS）打进 exe；
+- **插件不随 exe 附带**：首次运行只会在 exe 旁边创建**空**的 `plugins/` 目录，
+  插件由用户自己放进去（`plugins/<插件名>/metadata.yaml + main.py`）；
 - `config.json`、`data/`、`plugins/` 都在 exe 旁边，方便修改与备份；
 - 想改前端就不用重新打包：在 exe 旁边放一个 `web/` 目录即可（优先使用外部的）。
 """
@@ -79,9 +81,8 @@ def main() -> int:
         "--onefile" if onefile else "--onedir",
         "--console",                      # 机器人后台要看日志，保留控制台
         "--noupx",                        # 不用 UPX，避免杀软误报
-        # 打进 exe 的资源：前端 + 示例插件（首次运行释放到 exe 旁边的 plugins/）
+        # 打进 exe 的资源：只有前端（插件由用户自己放进 plugins/，不打进 exe）
         "--add-data", f"{os.path.join(BASE, 'web')}{sep}web",
-        "--add-data", f"{os.path.join(BASE, 'plugins')}{sep}plugins",
         # 这两个库的导入方式比较动态，显式声明更稳
         "--collect-submodules", "websocket",
         "--collect-submodules", "flask",
@@ -133,9 +134,11 @@ def main() -> int:
         print(f"  大小：{size_mb:.1f} MB")
     if onefile:
         print("  用法：把 exe 放到一个**可写目录**（如新建的文件夹）里双击运行，")
-        print("        首次运行会在它旁边生成 config.json / data/ / plugins/。")
+        print("        首次运行会在它旁边生成 config.json / data/ 和空的 plugins/。")
+        print("        插件请自行放进 plugins/<插件名>/（metadata.yaml + main.py）。")
     else:
         print("  用法：整个 dist/%s 文件夹一起拷走，双击里面的 %s.exe 运行。" % (APP_NAME, APP_NAME))
+        print("        插件请自行放进 exe 旁边的 plugins/<插件名>/。")
     print("=" * 66)
     return 0
 
