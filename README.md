@@ -23,6 +23,9 @@
 7. [数据、备份与云同步](#七数据备份与云同步)
 8. [测试与自检](#八测试与自检)
 9. [常见问题](#九常见问题)
+10. [打包分发](#十打包分发)
+11. [打包成 exe（Windows 可执行文件）](#十一打包成-exewindows-可执行文件)
+12. [用 Git 上传到 GitHub](#十二用-git-上传到-github)
 
 ---
 
@@ -96,6 +99,7 @@ python tests/simulate_message.py --type group --text "你好"   # 注入模拟�
 ```
 QQBotMerged/
 ├── run.py                     # 启动入口（单实例保护 + 网页服务）
+├── build_exe.py / build_exe.bat  # 打包成 Windows exe（PyInstaller）
 ├── start.bat / start.sh       # 依赖检查 + 崩溃自动重启
 ├── requirements.txt           # flask / requests / websocket-client
 ├── config.json                # 首次运行自动生成（含全部配置，默认不进 Git）
@@ -304,7 +308,242 @@ QQ 官方限制：文件 200MB、图片 20MB；超过 4MB 会自动改用官方�
 
 ---
 
+## 十、打包分发
+
+### 1. 该打包什么
+
+**必须**：`run.py`、`core/`、`web/`、`plugins/`、`requirements.txt`、`start.bat`、`start.sh`、`README.md`
+**不要**：`data/`（聊天记录、日志、媒体，很大）、`config.json`（含 AppSecret / API Key）、
+`__pycache__/`、`*.log`
+
+### 2. Windows 一键打包（干净副本，已实测可用）
+
+用 `robocopy` 只拷贝需要的文件、直接排除 `data/`、`config.json`、`__pycache__` 等，
+**程序正在运行也能打包**（不会碰到被占用的数据库文件）：
+
+```powershell
+cd C:\Users\L\Desktop\DeepSeek
+$src = "C:\Users\L\Desktop\DeepSeek\QQBotMerged"
+$tmp = "$env:TEMP\QQBotMerged-pack"
+$zip = "C:\Users\L\Desktop\DeepSeek\QQBotMerged-$(Get-Date -Format yyyyMMdd).zip"
+
+Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+robocopy $src $tmp /E /XD data __pycache__ .git .venv /XF config.json "config配置说明文件.txt" *.log *.zip /NFL /NDL /NJH /NJS
+Compress-Archive -Path "$tmp\*" -DestinationPath $zip -Force
+"已生成：$zip（$([math]::Round((Get-Item $zip).Length/1KB,1)) KB）"
+```
+
+> `robocopy` 退出码 0~7 都表示成功（1 = 正常复制了文件），不用当报错。
+
+打出来的包里只有代码：`run.py`、`core/`、`web/`、`plugins/`、`tests/`、`README.md`、
+`requirements.txt`、`start.bat`、`start.sh`、`.gitignore`（约 340 KB，56 个文件），
+**不含** `config.json`（密钥）与 `data/`（聊天记录、媒体、日志）。
+
+别人拿到后：
+
+```bash
+pip install -r requirements.txt
+python run.py          # 或双击 start.bat
+```
+
+然后到自己电脑上打开 <http://127.0.0.1:8666/> 填自己的 AppID/AppSecret 与 AI Key 即可。
+
+### 3. 自己换设备（要保留数据）
+
+先**关掉程序**，然后整目录复制（`data/` 和 `config.json` 一起带上），到新设备后删掉这几个运行痕迹：
+`data/merged.lockdir`、`data/merged.lock`、`data/merged.pid`、`data/instance.json`，
+再 `pip install -r requirements.txt` 后启动即可。注意 `config.json` 里有密钥，别外发。
+
+> 只想留下聊天记录的话，备份 `data/messages.db`（以及同目录的 `-wal`、`-shm`）就够；
+> 运行中复制不保险，先关程序再复制。
+
+---
+
+## 十一、打包成 exe（Windows 可执行文件）
+
+用 **PyInstaller** 把程序打成免安装的 Windows 可执行文件，对方电脑**不需要装 Python**。
+
+### 1. 准备（只做一次）
+
+```powershell
+python -m pip install pyinstaller     # 本项目已用 6.22.0 实测通过
+```
+
+### 2. 一键打包
+
+**最简单**：双击项目里的 **`build_exe.bat`**，按提示选 1（单文件）或 2（文件夹版）。
+
+**或者用命令行**：
+
+```powershell
+cd C:\Users\L\Desktop\DeepSeek\QQBotMerged
+python build_exe.py --onefile     # 单文件 exe（默认）→ dist\QQBotMerged.exe
+python build_exe.py --onedir      # 文件夹版        → dist\QQBotMerged\QQBotMerged.exe
+python build_exe.py --clean-only  # 只清理 build\ 与 dist\
+python build_exe.py --icon icon.ico   # 想换图标就放一个 .ico
+```
+
+实测结果（本机 Python 3.14.7 + PyInstaller 6.22.0）：
+
+| 方式 | 产物 | 体积 | 特点 |
+|---|---|---|---|
+| 单文件 `--onefile` | `dist\QQBotMerged.exe` | **19.2 MB** | 只有一个文件，最好分发；首次启动多花 2~4 秒解包 |
+| 文件夹版 `--onedir` | `dist\QQBotMerged\`（exe 7.4 MB + `_internal\`） | 整个文件夹约 25 MB | **启动更快**，长期挂机推荐；整个文件夹一起拷 |
+
+### 3. 怎么用
+
+1. 把 exe（文件夹版的整个文件夹）放到一个**可写的目录**里，例如 `D:\QQBotMerged\`；
+2. 双击运行 —— 首次运行会在 exe **旁边**自动生成：
+   - `config.json`：配置（含 AppID/AppSecret/AI Key），网页后台里改；
+   - `data\`：消息库、留存媒体、日志、上下文；
+   - `plugins\`：**空目录**，插件由你自己放进去（见下一节）；
+3. 浏览器打开 <http://127.0.0.1:8666/>，到「设置」里填自己的机器人信息即可。
+
+> 命令行参数和源码版完全一样：`QQBotMerged.exe --check`、`--port 9000`、`--no-bots`。
+
+### 4. 插件要自己加（exe 不附带任何插件）
+
+打包出来的 exe **不含插件、也不会自动释放插件**，`plugins\` 一直是空的，等你放东西：
+
+1. 从插件来源（AstrBot 插件市场 / 作者提供的压缩包 / 本仓库源码里的 `plugins\`）拿到插件目录；
+2. 把整个插件目录复制到 exe 旁边的 `plugins\` 下，结构必须是：
+
+   ```
+   plugins\
+   └── astrbot_plugin_xxx\
+       ├── metadata.yaml      ← 必需
+       ├── main.py            ← 必需
+       ├── _conf_schema.json  ← 可选（插件配置项定义）
+       └── requirements.txt   ← 可选（插件自己的依赖，装了才生效）
+   ```
+
+3. 网页「插件管理」→ 点右上角「丢弃修改并重载」；加载失败时页面会直接写明原因
+   （缺文件、语法错误、没有处理器、少依赖等）。
+
+> 想用仓库里自带的 3 个示例插件（骰子 / 签到 / Ollama），把源码目录 `QQBotMerged\plugins\`
+> 下的对应文件夹拷到 exe 旁边的 `plugins\` 里就行 —— 它们在**源码**里有，只是**不随 exe 打包**。
+
+### 5. 已验证的行为
+
+打包后我逐项跑过：
+
+- `QQBotMerged.exe --check` → 退出码 **0**（配置 17 分组 / 107 项、路由全部就绪）；
+- `QQBotMerged.exe --no-bots --port 8770` → `/health`、`/`（内置模板）、
+  `/static/css/app.css`、`/static/js/chat.js` 全部 **HTTP 200**（前端资源确实打进了 exe）；
+- 首次运行在 exe 旁边生成了 `config.json`、`data/` 与**空的** `plugins/`（不释放任何插件）；
+- 网页「关闭程序」能正常退出，不留残留进程。
+
+### 6. 注意事项
+
+- **必须放在可写目录**：程序要在旁边写 `data/`，放只读目录 / 光盘里会启动失败；
+- **杀毒软件 / SmartScreen 可能误报**（PyInstaller 单文件 exe 的通病）：选「更多信息 → 仍要运行」；
+  想少点误报就用**文件夹版**，或自己加个 `--icon`；
+- **控制台窗口不要关**：关掉窗口 = 关闭程序；不想看日志可以用 `--noconsole` 打包，但出问题就看不到报错；
+- **端口与单实例**：默认 `127.0.0.1:8666`，同一台机器只允许跑一个实例（锁机制与源码版一致）；
+  换端口：`QQBotMerged.exe --port 9000`；
+- **想改前端不用重新打包**：在 exe 旁边放一个 `web\` 目录（含 `templates\`、`static\`），
+  程序会优先用外部的；`plugins\` 同理，插件随便加；
+- **跨机器**：exe 里带的是打包那台机器的 Python 运行时，Windows 之间可以直接拷；
+  目标机器如果是 ARM 或 32 位，需要在那台机器上用源码重新打包；
+- 打包脚本会自动排除 `data/`（不会把你的聊天记录/密钥打进去），也**不打包 `plugins/`**
+  （插件由使用者自行添加）；`dist\README.md` 会自动复制一份说明文件。
+
+---
+
+## 十二、用 Git 上传到 GitHub
+
+### 0. 准备
+
+- 已安装 Git（本机是 `git version 2.55.0.windows.5`）。没装的话：`winget install Git.Git` 或
+  从 <https://git-scm.com/downloads> 下载安装。
+- 在 GitHub 网页上点 **New repository** 新建一个**空仓库**（例如 `QQBotMerged`）：
+  **不要**勾选 "Add a README file" / .gitignore / license，避免和本地首推冲突。
+- 本目录已有 `.gitignore`，会自动排除 `config.json`、`data/`、`__pycache__`、`*.zip` 等 —— **密钥不会上传**；
+- 还有 `.gitattributes`，统一把源码按 LF 换行提交（`start.sh` 在 Linux 上才能正常运行），
+  Windows 上的 `start.bat` 保持 CRLF。
+
+### 1. 第一次上传（在 QQBotMerged 目录里执行）
+
+```powershell
+cd C:\Users\L\Desktop\DeepSeek\QQBotMerged
+
+# ① 告诉 Git 你是谁（只需设置一次；邮箱可以用 GitHub 的 noreply 地址）
+git config --global user.name "你的名字"
+git config --global user.email "你的邮箱@example.com"
+
+# ② 建库、暂存、核对、提交
+git init                                  # 把这里变成 Git 仓库
+git add .                                 # 暂存所有文件（.gitignore 已排除敏感文件）
+git status                                # ★ 核对一遍：不该出现 config.json、data/
+git commit -m "首次提交：QQBotMerged QQ 机器人多开后台"
+git branch -M main                        # 主分支改名 main
+
+# ③ 关联你自己的仓库（用户名/仓库名要对）
+git remote add origin https://github.com/<你的用户名>/QQBotMerged.git
+
+# ④ 推送
+git push -u origin main
+```
+
+第一次 `push` 会弹窗要求登录：
+
+- **推荐用 Personal Access Token**：GitHub → 右上角头像 → Settings → Developer settings →
+  Personal access tokens → Tokens (classic) → Generate new token，
+  勾选 **repo** 权限，复制生成的 token；push 时**用户名填 GitHub 用户名，密码填这个 token**。
+- 或者用 GitHub CLI：`winget install GitHub.cli` → `gh auth login`（按提示浏览器登录）后直接 push。
+- 或者用 SSH：`ssh-keygen -t ed25519 -C "你的邮箱"`，把 `~/.ssh/id_ed25519.pub` 内容贴到
+  GitHub → Settings → SSH and GPG keys，然后把远端地址换成 `git@github.com:<用户名>/QQBotMerged.git`。
+
+### 2. 以后更新代码
+
+```powershell
+cd C:\Users\L\Desktop\DeepSeek\QQBotMerged
+git status                       # 看改了什么
+git add -A                       # 或 git add 具体文件名
+git commit -m "说明这次改了什么"
+git push
+```
+
+常用查看命令：
+
+```powershell
+git log --oneline -10            # 最近 10 次提交
+git diff                         # 还没暂存的改动
+git diff --staged                # 已暂存待提交的改动
+git restore <文件>               # 撤销工作区改动（回到上次提交）
+```
+
+### 3. 常见问题
+
+| 现象 | 处理 |
+|---|---|
+| `remote origin already exists` | `git remote set-url origin https://github.com/<用户名>/<仓库>.git` |
+| push 被拒（`non-fast-forward` / `fetch first`） | 远端有本地没有的提交：`git pull --rebase origin main` 后再 `git push` |
+| 忘了密码 / 认证失败 | 重新生成 token（勾选 repo），或 `git config --global credential.helper manager` 用 Windows 凭据管理器 |
+| 公司网络/代理连不上 GitHub | `git config --global http.proxy http://127.0.0.1:7890`（改成你的代理端口；取消用 `--unset`） |
+| **不小心提交了 `config.json`** | `git rm --cached config.json` → `git commit -m "移除密钥文件"` → `git push`；**并且立刻去 QQ 开放平台重置 AppSecret、换掉 AI API Key**（历史提交里仍有明文） |
+| 提交了很大的 `data/` | `git rm -r --cached data` → commit → push（GitHub 单文件 >100MB 会被拒；历史里的大文件需要 `git filter-repo` 才能彻底清掉） |
+| 想只提交部分文件 | `git add run.py core/ web/ plugins/ requirements.txt README.md` |
+
+### 4. 建议的仓库结构
+
+```
+QQBotMerged/
+├── .gitignore          # 已排除 config.json / data/ / __pycache__
+├── README.md           # 本文件
+├── requirements.txt
+├── run.py  start.bat  start.sh
+├── core/  web/  plugins/  tests/
+└── (可选) LICENSE      # 想开源的话加一个（如 MIT）
+```
+
+顺手也可以在 GitHub 仓库页面上把 **About** 描述和 topics 填上，
+再在 Release 里附上第十节的 zip 包，别人下载就能直接用。
+
+---
+
 ## 致谢
 
+- 合并自工作区的 `API_qqbot` 与 `app` 两个程序；
 - 插件体系对齐 **AstrBot** 官方格式（`astrbot.api.*`），可直接使用其插件生态；
 - QQ 接口依据官方文档：<https://bot.q.qq.com/wiki/>。
