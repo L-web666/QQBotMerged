@@ -1,9 +1,0 @@
-name: astrbot_plugin_ollama
-display_name: Ollama 本地 AI
-desc: 用本地 Ollama 回答普通消息，不消耗 API 额度；默认在内置 AI 可用时让给内置 AI
-version: 2.5.0
-author: L-web666
-short_desc: 本地 Ollama 模型接管普通消息
-astrbot_version: ">=4.0.0"
-support_platforms:
-  - qq_official

@@ -1,9 +1,0 @@
-name: astrbot_plugin_dice
-display_name: 骰子
-desc: 群聊轻互动，发送 /骰子 掷一个 1-6 的骰子，也可 /骰子 3d6 掷多个
-version: 2.1.0
-author: L-web666
-short_desc: 群聊掷骰子小游戏
-astrbot_version: ">=4.0.0"
-support_platforms:
-  - qq_official
