@@ -1,0 +1,14 @@
+{
+  "lottery_cost": {
+    "description": "每次抽奖消耗的积分数",
+    "type": "int",
+    "default": 10,
+    "hint": "建议 5~50，正整数"
+  },
+  "streak_max_bonus": {
+    "description": "连签加成上限",
+    "type": "int",
+    "default": 5,
+    "hint": "连签第 2 天起每天 +1，最多加到该值"
+  }
+}
