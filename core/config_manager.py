@@ -16,7 +16,9 @@ import copy
 import json
 import logging
 import os
+import shutil
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from core import config_schema as schema
@@ -231,12 +233,54 @@ class Config:
         return [str(value)]
 
     def abs_path(self, path_value: str) -> str:
+        """把配置里的路径转成绝对路径（分隔符按**当前系统**统一）。
+
+        为什么必须在这里规范：`config.json` 里 `storage.db_path` 的默认值写的是
+        `data/messages.db`（`core/config_schema.py` 刻意用 `/`，好让同一份配置在 Linux
+        上也能直接用）。而 Windows 的 `os.path.join(BASE_DIR, "data/messages.db")`
+        **不会**把第二段里的 `/` 规范化，于是拼出
+        `C:\\...\\QQBotMerged\\data/messages.db` 这种正反斜杠混用的路径 ——
+        日志、接口里看起来就像 bug（Windows 的 open/sqlite3 恰好容忍，所以功能没坏）。
+
+        反向的坑更严重：用户在 Windows 上把路径写成 `data\\messages.db`，这份配置拿到
+        Linux/macOS 上时 `\\` 不是分隔符 —— POSIX 下 `\\` 是合法的文件名组成字符，于是会
+        在程序目录下建出一个**名字就叫 `data\\messages.db` 的文件**（并不在 `data/` 里）。
+        危害不是"报错"，而是**同一份配置的两种写法会分家成两套数据**：先把路径写成 `\\`、
+        后来又"改对"成 `/`，程序会在新位置建一个空库，看起来就像消息全丢了
+        （而 `messages.db` 在云同步的 NEVER_SYNC 里，救不回来）。
+
+        所以先把 `/` 和 `\\` 都统一成当前系统的 `os.sep`，再 `normpath`，最后判绝对/相对：
+        - 空串 → 程序根目录（保持原行为）；
+        - 绝对路径 → `normpath` 后原样返回；`normpath` 会保留开头成对的 `\\`
+          （Windows UNC `\\\\server\\share` 的语义），不会把网络路径改坏；
+        - 相对路径 → 拼到程序根目录下；
+        - **看起来是 POSIX 绝对路径**（`/mnt/...`）却在 Windows 上运行时无法定位，
+          会打一条 warning 并写出**真实落点**（Windows 当成"当前盘符根目录下的路径"），
+          避免静默落到没想到的位置。
+        """
         path_value = str(path_value or "").strip()
         if not path_value:
             return paths.BASE_DIR
+        # Windows 的 ntpath.isabs("/mnt/x") 是 False（Python 3.13 起"无盘符的根路径"不算绝对），
+        # 直接当相对路径拼会落到 "C:/mnt/..." 这类用户完全没想到的地方，所以显式提醒。
+        if os.name == "nt" and path_value.startswith("/") and not path_value.startswith("//"):
+            # 实际落点必须算出来给用户看：`\mnt\...` 在 Windows 上表示"当前盘符的根目录下"，
+            # 会落到 C:\mnt\... 这种用户完全没想到的地方（不是程序目录下面！）。
+            landed = os.path.normpath(
+                os.path.join(paths.BASE_DIR, path_value.replace("/", os.sep)))
+            logger.warning(
+                "配置里的路径 %r 看起来是 Linux/macOS 风格的绝对路径，在 Windows 上无法定位："
+                "Windows 会把它当成「当前盘符根目录下的路径」，实际会落到 %s。"
+                "如果这是从别的系统拷过来的配置，请改成 Windows 路径"
+                "（如 D:\\qqbot\\data\\messages.db）或相对路径（data/messages.db）",
+                path_value, landed)
+        # `/` 与 `\` 都按分隔符处理：POSIX 上 `\` 本来是合法文件名字符，但配置里出现的
+        # `\` 只可能来自 Windows 用户，当成分隔符才符合"同一份配置跨平台可用"的预期。
+        path_value = path_value.replace("/", os.sep).replace("\\", os.sep)
+        path_value = os.path.normpath(path_value)
         if os.path.isabs(path_value):
             return path_value
-        return os.path.join(paths.BASE_DIR, path_value)
+        return os.path.normpath(os.path.join(paths.BASE_DIR, path_value))
 
 
 def _migrate_legacy_media_limits(file_data: Dict[str, Any]) -> List[str]:
@@ -281,11 +325,16 @@ class ConfigManager:
         with self._lock:
             file_data: Dict[str, Any] = {}
             created = False
+            read_failed = ""
             if os.path.exists(self.config_path):
                 try:
-                    with open(self.config_path, "r", encoding="utf-8") as handle:
+                    # `utf-8-sig`：容忍 Windows 上用 PowerShell 的 Out-File / 记事本"UTF-8"
+                    # 写出来的 BOM。以前用普通 utf-8 读，带 BOM 的文件会被判成"读不出来"，
+                    # 然后**直接用默认配置覆盖掉用户的配置**（等于配置全丢）。
+                    with open(self.config_path, "r", encoding="utf-8-sig") as handle:
                         file_data = json.load(handle) or {}
                 except (OSError, ValueError) as exc:
+                    read_failed = str(exc)
                     logger.error("读取 %s 失败（%s），已改用默认配置", self.config_path, exc)
                     file_data = {}
             else:
@@ -297,13 +346,25 @@ class ConfigManager:
             # 这里把"没改过的旧默认值"按新默认值升级（用户自己改过的值不动）。
             migrated = _migrate_legacy_media_limits(file_data)
             merged, added = _deep_merge_defaults(schema.DEFAULT_CONFIG, file_data)
+            # 记录本次实际补全的键名（供排查"新增配置项在老配置上没生效"）
+            self.missing = list(added)
+            # 原文件读不出来（编码/语法错误）时**绝不能直接覆盖**：先另存一份，
+            # 用户才有机会改回来。否则"一次读取失败"就等于把配置全清空了。
+            skip_write = bool(read_failed) and not self._backup_broken(read_failed)
             if created or added or migrated:
-                try:
-                    self._write(merged)
-                except OSError as exc:
-                    logger.error("写入配置文件失败: %s", exc)
-                if added:
-                    logger.info("配置已补全 %d 个缺失项", len(added))
+                if skip_write:
+                    logger.error("为避免丢失配置，本次**不写入** %s；"
+                                 "修好上面那个读不出来的文件后重启即可", self.config_path)
+                else:
+                    try:
+                        self._write(merged)
+                    except OSError as exc:
+                        logger.error("写入配置文件失败: %s", exc)
+                if added and not skip_write:
+                    # 只报数量时根本查不出补了哪个键，这里带上键名（最多列前 10 个）
+                    shown = "、".join(added[:10])
+                    more = f" 等 {len(added)} 项" if len(added) > 10 else ""
+                    logger.info("配置已补全 %d 个缺失项：%s%s", len(added), shown, more)
                 if migrated:
                     logger.info("已按 QQ 官方限制放宽媒体大小上限：%s（可在「设置 → 发送策略」调整）",
                                 "、".join(migrated))
@@ -315,10 +376,41 @@ class ConfigManager:
             self.config = Config(runtime, self._file_data, self.config_path)
             self._write_doc()
 
+    def _backup_broken(self, reason: str) -> str:
+        """原配置文件读不出来时先另存一份（返回备份路径；备份失败返回空串）。
+
+        为什么必须备份：以前读取失败就直接用默认配置覆盖写回，用户的机器人凭据、
+        API 密钥、指令面板配置会**当场全部消失**（config.json 不在云同步范围内，
+        救不回来）。现在先留一份 `.broken-<时间>`，至少能手工改回来。
+        """
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        backup = f"{self.config_path}.broken-{stamp}"
+        try:
+            shutil.copy2(self.config_path, backup)
+        except OSError as exc:
+            logger.error("备份读不出来的配置文件失败（%s）：%s", backup, exc)
+            return ""
+        logger.error("原配置文件无法解析（%s）：已备份为 %s。"
+                     "当前先用默认配置运行，把备份文件改好（或去掉开头的 BOM）后"
+                     "覆盖回 %s 并重启即可恢复",
+                     reason, os.path.basename(backup), os.path.basename(self.config_path))
+        return backup
+
     def _write(self, data: Dict[str, Any]):
+        # 先按"和写文件完全相同的方式"序列化，再和磁盘上的内容比一次：
+        # 一模一样就别写。每次重写都会改 mtime，白白造成磁盘抖动，
+        # 还会让文件监视/外部工具误以为配置变了。
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+        try:
+            with open(self.config_path, "r", encoding="utf-8-sig") as handle:
+                if handle.read() == text:
+                    return
+        except (OSError, ValueError):
+            # 读不到（首次创建、权限问题）或内容不是合法 UTF-8 → 当作"不同"，照旧写出去
+            pass
         tmp = self.config_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write(text)
         os.replace(tmp, self.config_path)
 
     def reload(self) -> Config:

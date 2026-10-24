@@ -558,5 +558,7 @@
   Settings.load = load;
   Settings.save = save;
   Settings.render = render;
-  global.Settings = Settings;
+    // 防止整个对象被别人替换掉（对象内部字段照旧可改，见 util.js 的 protectGlobal）
+  if (typeof global.__qbmProtect === 'function') global.__qbmProtect('Settings', Settings);
+  else global.Settings = Settings;
 })(window);

@@ -156,6 +156,9 @@
       if (global.Chat && global.Chat.onBotChanged) global.Chat.onBotChanged();
       if (global.Settings && global.Settings.spec) global.Settings.load();
       if (global.Groups && global.Groups.active) global.Groups.openGroup(global.Groups.active);
+      // 运行状态页也要按新机器人重拉：「内置 AI」报的是**当前机器人**的有效配置，
+      // 不重拉的话切完机器人那一格还是旧机器人的值。
+      if (global.Admin && global.App.page === 'status') global.Admin.loadStatus();
       return loadBotSwitcher();
     }).catch(function (error) {
       U.toast('切换机器人失败：' + error.message, 'err');
@@ -245,7 +248,10 @@
         U.toast('还没有配置机器人：请在「设置 → 机器人账号」填写 AppID / AppSecret', 'warn', 8000);
       }
       if (data.ai && !data.ai.usable) {
-        U.toast('内置 AI 未配置完整，普通消息将交给插件/关键词回复', 'warn', 6000);
+        U.toast(data.ai.enabled === false
+          ? '内置 AI 已关闭：普通消息将交给插件/关键词回复'
+          : '内置 AI 未配置完整（「设置 → AI 服务」里的这一组只作用于当前选中的机器人，' +
+            '全局段也要填或每个机器人都填全）：普通消息将交给插件/关键词回复', 'warn', 9000);
       }
     }).catch(function () { /* 忽略 */ });
   }
@@ -259,5 +265,7 @@
   } else {
     boot();
   }
-  global.App = App;
+    // 防止整个对象被别人替换掉（对象内部字段照旧可改，见 util.js 的 protectGlobal）
+  if (typeof global.__qbmProtect === 'function') global.__qbmProtect('App', App);
+  else global.App = App;
 })(window);

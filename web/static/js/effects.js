@@ -104,4 +104,6 @@
     remember: remember,
     recall: recall
   };
+  // 防止整个对象被别人替换掉（对象内部字段照旧可改，见 util.js 的 protectGlobal）
+  if (typeof global.__qbmProtect === 'function') global.__qbmProtect('Effects', global.Effects);
 })(window);

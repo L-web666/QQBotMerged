@@ -220,9 +220,91 @@ check('旧的 <@all> 渲染成 @全体成员',
 const fsSource = fs.readFileSync(path.join(ROOT, 'web', 'static', 'js', 'chat.js'), 'utf8');
 check('消息操作框里没有"转发图片到其他会话"',
       fsSource.indexOf('转发图片到其他会话') < 0 && fsSource.indexOf('forwardImage') < 0, '');
-check('已移除群 @ 提及发送入口（mentionPicker / insertMention）',
-      fsSource.indexOf('mentionPicker') < 0 && fsSource.indexOf('insertMention') < 0, '');
+// 群 @ 提及：重新接回来了，必须用官方标签写法 `<qqbot-at-user id="…" />`
+check('群 @ 入口已接回（mentionPicker + loadMentionCandidates）',
+      fsSource.indexOf('mentionPicker') >= 0 && fsSource.indexOf('loadMentionCandidates') >= 0, '');
+check('插入的是官方 @ 标签（qqbot-at-user id=…）',
+      fsSource.indexOf('<qqbot-at-user id="') >= 0 && fsSource.indexOf('insertMention') >= 0, '');
+check('@ 候选名单走 /api/chat/mentions（成员缓存 + 最近发言者）',
+      fsSource.indexOf('/api/chat/mentions') >= 0, '');
+check('@ 解析用官方标签正则（收到/插入的 @ 都能正确识别）',
+      fsSource.indexOf('qqbot-at-user') >= 0 && fsSource.indexOf('atUserIds') >= 0, '');
 
+// ---------------------------------------------------------------- 指令标签（仅 Markdown）
+const cmdMessage = {
+  direction: 'out', type: 'group',
+  content: '点这个 <qqbot-cmd-enter text="%2Fhelp" /> 和 ' +
+           '<qqbot-cmd-input text="%2Fban" show="%E5%B0%81%E7%A6%81" />',
+  content_display: '', attachments: [], image_url: '', content_images: [], msg_id: 'M12',
+};
+const cmdHtml = Chat.messageHtmlForTest(cmdMessage, {});
+check('指令标签渲染成可读标签（不显示原始标记）',
+      cmdHtml.indexOf('class="cmd-tag"') >= 0 && cmdHtml.indexOf('qqbot-cmd') < 0,
+      cmdHtml.slice(0, 240));
+check('回车指令显示成 /回车指令 + 文本（urlencode 已解码）',
+      cmdHtml.indexOf('/回车指令 /help') >= 0, cmdHtml.slice(0, 240));
+check('参数指令显示成 /参数指令 + 显示文本',
+      cmdHtml.indexOf('/参数指令 封禁') >= 0, cmdHtml.slice(0, 240));
+
+const FT = Chat.formatForTest || {};
+check('buildCmdEnter 生成官方标签并对值 urlencode',
+      FT.buildCmdEnter && FT.buildCmdEnter('/help') === '<qqbot-cmd-enter text="%2Fhelp" />',
+      FT.buildCmdEnter ? FT.buildCmdEnter('/help') : '缺少 formatForTest');
+check('buildCmdInput 支持 show 与 reference=true',
+      FT.buildCmdInput && FT.buildCmdInput('/ban', '封禁', true) ===
+        '<qqbot-cmd-input text="%2Fban" show="%E5%B0%81%E7%A6%81" reference="true" />',
+      FT.buildCmdInput ? FT.buildCmdInput('/ban', '封禁', true) : '缺少 formatForTest');
+check('前端 urlencode 与后端 Python quote(safe="") 规则一致（!*\'() 也要编码）',
+      FT.buildCmdEnter && FT.buildCmdEnter("a!b*c'd(e)f g&h") ===
+        '<qqbot-cmd-enter text="a%21b%2Ac%27d%28e%29f%20g%26h" />',
+      FT.buildCmdEnter ? FT.buildCmdEnter("a!b*c'd(e)f g&h") : '缺少 formatForTest');
+check('指令文本为空不生成标签、超 100 字符按官方上限截断',
+      FT.buildCmdEnter && FT.buildCmdEnter('   ') === '' &&
+      FT.readCmdTag(FT.buildCmdEnter('字'.repeat(120))).text.length === 100,
+      FT.buildCmdEnter ? FT.buildCmdEnter('') : '缺少 formatForTest');
+check('markdownOnlyParts 认得出 @ 与指令标签',
+      FT.markdownOnlyParts &&
+      JSON.stringify(FT.markdownOnlyParts('<qqbot-at-user id="U1" />')) === '["@某人"]' &&
+      JSON.stringify(FT.markdownOnlyParts('<qqbot-cmd-enter text="x" />')) === '["指令标签"]' &&
+      FT.markdownOnlyParts('普通文本 @全体成员').length === 0,
+      FT.markdownOnlyParts ? JSON.stringify(FT.markdownOnlyParts('普通文本')) : '缺少 formatForTest');
+
+// ---- 格式自动切换：@ 只在 Markdown 里渲染，选着纯文本时要自动切过去 ----
+const fmtSelect = documentStub.getElementById('sendFormat');
+fmtSelect.value = 'text';
+var switched = FT.syncFormatWithContent ? FT.syncFormatWithContent('<qqbot-at-user id="U1" /> 你好') : '';
+check('正文里有 @ 时自动从纯文本切到 Markdown',
+      switched === '@某人' && fmtSelect.value === 'markdown' &&
+      FT.currentFormat() === 'markdown', fmtSelect.value + ' / ' + switched);
+fmtSelect.value = 'markdown';
+check('已经是 Markdown 时不再重复切换（返回空）',
+      FT.syncFormatWithContent('<qqbot-at-user id="U1" />') === '', fmtSelect.value);
+fmtSelect.value = 'text';
+FT.syncFormatWithContent('<qqbot-cmd-enter text="%2Fhelp" />');
+check('正文里有指令标签同样自动切到 Markdown', fmtSelect.value === 'markdown', fmtSelect.value);
+fmtSelect.value = 'text';
+FT.syncFormatWithContent('普通一句话');
+check('普通文本不会把格式改成 Markdown（不做多余动作）', fmtSelect.value === 'text', fmtSelect.value);
+
+// ---- 插入指令标签：正文按官方写法落进输入框 ----
+const contentField = documentStub.getElementById('content');
+const cmdTextField = documentStub.getElementById('cmdText');
+const cmdKindField = documentStub.getElementById('cmdKind');
+contentField.value = '打卡：';
+fmtSelect.value = 'text';
+cmdKindField.value = 'input';
+cmdTextField.value = '/sign';
+FT.insertCmdTag();
+check('插入参数指令后输入框里是官方标签（urlencode + 光标处插入）',
+      contentField.value.indexOf('<qqbot-cmd-input text="%2Fsign" />') >= 0,
+      contentField.value);
+check('插入指令标签后自动切成 Markdown 格式', fmtSelect.value === 'markdown', fmtSelect.value);
+check('插入后清空指令输入框（避免重复插入）', cmdTextField.value === '', cmdTextField.value);
+cmdKindField.value = 'enter';
+cmdTextField.value = '';
+FT.insertCmdTag();
+check('指令文本为空时插入被拦住，正文里没有半截标签',
+      contentField.value.indexOf('<qqbot-cmd-enter') < 0, contentField.value);
 console.log('');
 console.log('='.repeat(66));
 const failed = results.filter((ok) => !ok).length;

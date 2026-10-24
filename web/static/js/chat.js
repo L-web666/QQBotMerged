@@ -18,6 +18,7 @@
     activeName: '',
     messages: [],
     quote: null,
+    mentionMembers: [],     // 当前群的 @ 候选成员（{openid, name, role}）
     pending: null,          // { blob, name, kind: 'image'|'file' }
     lastRendered: '',
     lastMsgId: null,        // 已渲染的最后一条消息 id（用于"只追加"优化）
@@ -187,7 +188,27 @@
     out = out.replace(/(^|\s)@everyone\b/g, '$1<span class="mention">@全体成员</span>');
     out = out.replace(/&lt;@!?([0-9A-Za-z_.\-]{4,80})&gt;/g,
       '<span class="mention">@某人</span>');
+    // 指令标签（官方仅 markdown）：显示成人能看懂的可点击标签文字
+    out = out.replace(/&lt;qqbot-cmd-(enter|input)\b[\s\S]*?&gt;/gi, function (whole, kind) {
+      var info = readCmdTag(whole);
+      var label = (String(kind).toLowerCase() === 'input') ? '/参数指令' : '/回车指令';
+      var value = info.show || info.text || '';
+      return '<span class="cmd-tag">' + U.esc(label + (value ? ' ' + value : '')) + '</span>';
+    });
     return out;
+  }
+
+  /* 解析一条指令标签（传入的是 HTML 转义后的片段，先还原再取属性） */
+  function readCmdTag(fragment) {
+    var raw = String(fragment || '')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+    function attr(name) {
+      var found = new RegExp(name + '\\s*=\\s*["\']([^"\']*)["\']', 'i').exec(raw);
+      if (!found) return '';
+      try { return decodeURIComponent(found[1]); } catch (e) { return found[1]; }
+    }
+    return { text: attr('text'), show: attr('show') || attr('text'), reference: /reference\s*=\s*["\']?true/i.test(raw) };
   }
 
   function displayText(message) {
@@ -352,6 +373,7 @@
       (bot ? ' · 机器人：' + U.esc(bot.name) : '');
     U.el('fetchGroupNameBtn').style.display = Chat.activeType === 'group' ? '' : 'none';
     FX.remember('lastConv', conv.key);
+    loadMentionCandidates();     // 群聊才给 @ 候选名单（私聊禁用）
     // 切会话时重置渲染状态，避免"只追加"逻辑串到别的会话上
     Chat.lastRendered = '';
     Chat.lastMsgId = null;
@@ -920,10 +942,274 @@
   }
 
   /* ============================ 发送 ============================ */
+
+  /* 发送格式（Markdown / 纯文本）：选择结果记忆在 localStorage，刷新后仍在 */
+  var FORMAT_KEY = 'qbm-send-format';
+
+  function currentFormat() {
+    var select = U.el('sendFormat');
+    return (select && select.value === 'markdown') ? 'markdown' : 'text';
+  }
+
+  function saveFormat(value) {
+    try { global.localStorage.setItem(FORMAT_KEY, value); } catch (e) { /* 隐私模式等忽略 */ }
+  }
+
+  /* 直接切换格式控件（并记住选择）；只有 @/指令标签引起的自动切换会顺带提示一次 */
+  function setFormat(value) {
+    var select = U.el('sendFormat');
+    var wanted = (value === 'markdown') ? 'markdown' : 'text';
+    if (select) select.value = wanted;
+    saveFormat(wanted);
+    return wanted;
+  }
+
+  function restoreFormat() {
+    var select = U.el('sendFormat');
+    if (!select) return;
+    var saved = '';
+    try { saved = global.localStorage.getItem(FORMAT_KEY) || ''; } catch (e) { /* 同上 */ }
+    select.value = (saved === 'markdown') ? 'markdown' : 'text';   // 默认纯文本
+    select.addEventListener('change', function () { saveFormat(currentFormat()); });
+  }
+
   function setStatus(text, kind) {
     var node = U.el('status');
     node.textContent = text || '';
     node.className = 'status ' + (kind || '');
+  }
+
+  /* ============================ 群聊 @ 某人 ============================
+     官方：群聊 / 文字子频道支持 @某人，写法是把 `<qqbot-at-user id="对方openid" />`
+     嵌进正文（文本消息、markdown 消息都行）。这里选中成员后就往输入框里插入这个标签，
+     正文仍然是"唯一事实来源"（不做隐藏状态），发送时后端还会把旧写法 `<@openid>`
+     统一转成新标签；@全体成员 官方仅文字子频道可用，故不提供按钮。
+
+     ⚠️ 实测：@ 标签只有 **Markdown** 消息会被客户端渲染（纯文本发出去就是一串尖括号），
+     所以正文里出现 @ / 指令标签时会自动把发送格式切成 Markdown（见 syncFormatWithContent）。 */
+  var AT_USER_RE = /<qqbot-at-user\s+id=["']?([^"'\s/>]+)["']?\s*\/?>/gi;
+  var LEGACY_AT_RE = /<@!?([0-9A-Za-z_.\-]{4,80})>/;
+  var CMD_TAG_RE = /<qqbot-cmd-(enter|input)\b[^>]*>/gi;
+
+  function atUserIds(text) {
+    var out = [];
+    var re = new RegExp(AT_USER_RE.source, 'gi');
+    var match;
+    while ((match = re.exec(String(text || ''))) !== null) {
+      if (match[1] && out.indexOf(match[1]) < 0) out.push(match[1]);
+    }
+    return out;
+  }
+
+  /* 正文里「只在 Markdown 消息里生效」的标签（与后端 markdown_only_tags 一致） */
+  function markdownOnlyParts(text) {
+    var value = String(text || '');
+    var parts = [];
+    if (atUserIds(value).length || LEGACY_AT_RE.test(value)) parts.push('@某人');
+    if (new RegExp(CMD_TAG_RE.source, 'i').test(value)) parts.push('指令标签');
+    return parts;
+  }
+
+  /* 带 @ / 指令标签却选着纯文本时，自动切到 Markdown 并说明原因 */
+  function syncFormatWithContent(text, silent) {
+    var parts = markdownOnlyParts(text);
+    if (!parts.length || currentFormat() !== 'text') return '';
+    setFormat('markdown');
+    var why = parts.join('、');
+    if (!silent) {
+      setStatus('检测到 ' + why + '（只有 Markdown 消息里会被渲染）：已自动切换为 Markdown 格式');
+    }
+    return why;
+  }
+
+  function atUserName(openid) {
+    var list = Chat.mentionMembers || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].openid === openid) return list[i].name || openid;
+    }
+    return openid;
+  }
+
+  function renderMentionHint() {
+    var node = U.el('mentionHint');
+    if (!node) return;
+    var fields = U.el('content');
+    var ids = atUserIds(fields ? fields.value : '');
+    if (!ids.length) { node.textContent = ''; return; }
+    var names = ids.map(function (id) { return '@' + atUserName(id); });
+    node.innerHTML = '将 @：<b>' + U.esc(names.join(' ')) + '</b>';
+  }
+
+  function fillMentionOptions(members) {
+    var select = U.el('mentionPicker');
+    if (!select) return;
+    select.innerHTML = '';
+    var placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = members.length ? ('＠ 选择成员（' + members.length + '）') : '没有可选成员';
+    select.appendChild(placeholder);
+    for (var i = 0; i < members.length; i++) {
+      var option = document.createElement('option');
+      option.value = members[i].openid || '';
+      option.textContent = members[i].name || members[i].openid || '';
+      select.appendChild(option);
+    }
+    select.disabled = !members.length;
+  }
+
+  function loadMentionCandidates() {
+    var wrap = U.el('mentionWrap');
+    var select = U.el('mentionPicker');
+    if (!select) return;
+    if (Chat.activeType !== 'group' || !Chat.activeOpenid) {
+      Chat.mentionMembers = [];
+      fillMentionOptions([]);
+      if (wrap) {
+        wrap.title = '只有群聊支持 @ 某人（私聊里 @ 标签会被当成普通文字）';
+      }
+      renderMentionHint();
+      return;
+    }
+    if (wrap) wrap.title = '在群里 @ 某人：选中后插入官方 @ 标签（<qqbot-at-user id="对方openid" />）';
+    var path = '/api/chat/mentions?group=' + encodeURIComponent(Chat.activeOpenid);
+    U.getJSON(U.qs(path)).then(function (data) {
+      Chat.mentionMembers = (data && data.members) || [];
+      fillMentionOptions(Chat.mentionMembers);
+      renderMentionHint();
+      if (data && data.member_api_error && !Chat.mentionMembers.length) {
+        setStatus('没能取到群成员（' + data.member_api_error + '）：只能手动粘贴 @ 标签', 'warn');
+      }
+    }).catch(function (error) {
+      Chat.mentionMembers = [];
+      fillMentionOptions([]);
+      setStatus('群成员加载失败：' + error.message, 'err');
+    });
+  }
+
+  function insertMention(openid) {
+    var field = U.el('content');
+    if (!field || !openid) return;
+    var tag = '<qqbot-at-user id="' + openid + '" />';
+    insertTagAtCaret(tag);
+    syncFormatWithContent(field.value);          // @ 只在 Markdown 里渲染 → 自动切格式
+    refreshComposerHints();
+  }
+
+  /* 往输入框光标处插一段标签（前后补空格，避免和相邻文字粘在一起） */
+  function insertTagAtCaret(tag) {
+    var field = U.el('content');
+    if (!field || !tag) return;
+    var start = typeof field.selectionStart === 'number' ? field.selectionStart : field.value.length;
+    var end = typeof field.selectionEnd === 'number' ? field.selectionEnd : start;
+    var before = field.value.slice(0, start);
+    var after = field.value.slice(end);
+    var prefix = (before && !/\s$/.test(before)) ? ' ' : '';
+    var suffix = (after && !/^\s/.test(after)) ? ' ' : '';
+    field.value = before + prefix + tag + suffix + after;
+    var caret = (before + prefix + tag + suffix).length;
+    field.focus();
+    try { field.setSelectionRange(caret, caret); } catch (e) { /* 老浏览器忽略 */ }
+  }
+
+  /* ============================ 指令标签（仅 Markdown） ============================
+     官方「指令操作」：
+       <qqbot-cmd-enter text="xxx" />                            用户点击后直接发送文本
+       <qqbot-cmd-input text="xxx" show="xxx" reference="false" /> 用户点击后插入输入框
+     text / show 最长 100 字符且**必须 urlencode**；这两类标签只有 markdown 消息支持，
+     所以插入时同样会自动把格式切到 Markdown。 */
+  var CMD_TEXT_MAX = 100;
+
+  function cmdLimit() {
+    var box = U.el('cmdText');
+    if (box) box.maxLength = CMD_TEXT_MAX;
+    return CMD_TEXT_MAX;
+  }
+
+  function encodeCmdValue(value) {
+    // 与后端 core/message_text.encode_cmd_value（Python 的 quote(safe="")）保持完全一致：
+    // encodeURIComponent 会漏掉 ! ' ( ) * 这四个半角符号，这里补上
+    return encodeURIComponent(String(value === undefined || value === null ? '' : value))
+      .replace(/[!'()*]/g, function (ch) {
+        return '%' + ch.charCodeAt(0).toString(16).toUpperCase();
+      });
+  }
+
+  function buildCmdEnter(text) {
+    var value = String(text || '').trim().slice(0, CMD_TEXT_MAX);
+    if (!value) return '';
+    return '<qqbot-cmd-enter text="' + encodeCmdValue(value) + '" />';
+  }
+
+  function buildCmdInput(text, show, reference) {
+    var value = String(text || '').trim().slice(0, CMD_TEXT_MAX);
+    if (!value) return '';
+    var shown = String(show || '').trim().slice(0, CMD_TEXT_MAX);
+    var tag = '<qqbot-cmd-input text="' + encodeCmdValue(value) + '"';
+    if (shown && shown !== value) tag += ' show="' + encodeCmdValue(shown) + '"';
+    if (reference) tag += ' reference="true"';
+    return tag + ' />';
+  }
+
+  function cmdTagCount(text) {
+    var re = new RegExp(CMD_TAG_RE.source, 'gi');
+    var count = 0;
+    while (re.exec(String(text || '')) !== null) count += 1;
+    return count;
+  }
+
+  function renderCmdHint() {
+    var node = U.el('cmdHint');
+    if (!node) return;
+    var field = U.el('content');
+    var count = cmdTagCount(field ? field.value : '');
+    node.textContent = count ? ('已插入 ' + count + ' 个指令标签') : '';
+  }
+
+  /* 输入框内容变化后统一刷新：@ 提示、指令标签提示、格式自动切换 */
+  function refreshComposerHints() {
+    var field = U.el('content');
+    renderMentionHint();
+    renderCmdHint();
+    if (field) syncFormatWithContent(field.value, true);
+  }
+
+  function insertCmdTag() {
+    var kind = (U.el('cmdKind') && U.el('cmdKind').value === 'input') ? 'input' : 'enter';
+    var text = U.el('cmdText') ? String(U.el('cmdText').value || '') : '';
+    var show = U.el('cmdShow') ? String(U.el('cmdShow').value || '') : '';
+    var reference = !!(U.el('cmdReference') && U.el('cmdReference').checked);
+    if (!text.trim()) {
+      setStatus('请先填「点击后发送/插入的文本」（例如 /帮助）', 'err');
+      return;
+    }
+    if (text.trim().length > CMD_TEXT_MAX) {
+      setStatus('指令文本最多 ' + CMD_TEXT_MAX + ' 个字符（官方限制）', 'err');
+      return;
+    }
+    var tag = (kind === 'input') ? buildCmdInput(text, show, reference) : buildCmdEnter(text);
+    if (!tag) {
+      setStatus('指令文本不能为空', 'err');
+      return;
+    }
+    insertTagAtCaret(tag);
+    setFormat('markdown');                       // 指令标签只有 Markdown 消息支持
+    setStatus('已插入' + (kind === 'input' ? '参数指令' : '回车指令') +
+              '标签，并切换为 Markdown 格式');
+    if (U.el('cmdText')) U.el('cmdText').value = '';
+    if (U.el('cmdShow')) U.el('cmdShow').value = '';
+    if (U.el('cmdReference')) U.el('cmdReference').checked = false;
+    refreshComposerHints();
+  }
+
+  function toggleCmdPanel(force) {
+    var panel = U.el('cmdPanel');
+    if (!panel) return;
+    var show = (force === undefined) ? (panel.style.display === 'none') : !!force;
+    panel.style.display = show ? 'flex' : 'none';
+    if (show) {
+      cmdLimit();
+      if (U.el('cmdText')) U.el('cmdText').focus();
+    }
   }
 
   function buildForm(targetType, openid) {
@@ -956,17 +1242,31 @@
         targetType: Chat.activeType, openid: Chat.activeOpenid,
         content: content, bot_id: Chat.botId
       };
-      if (imageUrl) body.image_url = imageUrl;
+      if (imageUrl) {
+        body.image_url = imageUrl;
+      } else {
+        // 只有纯文本分支带 format；上传文件/图片/图片链接分支一律不带。
+        // 正文里有 @/指令标签时先自动切到 Markdown（这两类标签只在 markdown 里渲染）。
+        syncFormatWithContent(content, true);
+        body.format = currentFormat();
+      }
       if (Chat.quote) body.msg_id = Chat.quote.msg_id;
       request = U.postJSON('/api/chat/send', body);
     }
 
     request.then(function (data) {
-      var modeText = { text: '文本', image: '图片', image_link: '图片链接',
-                       file: '文件', link: '文件链接' }[data.mode] || '消息';
-      setStatus('✅ ' + modeText + '发送成功' + (data.note ? '（' + data.note + '）' : ''), 'ok');
+      var okText;
+      if (data.mode === 'text') {
+        okText = (data.format === 'markdown') ? 'Markdown 文本发送成功' : '文本发送成功';
+      } else {
+        var modeText = { image: '图片', image_link: '图片链接',
+                         file: '文件', link: '文件链接' }[data.mode] || '消息';
+        okText = modeText + '发送成功';
+      }
+      setStatus('✅ ' + okText + (data.note ? '（' + data.note + '）' : ''), 'ok');
       U.el('content').value = '';
       U.el('imageUrl').value = '';
+      refreshComposerHints();
       clearPending();
       Chat.quote = null;
       renderQuoteBar();
@@ -1132,6 +1432,7 @@
     renderMessages([], { force: true });
     U.el('chatTitle').textContent = '未选择会话';
     U.el('chatSub').textContent = '从左侧选择一个会话';
+    loadMentionCandidates();
     loadConversations().then(function () {
       if (Chat.conversations.length) openConversation(Chat.conversations[0]);
     }).catch(function () { /* 忽略 */ });
@@ -1248,7 +1549,37 @@
 
   /* ============================ 事件绑定 ============================ */
   function init() {
+    restoreFormat();
     U.el('sendBtn').addEventListener('click', sendMessage);
+    // 群 @：选成员 → 往输入框插官方标签；输入框内容变化时刷新"将 @ 谁"的提示
+    var mentionPicker = U.el('mentionPicker');
+    if (mentionPicker) {
+      mentionPicker.addEventListener('change', function () {
+        var openid = this.value;
+        this.value = '';
+        if (openid) insertMention(openid);
+      });
+    }
+    U.el('content').addEventListener('input', refreshComposerHints);
+    refreshComposerHints();
+    // 指令标签面板：⌘ 指令 展开 → 填文本 → 插入（插入时自动切 Markdown）
+    if (U.el('cmdBtn')) {
+      U.el('cmdBtn').addEventListener('click', function () { toggleCmdPanel(); });
+    }
+    if (U.el('cmdInsert')) U.el('cmdInsert').addEventListener('click', insertCmdTag);
+    if (U.el('cmdClose')) U.el('cmdClose').addEventListener('click', function () { toggleCmdPanel(false); });
+    if (U.el('cmdKind')) {
+      U.el('cmdKind').addEventListener('change', function () {
+        var isInput = this.value === 'input';
+        if (U.el('cmdShow')) U.el('cmdShow').disabled = !isInput;
+        if (U.el('cmdReference')) U.el('cmdReference').disabled = !isInput;
+        setStatus(isInput ? '参数指令：用户点击后文本插入输入框（可带引用）'
+                          : '回车指令：用户点击后文本直接发送（官方：群聊/文字子频道不支持）');
+      });
+    }
+    if (U.el('cmdShow')) U.el('cmdShow').disabled = true;
+    if (U.el('cmdReference')) U.el('cmdReference').disabled = true;
+    cmdLimit();
     U.el('content').addEventListener('keydown', function (event) {
       if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
@@ -1338,5 +1669,20 @@
   Chat.onBotChanged = onBotChanged;
   Chat.imageKeys = imageKeys;          // 供测试与调试使用
   Chat.messageHtmlForTest = messageHtml;
-  global.Chat = Chat;
+  Chat.formatForTest = {               // 供测试与调试使用（格式自动切换 / 指令标签）
+    currentFormat: currentFormat,
+    syncFormatWithContent: syncFormatWithContent,
+    markdownOnlyParts: markdownOnlyParts,
+    buildCmdEnter: buildCmdEnter,
+    buildCmdInput: buildCmdInput,
+    insertCmdTag: insertCmdTag,
+    insertMention: insertMention,
+    atUserIds: atUserIds,
+    readCmdTag: readCmdTag,
+    cmdTagCount: cmdTagCount,
+    cmdTextMax: CMD_TEXT_MAX,
+  };
+    // 防止整个对象被别人替换掉（对象内部字段照旧可改，见 util.js 的 protectGlobal）
+  if (typeof global.__qbmProtect === 'function') global.__qbmProtect('Chat', Chat);
+  else global.Chat = Chat;
 })(window);

@@ -16,6 +16,24 @@
 
   function el(id) { return document.getElementById(id); }
 
+  /* 把一个命名空间挂成"只读的全局绑定"：
+     目的不是冻结对象本身（那会让 `Chat.byKey = {}` 这类整字段重新赋值全部失效），
+     而是防止**整个对象被别人替换掉**（别的脚本 / 控制台 / 被注入的页面）。
+     做法：先普通赋值保证一定挂得上，再重定义成 writable=false / configurable=false。 */
+  function protectGlobal(name, value) {
+    try {
+      global[name] = value;
+    } catch (e) { /* 只读环境下普通赋值会失败：下面用 defineProperty 再试 */ }
+    try {
+      // 用裸 Object（浏览器里就是 window.Object；某些测试/沙箱环境的 window 桩上没有挂 Object）
+      Object.defineProperty(global, name, {
+        value: value, writable: false, enumerable: true, configurable: false
+      });
+    } catch (e) { /* 环境不支持 / 已定义过：保留普通赋值的结果 */ }
+    return value;
+  }
+  global.__qbmProtect = protectGlobal;      // 供其它几个脚本文件使用
+
   function esc(text) {
     return String(text === undefined || text === null ? '' : text)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -46,11 +64,18 @@
   /* ---------------- 网络 ---------------- */
   function getJSON(path) {
     return fetch(apiUrl(path), { credentials: 'same-origin' }).then(function (response) {
-      if (response.status === 401) {
-        throw new Error('访问令牌无效：请在网址后面加上 ?token=你的令牌');
-      }
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      return response.json();
+      return response.json().catch(function () { return {}; }).then(function (data) {
+        if (response.status === 401) {
+          throw new Error('访问令牌无效：请在网址后面加上 ?token=你的令牌');
+        }
+        // 非 2xx 时优先用后端文案，并把响应体一起抛出来，页面才能显示真实原因
+        if (!response.ok) {
+          var error = new Error(data && data.message ? data.message : ('HTTP ' + response.status));
+          error.payload = data || {};
+          throw error;
+        }
+        return data;
+      });
     });
   }
 
@@ -239,6 +264,10 @@
     fmtTime: fmtTime,
     humanSize: humanSize,
     humanDuration: humanDuration,
-    debounce: debounce
+    debounce: debounce,
+    protectGlobal: protectGlobal
   };
+
+  // 自己的全局绑定同样锁成只读（防止别的脚本把 Util 整个换掉）
+  protectGlobal('Util', global.Util);
 })(window);

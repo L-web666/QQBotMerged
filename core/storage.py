@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS media (
     source       TEXT DEFAULT 'received',
     url          TEXT DEFAULT '',
     url_hash     TEXT DEFAULT '',
+    sha256       TEXT DEFAULT '',
     local_name   TEXT DEFAULT '',
     file_name    TEXT DEFAULT '',
     content_type TEXT DEFAULT '',
@@ -299,8 +300,26 @@ class SQLiteStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(SCHEMA)
+            self._migrate_media_sha256_locked()
             self._conn.commit()
         logger.info("消息库已就绪: %s", db_path)
+
+    def _migrate_media_sha256_locked(self):
+        """给老库补上 `media.sha256`（按内容去重用）。
+
+        注意：`SCHEMA` 里的 `CREATE TABLE IF NOT EXISTS` 对**已存在**的库是空操作，
+        所以老库不会自动多出这一列，必须显式 ALTER。索引也放在这里建 ——
+        如果写进 SCHEMA，老库执行 `CREATE INDEX ... (sha256)` 会因为列不存在直接报错，
+        整个程序起不来。调用方必须已经持有 `self._lock`。
+        """
+        try:
+            columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(media)")}
+            if "sha256" not in columns:
+                self._conn.execute("ALTER TABLE media ADD COLUMN sha256 TEXT DEFAULT ''")
+                logger.info("媒体表已补列 media.sha256（同一张图片只留一份）")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_media_sha ON media(sha256)")
+        except sqlite3.Error as exc:
+            logger.warning("媒体表补列/建索引失败（不影响消息收发）: %s", exc)
 
     # ------------------------------------------------------------------ 基础
     def _execute(self, sql: str, params: tuple = ()):
@@ -460,6 +479,25 @@ class SQLiteStore:
             self._execute("UPDATE conversations SET unread=0 WHERE conv_key=?", (conv_key,))
         else:
             self._execute("UPDATE conversations SET unread=0")
+
+    def recent_senders(self, conv_key: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """某个会话里最近说过话的人（用于群聊 @ 候选名单）。
+
+        为什么需要它：官方「查询群成员」接口要求机器人是群管理员，拉不到时也有这个兜底 ——
+        「最近在群里说过话的人」通常就是要 @ 的人。只统计收到（`in`）的消息，按最后发言时间倒序。
+        """
+        key = str(conv_key or "").strip()
+        if not key:
+            return []
+        rows = self._query(
+            """SELECT openid, MAX(username) AS username, COUNT(*) AS count, MAX(ts) AS last_ts
+               FROM messages
+               WHERE conv_key=? AND direction='in' AND openid<>''
+               GROUP BY openid
+               ORDER BY last_ts DESC
+               LIMIT ?""",
+            (key, max(1, int(limit or 200))))
+        return [dict(row) for row in rows]
 
     def count(self, bot_id: str = "") -> int:
         if bot_id:
@@ -703,6 +741,20 @@ class SQLiteStore:
             (conv_key, msg_id))
         return rows[0]["raw_event"] if rows else ""
 
+    def member_role_rows(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        """取"带原始报文的入站群消息"，用于补齐群成员身份。
+
+        背景：官方群消息的 `author.member_role` 每条都带身份，但老版本没存下来；
+        这些报文一直躺在 `messages.raw_event` 里，可以直接解析出来补进群成员表，
+        不必联网、也不必让群成员接口可用。
+        返回 [{bot_id, group_openid, raw_event}]。
+        """
+        rows = self._query(
+            """SELECT bot_id, group_openid, raw_event FROM messages
+               WHERE direction='in' AND group_openid<>'' AND raw_event<>''
+               ORDER BY id DESC LIMIT ?""", (int(limit),))
+        return [dict(row) for row in rows]
+
     def name_index(self, limit: int = 1000) -> Dict[str, str]:
         """openid → 昵称（取自**收到的**消息，机器人自己的消息不算）。
 
@@ -852,11 +904,12 @@ class SQLiteStore:
         with self._lock:
             cursor = self._conn.execute(
                 """INSERT INTO media
-                   (bot_id, conv_key, msg_id, source, url, url_hash, local_name, file_name,
+                   (bot_id, conv_key, msg_id, source, url, url_hash, sha256, local_name, file_name,
                     content_type, size, state, error, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (record.get("bot_id", ""), record.get("conv_key", ""), record.get("msg_id", ""),
                  record.get("source", "received"), record.get("url", ""), record.get("url_hash", ""),
+                 record.get("sha256", ""),
                  record.get("local_name", ""), record.get("file_name", ""),
                  record.get("content_type", ""), int(record.get("size") or 0),
                  record.get("state", "done"), record.get("error", ""),
@@ -869,6 +922,20 @@ class SQLiteStore:
             return None
         rows = self._query(
             "SELECT * FROM media WHERE url_hash=? AND state='done' ORDER BY id DESC LIMIT 1", (url_hash,))
+        return dict(rows[0]) if rows else None
+
+    def find_media_by_sha256(self, sha256: str) -> Optional[Dict[str, Any]]:
+        """按内容指纹找一份已经留存的媒体（"同一张图片只存一次"用）。
+
+        为什么不能只按 URL 去重：多个机器人同在一个群时，同一条消息里的图片会分别
+        下发给每个机器人，**每份下载地址都带各自的 rkey 签名**，URL 完全不同，但内容
+        一模一样，只按 `url_hash` 去重根本拦不住。
+        """
+        digest = str(sha256 or "").strip()
+        if not digest:
+            return None
+        rows = self._query(
+            "SELECT * FROM media WHERE sha256=? AND state='done' ORDER BY id DESC LIMIT 1", (digest,))
         return dict(rows[0]) if rows else None
 
     def list_media(self, limit: int = 200, conv_key: str = "", source: str = "",
@@ -924,14 +991,21 @@ class SQLiteStore:
                        WHERE bot_id=? AND group_openid=? AND member_openid=?""",
                     (bot_id, group_openid, openid)).fetchone()
                 joined = existing["joined_at"] if existing else now
+                # 身份只在"这次带了有效身份"时才更新：这条消息没带 member_role
+                # （私聊/老事件）或者带的是 unknown，都不能把已知的群主/管理员降级。
+                incoming_role = str(member.get("role") or "").strip()
                 self._conn.execute(
                     """INSERT INTO group_members
                        (bot_id, group_openid, member_openid, username, role, joined_at, updated_at)
                        VALUES (?,?,?,?,?,?,?)
                        ON CONFLICT(bot_id, group_openid, member_openid) DO UPDATE SET
-                         username=excluded.username, role=excluded.role, updated_at=excluded.updated_at""",
+                         username=CASE WHEN excluded.username<>'' THEN excluded.username
+                                       ELSE group_members.username END,
+                         role=CASE WHEN excluded.role NOT IN ('', 'unknown') THEN excluded.role
+                                   ELSE group_members.role END,
+                         updated_at=excluded.updated_at""",
                     (bot_id, group_openid, openid, str(member.get("username") or "")[:200],
-                     str(member.get("role") or "member"), joined, now))
+                     incoming_role or "unknown", joined, now))
             self._conn.commit()
 
     def list_members(self, group_openid: str, bot_id: str = "") -> List[Dict[str, Any]]:

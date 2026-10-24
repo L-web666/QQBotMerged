@@ -100,6 +100,7 @@ class FakeClient:
         self.last_error = ""
         self._config_source = config_source
         self._configured = True          # 显式状态，便于测试里模拟"凭据被清空"
+        self.panels = {}                 # scope -> 面板列表（测试里可填，模拟"线上已有面板"）
 
     # ---- 基础设施 ----
     @property
@@ -115,10 +116,11 @@ class FakeClient:
 
     # ---- 发送 ----
     def send_text(self, target_type, openid, content, reply_msg_id="", msg_type=0,
-                  reply_style=""):
+                  reply_style="", fmt=""):
+        # `fmt` 只用于记录（第 [44] 节断言「格式真的传到了客户端」），不改变返回结构
         self.calls.append({"kind": "text", "target": target_type, "openid": openid,
                            "content": content, "reply_to": reply_msg_id,
-                           "reply_style": reply_style})
+                           "reply_style": reply_style, "fmt": fmt})
         # 像真实接口一样返回消息 ID（撤回消息必须用到它）
         return {"id": f"ROBOT1.0_MSG_{len(self.calls)}"}
 
@@ -226,7 +228,8 @@ class FakeClient:
     # ---- 指令面板 ----
     def list_command_panels(self, scope="c2c", with_raw=False):
         self.calls.append({"kind": "panel_list", "scope": scope})
-        return ([], "") if with_raw else []
+        items = list(self.panels.get(scope) or [])
+        return (items, "") if with_raw else items
 
     def create_command_panel(self, scope, target_type, items, remark="", openids=None):
         self.calls.append({"kind": "panel_create", "scope": scope, "target_type": target_type,
@@ -245,6 +248,9 @@ class FakeClient:
 
     def delete_command_panel(self, panel_id):
         self.calls.append({"kind": "panel_delete", "panel_id": panel_id})
+        for scope in list(self.panels):
+            self.panels[scope] = [p for p in self.panels[scope]
+                                  if str(p.get("panel_id")) != str(panel_id)]
         return True
 
     def normalize_panel_items(self, items):
@@ -3355,6 +3361,1410 @@ class GroupPlugin(Star):
           == _schema.DEFAULT_CONFIG["send"]["max_file_mb"]
           and (_fresh.config.data.get("send") or {}).get("reply_style") == "both",
           json.dumps((_fresh.config.data.get("send") or {}), ensure_ascii=False)[:200])
+
+    # ------------------------------------------------------------------ 33. 指令面板按机器人隔离
+    print("\n[33] 指令面板：按机器人隔离（列表 / 删除 / 过期页面）")
+    # 先记下现场：本节结尾要原样还回去，避免影响别的测试/后续运行
+    _orig_bots = json.loads(json.dumps(config_manager.config.get("bots") or []))
+    _orig_active = config_manager.active_bot_id()
+    _orig_panel_ids = runtime._load_panel_ids()
+    bot2 = "bot2"
+    # 第二个机器人：照 [19] 的写法写进配置并让运行侧对账出实例
+    _two_bots = json.loads(json.dumps(_orig_bots))
+    _two_bots.append({"id": bot2, "name": "机器人 2", "enabled": True, "app_id": "9999999999",
+                      "app_secret": "secret2", "sandbox": False, "intents": 100663296,
+                      "reconnect_attempts": 5, "reconnect_interval": 10})
+    config_manager.set_path("bots", _two_bots)
+    config_manager.save()
+    runtime._reconcile_bots()
+    fake2 = fakes.get(bot2)
+    if not isinstance(fake2, FakeClient):        # 新建的实例用的是真客户端，换成桩
+        fake2 = FakeClient(bot2, config_source=lambda: config_manager.config)
+        fakes[bot2] = fake2
+    if runtime.bots.get(bot2) is not None:
+        runtime.bots[bot2].client = fake2
+        runtime.bots[bot2].gateway.api = fake2
+    runtime._ai_clients[bot2] = runtime.ai_client
+    check("测试环境已装上第二个机器人（隔离用例的前置）",
+          bot2 in runtime.bots and runtime.get_client(bot2) is fake2, str(list(runtime.bots)))
+
+    # 两个机器人各自"线上"有一套不同的面板
+    fake.panels = {"c2c": [{"panel_id": "P_ONE_C2C", "scope": "c2c", "target_type": "all"}],
+                   "group": []}
+    fake2.panels = {"c2c": [{"panel_id": "P_TWO_C2C", "scope": "c2c"}], "group": []}
+    # 缓存里两个机器人各有一条（键按 bot:scope 分开）
+    runtime._save_panel_ids({f"{bot_id}:c2c": "P_ONE_C2C", f"{bot2}:c2c": "P_TWO_C2C"})
+
+    config_manager.set_active_bot(bot_id)
+    body_1 = client.get("/api/admin/panels").get_json()
+    ids_1 = [str(item.get("panel_id")) for item in (body_1.get("panels") or [])]
+    check("切到 bot1 时列表给出 bot1 的面板",
+          body_1.get("bot_id") == bot_id and ids_1 == ["P_ONE_C2C"],
+          f"bot={body_1.get('bot_id')} ids={ids_1}")
+    config_manager.set_active_bot(bot2)
+    body_2 = client.get("/api/admin/panels").get_json()
+    ids_2 = [str(item.get("panel_id")) for item in (body_2.get("panels") or [])]
+    check("切换机器人后指令面板跟着换（不再串到上一个机器人）",
+          body_2.get("bot_id") == bot2 and ids_2 == ["P_TWO_C2C"] and "P_ONE_C2C" not in ids_2,
+          f"bot={body_2.get('bot_id')} ids={ids_2}")
+    check("列表里的每一项都带当前机器人 id",
+          bool(body_2.get("panels")) and all(item.get("bot_id") == bot2
+                                             for item in body_2["panels"]),
+          str(body_2.get("panels"))[:200])
+    check("缓存里的 registered 也按机器人分开",
+          (body_1.get("registered") or {}).get("c2c") == "P_ONE_C2C"
+          and (body_2.get("registered") or {}).get("c2c") == "P_TWO_C2C",
+          f"bot1={body_1.get('registered')} bot2={body_2.get('registered')}")
+
+    # 过期页面：页面还停在 bot2，服务端已经切回 bot1
+    config_manager.set_active_bot(bot_id)
+    stale = client.get(f"/api/admin/panels?bot={bot2}")
+    stale_body = stale.get_json()
+    check("过期页面（页面停在 bot2、服务端是 bot1）访问列表会 409",
+          stale.status_code == 409 and stale_body.get("bot_id") == bot_id,
+          f"status={stale.status_code} body={str(stale_body)[:200]}")
+
+    # 跨机器人删除：bot2 的面板，绝不能借当前机器人（或过期页面）删掉
+    fake.calls.clear()
+    fake2.calls.clear()
+    cross = client.post("/api/admin/panels/delete",
+                        json={"panel_id": "P_TWO_C2C", "bot_id": bot2})
+    cross_body = cross.get_json()
+    cross_deleted = [c for c in (fake.calls + fake2.calls) if c.get("kind") == "panel_delete"]
+    check("跨机器人删除被拒（页面给的 bot_id 与服务端不一致 → 409），且不调用平台删除",
+          cross.status_code == 409 and not cross_deleted
+          and "刷新" in str(cross_body.get("message") or ""),
+          f"status={cross.status_code} body={str(cross_body)[:200]} deleted={cross_deleted}")
+    # 归属校验：以当前机器人身份删别人的面板 → 403「不属于」，同样不调平台删除
+    fake.calls.clear()
+    fake2.calls.clear()
+    foreign = client.post("/api/admin/panels/delete",
+                          json={"panel_id": "P_TWO_C2C", "bot_id": bot_id})
+    foreign_body = foreign.get_json()
+    foreign_deleted = [c for c in (fake.calls + fake2.calls) if c.get("kind") == "panel_delete"]
+    check("不属于当前机器人的面板被 403 拒绝（message 含「不属于」），且不调用平台删除",
+          foreign.status_code == 403 and "不属于" in str(foreign_body.get("message") or "")
+          and not foreign_deleted,
+          f"status={foreign.status_code} body={str(foreign_body)[:200]} deleted={foreign_deleted}")
+
+    # 删自己的：200 + 清掉本机器人对应 scope 的缓存键
+    config_manager.set_active_bot(bot_id)
+    fake.calls.clear()
+    fake2.calls.clear()
+    own = client.post("/api/admin/panels/delete",
+                      json={"panel_id": "P_ONE_C2C", "bot_id": bot_id})
+    own_body = own.get_json()
+    cache_after = runtime._load_panel_ids()
+    check("删自己的面板成功（200 / success）",
+          own.status_code == 200 and own_body.get("success") is True
+          and (own_body.get("removed") or {}).get("scope") == "c2c",
+          f"status={own.status_code} body={str(own_body)[:200]}")
+    check("删除成功后清掉本机器人 c2c 的缓存键（别的机器人缓存不受影响）",
+          f"{bot_id}:c2c" not in cache_after and cache_after.get(f"{bot2}:c2c") == "P_TWO_C2C",
+          str(cache_after))
+    check("删除只调用了当前机器人的平台删除接口",
+          [c for c in fake.calls if c.get("kind") == "panel_delete"]
+          and not [c for c in fake2.calls if c.get("kind") == "panel_delete"],
+          f"bot1={[c.get('kind') for c in fake.calls]} bot2={[c.get('kind') for c in fake2.calls]}")
+    after = client.get("/api/admin/panels").get_json()
+    ids_after = [str(item.get("panel_id")) for item in (after.get("panels") or [])]
+    check("删除后列表里不再出现该面板", "P_ONE_C2C" not in ids_after, str(ids_after))
+
+    # 缓存没了但线上还有 → 仍可删（归属以线上列表为准，不是只看缓存）
+    fake.panels = {"c2c": [], "group": [{"panel_id": "P_ONE_GROUP", "scope": "group",
+                                         "target_type": "all"}]}
+    runtime._save_panel_ids({})
+    by_list = client.post("/api/admin/panels/delete",
+                          json={"panel_id": "P_ONE_GROUP", "bot_id": bot_id})
+    by_list_body = by_list.get_json()
+    check("缓存过期但线上还有的面板仍可删（归属判定以线上列表为准）",
+          by_list.status_code == 200 and by_list_body.get("success") is True
+          and (by_list_body.get("removed") or {}).get("panel_id") == "P_ONE_GROUP",
+          f"status={by_list.status_code} body={str(by_list_body)[:200]}")
+
+    # 还原：配置回到只剩原本的机器人、活动机器人复位、面板缓存写回原样、桩数据清空
+    config_manager.set_path("bots", _orig_bots)
+    config_manager.save()
+    runtime._reconcile_bots()
+    config_manager.set_active_bot(_orig_active or bot_id)
+    runtime._save_panel_ids(_orig_panel_ids)
+    fake.panels = {}
+    fakes.pop(bot2, None)
+    check("第 [33] 节结束后环境已还原（配置/活动机器人/面板缓存）",
+          [str(item.get("id")) for item in (config_manager.config.get("bots") or [])]
+          == [str(item.get("id")) for item in _orig_bots]
+          and config_manager.active_bot_id() == (_orig_active or bot_id)
+          and runtime._load_panel_ids() == _orig_panel_ids,
+          f"bots={config_manager.config.get('bots')} active={config_manager.active_bot_id()}")
+
+    # ------------------------------------------------------------------ 34. 保存配置的机器人归属
+    print("\n[34] 保存配置时的机器人归属校验（不让空白/未知 bot_id 写全局）")
+    # 先记下现场：本节结尾要原样还回去（照 [33] 的做法），不影响后续
+    _orig_bots34 = json.loads(json.dumps(config_manager.config.get("bots") or []))
+    _orig_active34 = config_manager.active_bot_id()
+    _orig_panel_ids34 = runtime._load_panel_ids()
+    _global_panels34 = config_manager.config.get("panels", "enabled")
+    _global_reply34 = config_manager.config.get("reply", "max_segment_length")
+
+    def _overrides_snapshot():
+        return {str(item.get("id")): config_manager.bot_overrides(str(item.get("id")))
+                for item in (config_manager.config.get("bots") or []) if isinstance(item, dict)}
+
+    config_manager.set_active_bot(bot_id)          # 关键：active 是个真实的 id
+    _ov_before = _overrides_snapshot()
+
+    # (1) 纯空白 bot_id + per-bot 段：以前会被写成全局，现在必须 400 且一个字节都不落盘
+    blank = client.post("/api/admin/config",
+                        json={"config": {"panels": {"enabled": False}}, "bot_id": "   "})
+    blank_body = blank.get_json()
+    check("纯空白 bot_id 保存 per-bot 段被 400 拒绝（不再当成有效 id 写全局）",
+          blank.status_code == 400 and blank_body.get("success") is False
+          and "机器人" in str(blank_body.get("message") or ""),
+          f"status={blank.status_code} body={str(blank_body)[:200]}")
+    check("被拒后全局 panels.enabled 没有被改",
+          config_manager.config.get("panels", "enabled") == _global_panels34,
+          f"before={_global_panels34} now={config_manager.config.get('panels', 'enabled')}")
+    check("被拒后没有任何机器人的 overrides 被写",
+          _overrides_snapshot() == _ov_before, str(_overrides_snapshot()))
+
+    # (2) 未知 bot_id + per-bot 段：400（报错让用户刷新，而不是静默丢弃保存）
+    ghost = client.post("/api/admin/config",
+                        json={"config": {"reply": {"max_segment_length": 1234}},
+                              "bot_id": "ghostbot"})
+    ghost_body = ghost.get_json()
+    check("未知 bot_id 保存 per-bot 段被 400 拒绝",
+          ghost.status_code == 400 and "未知机器人" in str(ghost_body.get("message") or ""),
+          f"status={ghost.status_code} body={str(ghost_body)[:200]}")
+    check("未知 bot_id 被拒后全局 reply.max_segment_length 没有被改",
+          config_manager.config.get("reply", "max_segment_length") == _global_reply34,
+          f"now={config_manager.config.get('reply', 'max_segment_length')}")
+
+    # (3) 不带 bot_id + per-bot 段 + 配置里有机器人：不能猜"当前选中"，必须 400
+    orphan = client.post("/api/admin/config",
+                         json={"reply": {"max_segment_length": 1234}})
+    orphan_body = orphan.get_json()
+    check("没带 bot_id 却含 per-bot 段被 400（页面过期时不猜当前机器人）",
+          orphan.status_code == 400
+          and "没带机器人 id" in str(orphan_body.get("message") or ""),
+          f"status={orphan.status_code} body={str(orphan_body)[:200]}")
+    check("没带 bot_id 被拒后该值既没写全局也没写进任何机器人的 overrides",
+          config_manager.config.get("reply", "max_segment_length") == _global_reply34
+          and _overrides_snapshot() == _ov_before,
+          f"global={config_manager.config.get('reply', 'max_segment_length')}")
+
+    # (4) 回归：带真实 bot_id + per-bot 段照旧 200，并写进该机器人的覆盖（不是全局）
+    good = client.post("/api/admin/config",
+                       json={"config": {"reply": {"max_segment_length": 1234}},
+                             "bot_id": bot_id})
+    good_body = good.get_json()
+    check("带真实 bot_id 的正常保存仍是 200",
+          good.status_code == 200 and good_body.get("success") is True,
+          f"status={good.status_code} body={str(good_body)[:200]}")
+    check("该值写进了这个机器人的 overrides、没有污染全局",
+          (config_manager.bot_overrides(bot_id).get("reply") or {}).get("max_segment_length") == 1234
+          and config_manager.config.get("reply", "max_segment_length") == _global_reply34,
+          f"overrides={config_manager.bot_overrides(bot_id)} "
+          f"global={config_manager.config.get('reply', 'max_segment_length')}")
+
+    # (5) panels/delete 收到非 dict 的 JSON 一律当空体 → 400（以前 body.get 抛 500）
+    bad_array = client.post("/api/admin/panels/delete", json=[{"panel_id": "P_X"}])
+    check("panels/delete 收到 JSON 数组返回 400 而不是 500",
+          bad_array.status_code == 400
+          and (bad_array.get_json() or {}).get("success") is False,
+          f"status={bad_array.status_code} body={str(bad_array.get_json())[:200]}")
+    check("panels/delete 收到空数组同样 400（不会 500）",
+          client.post("/api/admin/panels/delete", json=[]).status_code == 400)
+    check("panels/delete 收到 JSON 字符串同样 400（不会 500）",
+          client.post("/api/admin/panels/delete", json="oops").status_code == 400)
+
+    # (6) 面板缓存：原子写 + 读回一致 + 不留 .tmp 残留；并确认读写锁已就位
+    _atomic_file = runtime.panel_ids_file
+    runtime._save_panel_ids({f"{bot_id}:c2c": "P_ATOMIC_C2C",
+                             f"{bot_id}:group": "P_ATOMIC_GROUP"})
+    _atomic_back = runtime._load_panel_ids()
+    check("面板缓存写后能原样读回",
+          _atomic_back.get(f"{bot_id}:c2c") == "P_ATOMIC_C2C"
+          and _atomic_back.get(f"{bot_id}:group") == "P_ATOMIC_GROUP",
+          str(_atomic_back))
+    check("原子写不留下 command_panel.json.tmp 残留文件",
+          not os.path.isfile(_atomic_file + ".tmp"), _atomic_file + ".tmp")
+    check("面板缓存读写锁已就位（注册流程与网页删除流程共用同一把）",
+          hasattr(runtime, "_panel_ids_lock"), "缺少 _panel_ids_lock")
+
+    # (7) 兜底回归：配置里一个机器人都没有时，per-bot 段照旧写全局（不能拦死）
+    _global_remark34 = config_manager.config.get("panels", "remark")
+    config_manager.set_path("bots", [])
+    config_manager.save()
+    runtime._reconcile_bots()
+    empty_save = client.post("/api/admin/config",
+                             json={"config": {"panels": {"remark": "无机器人兜底"}}})
+    check("配置里没有任何机器人时，per-bot 段照旧写全局（兜底场景不被拦）",
+          empty_save.status_code == 200
+          and config_manager.config.get("panels", "remark") == "无机器人兜底",
+          f"status={empty_save.status_code} "
+          f"remark={config_manager.config.get('panels', 'remark')}")
+    config_manager.set_path("panels.remark", _global_remark34)     # 立刻还原全局值
+
+    # 还原：配置（含各机器人 overrides）、活动机器人、面板缓存都复位
+    config_manager.set_path("bots", _orig_bots34)
+    config_manager.save()
+    runtime._reconcile_bots()
+    config_manager.set_active_bot(_orig_active34 or bot_id)
+    runtime._save_panel_ids(_orig_panel_ids34)
+    check("第 [34] 节结束后环境已还原（配置/活动机器人/面板缓存）",
+          [str(item.get("id")) for item in (config_manager.config.get("bots") or [])]
+          == [str(item.get("id")) for item in _orig_bots34]
+          and config_manager.active_bot_id() == (_orig_active34 or bot_id)
+          and runtime._load_panel_ids() == _orig_panel_ids34
+          and config_manager.config.get("panels", "enabled") == _global_panels34
+          and config_manager.config.get("panels", "remark") == _global_remark34
+          and config_manager.config.get("reply", "max_segment_length") == _global_reply34,
+          f"bots={config_manager.config.get('bots')} active={config_manager.active_bot_id()}")
+
+    # ------------------------------------------------------------------ 35. 切换机器人
+    print("\n[35] 切换机器人不应触发整轮热更新（active_bot_id 不是设置项）")
+    # 先记现场：本节结尾要原样还回去（照 [33]/[34] 的做法），不影响收尾
+    _orig_bots35 = json.loads(json.dumps(config_manager.config.get("bots") or []))
+    _orig_active35 = config_manager.active_bot_id()
+    _orig_anim35 = config_manager.config.get("ui", "animation")
+    _orig_on_changed35 = runtime.on_config_changed
+    _orig_broadcast35 = runtime.broadcast
+
+    # 打桩：只记录"有没有真的热更新"，不跑真实链路（本节的互不干扰）
+    _calls35 = []
+    _casts35 = []
+
+    def _fake_on_changed35(source="测试"):
+        _calls35.append(source)
+        return []
+
+    runtime.on_config_changed = _fake_on_changed35
+    runtime.broadcast = lambda payload: _casts35.append(payload)
+
+    # 现场至少要有两个机器人才能"切换"：临时补一个（本节结束连列表一起还原）
+    _tmp_bot35 = {"id": "bot_switch_35", "name": "切换测试机器人", "enabled": False,
+                  "app_id": "", "app_secret": ""}
+    _work_bots35 = list(_orig_bots35) + [_tmp_bot35]
+    if not _orig_bots35:
+        _work_bots35.append({"id": "bot_switch_35b", "name": "切换测试机器人B",
+                             "enabled": False, "app_id": "", "app_secret": ""})
+    config_manager.set_path("bots", _work_bots35)
+    config_manager.save()
+    config_manager.set_active_bot("bot_switch_35")
+    _other35 = next((str(item.get("id")) for item in _work_bots35
+                     if isinstance(item, dict) and str(item.get("id")) != "bot_switch_35"), "")
+    # 上面"补一个机器人"本身是真变化：先把监视缓存对齐到当前文件状态，
+    # 后面的"切换机器人"才是纯净的 active_bot_id 变化
+    runtime._last_config_mtime = runtime._config_mtime()
+    runtime._config_fingerprint_cached = runtime._config_fingerprint()
+
+    try:
+        # (1)+(4) 只切换机器人：文件被重写（内容变了），但指纹不变 → 监视循环不热更新
+        _fp_before35 = runtime._config_fingerprint()
+        config_manager.set_active_bot(_other35)
+        _fp_after35 = runtime._config_fingerprint()
+        with open(config_manager.config_path, encoding="utf-8") as _handle35:
+            _saved_active35 = json.load(_handle35).get("active_bot_id")
+        check("切到另一个真实机器人后 active 确实变了、且配置指纹不变",
+              bool(_other35) and config_manager.active_bot_id() == _other35
+              and _fp_before35 == _fp_after35,
+              f"active={config_manager.active_bot_id()} "
+              f"fp={_fp_before35[:12]}->{_fp_after35[:12]}")
+        # 这里**故意不断言 mtime 变化**：Windows（NTFS 文件系统隧道）在"同名文件被删除后
+        # 15 秒内重建"时会复用原来的时间戳，而 _write() 恰恰是 tmp + os.replace 的同写法，
+        # 于是 os.path.getmtime 可能纹丝不动。"有没有真的写盘"必须看文件内容。
+        check("切换机器人确实写进了 config.json（文件里的 active_bot_id 变了）",
+              _saved_active35 == _other35, f"on_disk={_saved_active35!r} expect={_other35!r}")
+        # 指纹判定才是关键：把监视循环记的 mtime 拨到"旧值"，模拟"文件被重写过了"。
+        # （不能靠真实 mtime 差异，理由同上。）
+        runtime._last_config_mtime = runtime._config_mtime() - 5
+        _calls35.clear()
+        _casts35.clear()
+        _hot35 = runtime._config_watch_tick()
+        check("mtime 变了但指纹没变：监视循环不调用 on_config_changed",
+              _hot35 is False and _calls35 == [], f"hot={_hot35} calls={_calls35}")
+        check("切换机器人不再广播 config_changed（别的标签页不会弹「配置已更新」）",
+              not [c for c in _casts35 if isinstance(c, dict)
+                   and c.get("type") == "config_changed"], str(_casts35))
+
+        # (2) 真改一个设置：指纹必须变，监视循环照旧热更新
+        _new_anim35 = "lite" if _orig_anim35 != "lite" else "full"
+        config_manager.set_path("ui.animation", _new_anim35)
+        config_manager.save()
+        _fp_changed35 = runtime._config_fingerprint()
+        check("改真设置（ui.animation）后配置指纹变化",
+              _fp_changed35 != _fp_after35,
+              f"{_fp_after35[:12]} -> {_fp_changed35[:12]}")
+        runtime._last_config_mtime = runtime._config_mtime() - 5
+        _calls35.clear()
+        _casts35.clear()
+        _hot35b = runtime._config_watch_tick()
+        check("真改了设置时监视循环照旧热更新（来源=文件监视）",
+              _hot35b is True and _calls35 == ["文件监视"],
+              f"hot={_hot35b} calls={_calls35}")
+    finally:
+        runtime.on_config_changed = _orig_on_changed35
+        runtime.broadcast = _orig_broadcast35
+
+    # 还原：机器人列表 / active_bot_id / ui.animation / 监视状态
+    config_manager.set_path("bots", _orig_bots35)
+    config_manager.set_path("ui.animation", _orig_anim35)
+    config_manager.save()
+    _restore_active35 = _orig_active35 if any(
+        str(item.get("id")) == _orig_active35 for item in _orig_bots35
+        if isinstance(item, dict)) else ""
+    config_manager.set_active_bot(_restore_active35)
+    runtime._last_config_mtime = runtime._config_mtime()
+    runtime._config_fingerprint_cached = runtime._config_fingerprint()
+    check("第 [35] 节结束后环境已还原（机器人/活动机器人/动画/监视状态）",
+          [str(item.get("id")) for item in (config_manager.config.get("bots") or [])]
+          == [str(item.get("id")) for item in _orig_bots35]
+          and config_manager.config.get("ui", "animation") == _orig_anim35
+          and runtime.on_config_changed == _orig_on_changed35
+          and runtime._config_fingerprint_cached == runtime._config_fingerprint(),
+          f"bots={config_manager.config.get('bots')} "
+          f"anim={config_manager.config.get('ui', 'animation')}")
+
+    # ------------------------------------------------------------------ 36. 配置写盘
+    print("\n[36] 配置写盘：内容没变就不写 + 补全日志带键名")
+
+    # (1) 内容与磁盘逐字节一致时，save() 必须零写盘（用独立临时配置文件，不碰真实 config.json）
+    _same_path36 = os.path.join(test_root, f"config_same_{run_id}.json")
+    _same36 = load_config(_same_path36)              # 文件不存在 → 首次创建并写盘
+    _old_ts36 = time.time() - 3600                   # 故意把 mtime 拨到一小时前：真写了就一定会变
+    os.utime(_same_path36, (_old_ts36, _old_ts36))
+    _mtime_before36 = os.stat(_same_path36).st_mtime_ns
+    with open(_same_path36, "rb") as handle:
+        _bytes_before36 = handle.read()
+    _same36.save()                                   # 内容没变 → 应当直接 return，不写 tmp、不动 mtime
+    with open(_same_path36, "rb") as handle:
+        _bytes_after36 = handle.read()
+    check("内容没变的 save() 不写盘（mtime 与文件字节都不变）",
+          os.stat(_same_path36).st_mtime_ns == _mtime_before36
+          and _bytes_after36 == _bytes_before36,
+          f"mtime {_mtime_before36} -> {os.stat(_same_path36).st_mtime_ns}")
+
+    # (2) 真的改了值就必须写盘（mtime 变 + 新值落盘）
+    _same36.set_path("ui.animation", "lite")
+    _same36.save()
+    _mtime_after36 = os.stat(_same_path36).st_mtime_ns
+    with open(_same_path36, encoding="utf-8") as handle:
+        _text_after36 = handle.read()
+    check("改了设置（ui.animation=lite）后确实写盘（mtime 变化 + 新值落盘）",
+          _mtime_after36 != _mtime_before36 and '"animation": "lite"' in _text_after36,
+          f"mtime {_mtime_before36} -> {_mtime_after36}")
+
+    # (3) 补全缺失默认项：self.missing 记下键名、日志带键名、且这些键真的写进了文件
+    _fill_path36 = os.path.join(test_root, f"config_fill_{run_id}.json")
+    with open(_fill_path36, "w", encoding="utf-8") as handle:
+        json.dump({"send": {"reply_style": "both"}}, handle)      # 故意缺其它子项
+
+    _msgs36 = []
+
+    class _CollectHandler36(logging.Handler):
+        def emit(self, record):
+            _msgs36.append(record.getMessage())
+
+    _cfg_logger36 = logging.getLogger("core.config_manager")
+    _old_level36 = _cfg_logger36.level
+    _handler36 = _CollectHandler36()
+    _cfg_logger36.addHandler(_handler36)
+    _cfg_logger36.setLevel(logging.INFO)
+    try:
+        _fill36 = load_config(_fill_path36)
+    finally:
+        _cfg_logger36.removeHandler(_handler36)
+        _cfg_logger36.setLevel(_old_level36)
+    with open(_fill_path36, encoding="utf-8") as handle:
+        _saved36 = json.load(handle)
+
+    check("补全结果记进了 self.missing（形如 send.max_file_mb）",
+          "send.max_file_mb" in (_fill36.missing or [])
+          and "send.max_image_mb" in (_fill36.missing or []),
+          f"missing={(_fill36.missing or [])[:6]}")
+    check("补全日志带上了键名（不再只报数量）",
+          any("配置已补全" in msg and "send.max_file_mb" in msg for msg in _msgs36),
+          str(_msgs36)[:200])
+    check("missing 里记的键确实写进了配置文件（不是只记不写）",
+          (_saved36.get("send") or {}).get("max_file_mb")
+          == _schema.DEFAULT_CONFIG["send"]["max_file_mb"]
+          and (_saved36.get("send") or {}).get("max_image_mb")
+          == _schema.DEFAULT_CONFIG["send"]["max_image_mb"]
+          and (_saved36.get("send") or {}).get("reply_style") == "both",
+          json.dumps(_saved36.get("send") or {}, ensure_ascii=False)[:200])
+
+    # ------------------------------------------------------------------ 37. 路径规范化
+    print("\n[37] 配置里的路径要规范化（不出现正反斜杠混用）")
+    # 背景：config.json 里 storage.db_path 的默认值是 "data/messages.db"（刻意用 "/"，
+    # 好让同一份配置在 Linux 上也能用），而 Windows 的 os.path.join 不会把第二段里的
+    # "/" 规范化 → 启动日志里出现 "...\\QQBotMerged\\data/messages.db" 这种混用写法。
+    # 反向更危险：Windows 上写 "data\\messages.db" 的配置拿到 POSIX 上，"\"
+    # 不是分隔符会被当成文件名的一部分，直接建不出库。
+    _wrong_sep37 = "/" if os.sep == "\\" else "\\"          # 当前系统上"不该出现"的那个
+    _slash37 = config_manager.config.abs_path("data/messages.db")
+    _backslash37 = config_manager.config.abs_path("data\\messages.db")
+    _expect37 = os.path.normpath(os.path.join(paths.BASE_DIR, "data", "messages.db"))
+
+    check("abs_path('data/messages.db') 结果里没有非当前系统的分隔符"
+          f"（os.sep={os.sep!r} → 不应含 {_wrong_sep37!r}）",
+          _wrong_sep37 not in _slash37, f"path={_slash37!r}")
+    check("abs_path('data/messages.db') == normpath(join(BASE_DIR, 'data', 'messages.db'))",
+          _slash37 == _expect37, f"{_slash37!r} != {_expect37!r}")
+    check("反斜杠写法与正斜杠写法返回同一个字符串（同一份配置跨平台可用）",
+          _backslash37 == _slash37, f"{_backslash37!r} != {_slash37!r}")
+
+    # 绝对路径输入：只做 normpath，不能被当成相对路径再拼一次根目录
+    _abs_in37 = os.path.join(paths.BASE_DIR, "data", "messages.db")
+    _abs_out37 = config_manager.config.abs_path(_abs_in37)
+    check("绝对路径输入被 normpath 后原样返回（根目录不会被拼两次）",
+          _abs_out37 == _expect37 and _abs_out37.count(paths.BASE_DIR) == 1,
+          f"{_abs_out37!r}")
+
+    check("空串（含纯空白）仍然返回程序根目录",
+          config_manager.config.abs_path("") == paths.BASE_DIR
+          and config_manager.config.abs_path("   ") == paths.BASE_DIR,
+          repr(config_manager.config.abs_path("")))
+
+    # 真实链路：Runtime 用来建库的那个路径（启动日志打印的就是它）
+    _store_path37 = getattr(getattr(runtime, "store", None), "db_path", "")
+    check("运行时真实建库路径不含混合分隔符（日志里不会再出现 ...\\data/messages.db）",
+          bool(_store_path37) and _wrong_sep37 not in _store_path37,
+          f"store.db_path={_store_path37!r}")
+
+    # 再走一遍"默认配置"的真实取值链路：storage.db_path 用 schema 默认的 "data/messages.db"
+    # （测试主配置把它换成了 os.sep 写法，这里另开一份临时配置专门覆盖默认值场景）
+    _def_path37 = os.path.join(test_root, f"config_path37_{run_id}.json")
+    _def37 = load_config(_def_path37)
+    _default_db37 = _def37.config.str_of("storage", "db_path", default="data/messages.db")
+    _resolved37 = _def37.config.abs_path(_default_db37)
+    check("默认配置里的 storage.db_path（schema 默认 data/messages.db）解析后不带混合分隔符",
+          _default_db37 == "data/messages.db" and _wrong_sep37 not in _resolved37
+          and _resolved37 == _expect37,
+          f"{_default_db37!r} -> {_resolved37!r}")
+
+    # ------------------------------------------------------------------ 38. 库目录 & 降级
+    print("\n[38] 存储：群配置与库同目录（两种分隔符都对）+ 降级不静默")
+
+    # (1) 群配置/群名缓存必须和消息库落在同一个目录（否则"库在这儿、群配置在那儿"）
+    _db_val38 = config_manager.config.str_of("storage", "db_path", default="data/messages.db")
+    _expect_dir38 = os.path.dirname(config_manager.config.abs_path(_db_val38))
+    _dsn_dir38 = runtime._resolve_data_dir()
+    # 用 getattr 取"实例属性"（settings_path / db_path 不是类属性，会被第 [32] 节的
+    # "store / group_manager 上有没有这个方法"静态检查误报成不存在的调用）
+    _settings38 = getattr(runtime.group_manager, "settings_path")
+    _store_db38 = getattr(runtime.store, "db_path")
+    check("_resolve_data_dir() == dirname(abs_path(storage.db_path))（与建库同一套解析）",
+          _dsn_dir38 == _expect_dir38, f"{_dsn_dir38!r} != {_expect_dir38!r}")
+    check("group_settings.json 与消息库同一个目录",
+          os.path.dirname(os.path.abspath(_settings38)) == os.path.dirname(os.path.abspath(_store_db38)),
+          f"settings={_settings38!r} db={_store_db38!r}")
+
+    # (2) `data/x/db` 与 `data\x\db` 两种写法必须解析出同一个目录
+    _mix_dir38 = os.path.normpath(os.path.join(paths.BASE_DIR, "data", "_selftest", "sub38"))
+    _db_back38 = _db_val38
+    try:
+        config_manager.set_path("storage.db_path", "data/_selftest/sub38/messages.db")
+        _fwd_abs38 = config_manager.config.abs_path("data/_selftest/sub38/messages.db")
+        _fwd_dir38 = runtime._resolve_data_dir()
+        config_manager.set_path("storage.db_path", "data\\_selftest\\sub38\\messages.db")
+        _bwd_dir38 = runtime._resolve_data_dir()
+    finally:
+        config_manager.set_path("storage.db_path", _db_back38)
+    check("正斜杠写法的 db_path：群配置目录 = 库所在目录（data/_selftest/sub38）",
+          _fwd_dir38 == os.path.dirname(_fwd_abs38) == _mix_dir38, f"{_fwd_dir38!r}")
+    check("反斜杠写法解析出同一个目录（同一份配置不会分家成两套数据）",
+          _bwd_dir38 == _fwd_dir38 == _mix_dir38, f"{_bwd_dir38!r} != {_fwd_dir38!r}")
+
+    # (3) 内存库（":memory:"）/ 空路径时也要给出一个确定的目录，不能是空串
+    try:
+        config_manager.set_path("storage.db_path", ":memory:")
+        _mem_dir38 = runtime._resolve_data_dir()
+        config_manager.set_path("storage.db_path", "")
+        _empty_dir38 = runtime._resolve_data_dir()
+    finally:
+        config_manager.set_path("storage.db_path", _db_back38)
+    check("内存库时群配置目录沿用默认的相对路径 data（不是空字符串当目录用）",
+          _mem_dir38 == "data", repr(_mem_dir38))
+    check("空路径时回落到默认库路径所在目录（依旧是个确定目录）",
+          _empty_dir38 == os.path.dirname(config_manager.config.abs_path("data/messages.db"))
+          and bool(_empty_dir38), repr(_empty_dir38))
+
+    # (4) 「看起来是 POSIX 绝对路径」的配置在 Windows 上必须明确提醒（不静默乱落）
+    _msgs38 = []
+
+    class _CollectHandler38(logging.Handler):
+        def emit(self, record):
+            _msgs38.append(record.getMessage())
+
+    _cfg_logger38 = logging.getLogger("core.config_manager")
+    _old_level38 = _cfg_logger38.level
+    _handler38 = _CollectHandler38()
+    _cfg_logger38.addHandler(_handler38)
+    _cfg_logger38.setLevel(logging.INFO)
+    try:
+        _posix_out38 = config_manager.config.abs_path("/mnt/qqbot/data/messages.db")
+        _unc_out38 = config_manager.config.abs_path("//server/share/messages.db")
+    finally:
+        _cfg_logger38.removeHandler(_handler38)
+        _cfg_logger38.setLevel(_old_level38)
+    _posix_warn38 = [m for m in _msgs38 if "无法定位" in m]
+    if os.name == "nt":
+        # Windows 把 "\mnt\..." 当"当前盘符根目录下的路径"→ 实际落到 C:\mnt\...（不是程序目录）
+        _posix_landed38 = os.path.normpath(
+            os.path.splitdrive(paths.BASE_DIR)[0] + os.sep
+            + os.path.join("mnt", "qqbot", "data", "messages.db"))
+        check("Windows 上遇到 /mnt/... 这种 POSIX 绝对路径会明确提醒",
+              len(_posix_warn38) == 1 and "/mnt/qqbot/data/messages.db" in _posix_warn38[0],
+              str(_msgs38)[:220])
+        check("提醒里写出了真实落点（算法算出来的路径，不是含糊的『程序目录下』）",
+              bool(_posix_warn38) and _posix_landed38 in _posix_warn38[0]
+              and _posix_out38 == _posix_landed38,
+              f"{_posix_out38!r} {str(_posix_warn38)[:200]}")
+    else:
+        check("非 Windows 上 /mnt/... 本就是普通绝对路径：不提醒且原样保留",
+              not _posix_warn38
+              and _posix_out38 == os.path.normpath("/mnt/qqbot/data/messages.db"),
+              f"{_posix_out38!r} msgs={str(_msgs38)[:160]}")
+    check("UNC / 网络路径（//server/share/...）不误报提醒，也没被改坏",
+          not [m for m in _msgs38 if "server" in m]
+          and "server" in _unc_out38 and _unc_out38.endswith("messages.db")
+          and not _unc_out38.startswith(paths.BASE_DIR),
+          f"{_unc_out38!r} msgs={str(_msgs38)[:160]}")
+
+    # (5) SQLite 打不开时退回内存库：必须"能跑 + 大声报 + 状态接口可见"，不能静默
+    _blocker38 = os.path.join(test_root, f"blocker_{run_id}.txt")
+    with open(_blocker38, "w", encoding="utf-8") as handle:
+        handle.write("x")                                   # 父路径是个文件 → 建库必失败
+    _bad_db38 = os.path.join(_blocker38, "messages.db")
+    _degraded_back38 = runtime._store_degraded
+    _rt_msgs38 = []
+
+    class _CollectHandlerRt38(logging.Handler):
+        def emit(self, record):
+            _rt_msgs38.append(record.getMessage())
+
+    _rt_logger38 = logging.getLogger("qqbotmerged")
+    _rt_old_level38 = _rt_logger38.level
+    _rt_handler38 = _CollectHandlerRt38()
+    _rt_logger38.addHandler(_rt_handler38)
+    _rt_logger38.setLevel(logging.INFO)
+    try:
+        runtime._store_degraded = None
+        config_manager.set_path("storage.db_path", _bad_db38)
+        _store38 = runtime._make_store()
+        _degraded38 = dict(runtime._store_degraded or {})
+        _status_storage38 = dict(runtime.status().get("storage") or {})
+    finally:
+        _rt_logger38.removeHandler(_rt_handler38)
+        _rt_logger38.setLevel(_rt_old_level38)
+        config_manager.set_path("storage.db_path", _db_back38)
+        runtime._store_degraded = _degraded_back38
+    from core.storage import MemoryStore as _MemoryStore38
+    check("SQLite 建不出来时退回内存库（程序还能继续跑，不是启动即崩）",
+          isinstance(_store38, _MemoryStore38), type(_store38).__name__)
+    check("降级原因被记下来（db_path + 具体异常），不是静默吞掉",
+          _degraded38.get("db_path") == os.path.normpath(_bad_db38)
+          and bool(_degraded38.get("error")), str(_degraded38)[:200])
+    check("降级时日志明确说清后果（内存存储 / 重启就全丢）与出错路径",
+          any("内存存储" in m and "重启" in m and "messages.db" in m for m in _rt_msgs38),
+          str(_rt_msgs38)[:300])
+    check("状态接口在降级时把 degraded 暴露出来（网页上看得见）",
+          bool(_status_storage38.get("degraded")) and _status_storage38.get("kind") == "sqlite",
+          str(_status_storage38)[:200])
+
+    # (6) 内存库必须被标成 memory：MemoryStore 是 SQLiteStore 的子类，判定顺序不能反
+    _real_store38 = runtime.store
+    try:
+        runtime.store = _store38                               # 一个真正的内存库
+        _mem_kind38 = dict(runtime.status().get("storage") or {}).get("kind")
+    finally:
+        runtime.store = _real_store38
+    check("内存库在状态接口里被标成 memory（不会因为继承关系被误报成 sqlite）",
+          _mem_kind38 == "memory", repr(_mem_kind38))
+
+    # ------------------------------------------------------------------ 39. 插件按机器人隔离
+    print("\n[39] 插件按机器人隔离：每个机器人可以跑不同的插件")
+
+    check("plugins.enabled_names / disabled_names 属于「按机器人」的设置",
+          _schema.is_per_bot("plugins.enabled_names")
+          and _schema.is_per_bot("plugins.disabled_names"),
+          f"{_schema.is_per_bot('plugins.enabled_names')} "
+          f"{_schema.is_per_bot('plugins.disabled_names')}")
+    check("插件总开关与插件目录仍是全局设置（不会被写成某台机器人的覆盖）",
+          not _schema.is_per_bot("plugins.enabled") and not _schema.is_per_bot("plugins.dir"),
+          f"{_schema.is_per_bot('plugins.enabled')} {_schema.is_per_bot('plugins.dir')}")
+    _sec39 = next((item for item in _schema.sections_payload() if item["key"] == "plugins"), {})
+    check("设置页的「插件系统」分组把新字段一起渲染出来",
+          "plugins.enabled_names" in (_sec39.get("fields") or [])
+          and "plugins.disabled_names" in (_sec39.get("fields") or [])
+          and _sec39.get("per_bot") is True,
+          str(_sec39)[:220])
+
+    # 测试环境为了避免"受用户装的插件影响"，把运行时的插件目录换成了只含示例插件的临时目录，
+    # 配置里也只留了一个机器人。这一节要验证"多机器人 + 多插件"的隔离，所以临时补齐：
+    # 把插件目录指回真实的 plugins/、数据仍然写测试目录，并临时加一个机器人；本节的
+    # finally 里全部还原（[39] 是最后一个用例）。
+    _pm_back39 = (runtime.plugin_manager.plugin_dir, runtime.plugin_manager.data_dir,
+                  runtime.plugin_manager.disabled_file, dict(runtime.plugin_manager.disabled))
+    _bots_back39 = json.loads(json.dumps(config_manager.config.get("bots") or []))
+    _tmp_bot39 = {"id": "bot_iso39", "name": "隔离测试机器人", "enabled": True,
+                  "app_id": "99900039", "app_secret": "test-secret", "sandbox": False,
+                  "intents": 100663296, "reconnect_attempts": 1, "reconnect_interval": 1}
+    config_manager.set_path("bots", _bots_back39 + [_tmp_bot39])
+    runtime.plugin_manager.plugin_dir = os.path.join(PROJECT, "plugins")
+    runtime.plugin_manager.data_dir = os.path.join(test_root, "plugin_data39")
+    runtime.plugin_manager.disabled_file = os.path.join(test_root, "plugins_disabled39.json")
+    runtime.plugin_manager.disabled = {}
+    runtime.plugin_manager.load_plugins(force=True)
+    runtime._build_bots()                     # 只建对象、不连接（网关 start 已被打成空操作）
+    _tmp_rt39 = runtime.bots.get("bot_iso39")
+    if _tmp_rt39 is not None:
+        _iso_fake39 = FakeClient("bot_iso39", config_source=lambda: config_manager.config)
+        _tmp_rt39.client = _iso_fake39
+        _tmp_rt39.gateway.api = _iso_fake39
+    runtime.invalidate_bot_configs()
+    pm39 = runtime.plugin_manager
+    _names39 = [item["name"] for item in pm39.list_plugins()]
+    check("用于隔离验证的插件都加载出来了", len(_names39) >= 3, str(_names39))
+
+    def _dispatch39(bid, content="/骰子"):
+        return pm39.dispatch_message({
+            "type": "group", "content": content, "bot_id": bid,
+            "group_openid": "GROUP_ISO39", "member_openid": "M_ISO39",
+            "user_openid": "M_ISO39", "user_name": "小明", "mentions": [],
+            "attachments": [], "msg_id": "ISO39_" + str(bid) + content,
+            "raw_event": "{}"})
+
+    _ids39 = [str(item.get("id")) for item in (config_manager.config.get("bots") or [])
+              if isinstance(item, dict)]
+    check("测试环境里至少有两个机器人可用来验证隔离", len(_ids39) >= 2, str(_ids39))
+    _b1_39 = _ids39[0] if _ids39 else "bot1"
+    _b2_39 = _ids39[1] if len(_ids39) > 1 else "bot2"
+    check("两个机器人都在运行时里注册了（否则按机器人取配置会退回全局）",
+          _b1_39 in runtime.bots and _b2_39 in runtime.bots, str(sorted(runtime.bots)))
+    _ov_back39 = json.loads(json.dumps(config_manager.bot_overrides(_b1_39)))
+    _dice39 = "astrbot_plugin_dice"
+
+    try:
+        # (1) 默认：谁都没做限制 → 两个机器人都能用全部插件
+        check("没做任何按机器人限制时策略是「不限制」（向后兼容）",
+              pm39.allowed_names(_b1_39) is None and pm39.allowed_names(_b2_39) is None,
+              f"{pm39.bot_policy(_b1_39)} / {pm39.bot_policy(_b2_39)}")
+        check("默认情况下同一个插件对两个机器人都能触发",
+              bool(_dispatch39(_b1_39)) and bool(_dispatch39(_b2_39)),
+              f"{str(_dispatch39(_b1_39))[:80]} / {str(_dispatch39(_b2_39))[:80]}")
+
+        # (2) 黑名单：只停用 A 的骰子插件，B 照旧
+        config_manager.set_for_bot(_b1_39, "plugins.disabled_names", [_dice39])
+        runtime.invalidate_bot_configs()
+        _allowed39 = pm39.allowed_names(_b1_39)
+        check("给机器人 A 停用某插件后，它的可用集合里没有这个插件",
+              _allowed39 is not None and _dice39 not in _allowed39
+              and set(_names39) - {_dice39} <= _allowed39, str(sorted(_allowed39)))
+        check("机器人 A 再发这个指令就没反应了（插件被隔离）",
+              _dispatch39(_b1_39) is None, str(_dispatch39(_b1_39))[:160])
+        check("同一个插件对机器人 B 依然有效（互不影响）",
+              "🎲" in ((_dispatch39(_b2_39) or {}).get("text") or ""),
+              str(_dispatch39(_b2_39))[:160])
+        check("策略是按机器人分别读出来的（A 有限制、B 不限制）",
+              pm39.bot_policy(_b1_39)["deny"] == [_dice39]
+              and pm39.allowed_names(_b2_39) is None,
+              f"{pm39.bot_policy(_b1_39)} / {pm39.bot_policy(_b2_39)}")
+
+        # (3) 白名单：只放行一个插件
+        config_manager.set_for_bot(_b1_39, "plugins.disabled_names", [])
+        config_manager.set_for_bot(_b1_39, "plugins.enabled_names",
+                                   ["astrbot_plugin_daily_checkin"])
+        runtime.invalidate_bot_configs()
+        check("白名单只放行列出的插件",
+              pm39.allowed_names(_b1_39) == {"astrbot_plugin_daily_checkin"},
+              str(pm39.allowed_names(_b1_39)))
+        check("白名单之外的插件被拦住（骰子没反应）",
+              _dispatch39(_b1_39) is None, str(_dispatch39(_b1_39))[:160])
+
+        # (4) 黑白名单同时出现：黑名单优先
+        config_manager.set_for_bot(_b1_39, "plugins.disabled_names",
+                                   ["astrbot_plugin_daily_checkin"])
+        runtime.invalidate_bot_configs()
+        check("黑白名单冲突时以「停用」为准",
+              pm39.allowed_names(_b1_39) == set(), str(pm39.allowed_names(_b1_39)))
+
+        # (5) 接口：按机器人保存插件范围
+        _api39 = client.post("/api/admin/plugins/bot",
+                             json={"bot_id": _b1_39, "allowed": [_dice39]}).get_json()
+        check("接口可以按机器人设置插件范围",
+              bool(_api39.get("success"))
+              and (_api39.get("bot_allowed") or {}).get(_dice39) is True,
+              str(_api39)[:220])
+        check("接口把「没勾选的插件」标成 false",
+              any(value is False for value in (_api39.get("bot_allowed") or {}).values()),
+              str(_api39.get("bot_allowed"))[:200])
+        check("接口写进的是该机器人的覆盖（不是全局配置）",
+              (config_manager.bot_overrides(_b1_39).get("plugins") or {}
+               ).get("disabled_names") == [name for name in _names39 if name != _dice39],
+              str(config_manager.bot_overrides(_b1_39).get("plugins"))[:200])
+        check("接口没有碰全局 plugins 段",
+              (config_manager.config.data.get("plugins") or {}).get("disabled_names") == []
+              and (config_manager.config.data.get("plugins") or {}).get("enabled_names") == [],
+              str(config_manager.config.data.get("plugins"))[:200])
+        check("接口改完后该机器人只剩这一个插件（真的生效）",
+              pm39.allowed_names(_b1_39) == {_dice39}
+              and "🎲" in ((_dispatch39(_b1_39) or {}).get("text") or ""),
+              f"{pm39.allowed_names(_b1_39)}")
+
+        # (6) 全部勾选 = 该机器人不限制（两个名单都清空）
+        _all39 = client.post("/api/admin/plugins/bot",
+                             json={"bot_id": _b1_39, "allowed": _names39}).get_json()
+        check("勾满全部插件 = 该机器人不限制（两个名单都清空）",
+              bool(_all39.get("success"))
+              and pm39.allowed_names(_b1_39) is None
+              and (_all39.get("bot_policy") or {}) == {"allow": [], "deny": []},
+              str(_all39.get("bot_policy"))[:200])
+
+        # (7) 接口的参数校验：不能悄悄写错机器人 / 写进不存在的插件
+        _bad39 = []
+        for _payload39 in ({"bot_id": "", "allowed": []},
+                           {"bot_id": "   ", "allowed": []},
+                           {"bot_id": "no_such_bot_39", "allowed": []},
+                           {"bot_id": _b1_39, "allowed": ["不存在的插件"]},
+                           {"bot_id": _b1_39, "allowed": "astrbot_plugin_dice"}):
+            _resp39 = client.post("/api/admin/plugins/bot", json=_payload39)
+            _bad39.append((_payload39.get("bot_id"), _resp39.status_code))
+        check("非法请求都被拒（400）：空 id / 未知机器人 / 未知插件 / allowed 不是数组",
+              all(code == 400 for _bid, code in _bad39), str(_bad39))
+        check("被拒的请求没有改到任何机器人的插件范围",
+              pm39.allowed_names(_b1_39) is None
+              and config_manager.bot_overrides("no_such_bot_39") == {},
+              f"{pm39.allowed_names(_b1_39)}")
+
+        # (8) 列表接口带上机器人维度（页面按机器人勾选要用）
+        _list39 = client.get(f"/api/admin/plugins?bot={_b1_39}").get_json()
+        check("插件列表接口返回当前机器人、机器人清单与勾选状态",
+              bool(_list39.get("success")) and _list39.get("bot_id") == _b1_39
+              and isinstance(_list39.get("bots"), list) and bool(_list39.get("bots"))
+              and isinstance(_list39.get("bot_allowed"), dict)
+              and all(value is True for value in (_list39.get("bot_allowed") or {}).values()),
+              str({k: _list39.get(k) for k in ("bot_id", "bot_allowed")})[:220])
+        check("列表接口的勾选状态只用于当前机器人（另一个机器人仍是不限制）",
+              pm39.allowed_names(_b2_39) is None, str(pm39.bot_policy(_b2_39)))
+    finally:
+        # 还原：把 A 的 plugins 覆盖恢复成测试前的样子，别影响后面的用例
+        for _target39 in (config_manager._file_data, config_manager.config.data):
+            _entry39 = config_manager._find_bot(_target39, _b1_39)
+            if isinstance(_entry39, dict):
+                if _ov_back39:
+                    _entry39["overrides"] = json.loads(json.dumps(_ov_back39))
+                else:
+                    _entry39.pop("overrides", None)
+        # 还原临时补的机器人 + 运行时插件目录（本节自己造的现场自己收拾）
+        config_manager.set_path("bots", _bots_back39)
+        runtime.bots.pop("bot_iso39", None)
+        (runtime.plugin_manager.plugin_dir, runtime.plugin_manager.data_dir,
+         runtime.plugin_manager.disabled_file) = _pm_back39[:3]
+        runtime.plugin_manager.disabled = dict(_pm_back39[3])
+        runtime.plugin_manager.load_plugins(force=True)
+        runtime.invalidate_bot_configs()
+        try:
+            config_manager.save()
+        except Exception:
+            pass
+    check("第 [39] 节结束后机器人 A 的插件覆盖已还原",
+          config_manager.bot_overrides(_b1_39) == _ov_back39,
+          str(config_manager.bot_overrides(_b1_39))[:200])
+    check("第 [39] 节结束后临时补的机器人 / 插件目录都已还原",
+          [str(item.get("id")) for item in (config_manager.config.get("bots") or [])]
+          == [str(item.get("id")) for item in _bots_back39]
+          and "bot_iso39" not in runtime.bots
+          and runtime.plugin_manager.plugin_dir == _pm_back39[0],
+          f"bots={[i.get('id') for i in (config_manager.config.get('bots') or [])]} "
+          f"dir={runtime.plugin_manager.plugin_dir}")
+
+    # ------------------------------------------------------------------ 40. 热更新的范围
+    print("\n[40] 配置热更新只重载「真的改了」的组件（改别的设置不该重启云同步）")
+
+    class _FakeCloud40:
+        """假云同步：只记录 stop/start 有没有被调用。"""
+
+        def __init__(self):
+            self.enabled = True
+            self.calls = []
+
+        def stop(self, final_sync=False):
+            self.calls.append("stop")
+
+        def start(self, immediate=False):
+            self.calls.append("start")
+
+    _cloud_back40 = runtime.cloud_sync
+    _fake_cloud40 = _FakeCloud40()
+    runtime.cloud_sync = _fake_cloud40
+    _back40 = {}
+    for _path40 in ("ui.animation", "filters.keywords_enabled", "reply.max_queue_size",
+                    "cloud_sync.interval_seconds"):
+        _back40[_path40] = config_manager.config.get(*_path40.split("."))
+    try:
+        # (1) 改一个跟云同步、过滤器都无关的设置（界面动画）
+        _anim40 = "lite" if _back40["ui.animation"] != "lite" else "full"
+        config_manager.set_path("ui.animation", _anim40)
+        config_manager.save()
+        _hot40 = runtime.on_config_changed(source="测试-改界面")
+        check("改「界面与动画」不会去重启云同步（不再出现「云同步已停止/已启动」）",
+              _fake_cloud40.calls == [], str(_fake_cloud40.calls))
+        check("改「界面与动画」也不会谎报「过滤与安全」",
+              "过滤与安全" not in _hot40 and "云同步" not in _hot40, str(_hot40))
+
+        # (2) 改过滤器 → 只报过滤与安全，仍然不碰云同步
+        config_manager.set_path("filters.keywords_enabled",
+                                not bool(_back40["filters.keywords_enabled"]))
+        config_manager.save()
+        _hot40b = runtime.on_config_changed(source="测试-改过滤")
+        check("改过滤器时只重载过滤器（报「过滤与安全」，不报云同步）",
+              _hot40b == ["过滤与安全"] and _fake_cloud40.calls == [],
+              f"changed={_hot40b} cloud={_fake_cloud40.calls}")
+
+        # (3) 改回复设置 → 报「回复与消息」
+        config_manager.set_path("reply.max_queue_size", int(_back40["reply.max_queue_size"]) + 1)
+        config_manager.save()
+        _hot40c = runtime.on_config_changed(source="测试-改回复")
+        check("改回复设置时只报「回复与消息」",
+              _hot40c == ["回复与消息"] and _fake_cloud40.calls == [],
+              f"changed={_hot40c} cloud={_fake_cloud40.calls}")
+
+        # (4) 真的改了云同步设置 → 这时才允许重启同步线程
+        config_manager.set_path("cloud_sync.interval_seconds",
+                                int(_back40["cloud_sync.interval_seconds"]) + 60)
+        config_manager.save()
+        _hot40d = runtime.on_config_changed(source="测试-改云同步")
+        check("真的改了云同步设置时才重启它（stop + start）且上报云同步",
+              _fake_cloud40.calls == ["stop", "start"] and "云同步" in _hot40d,
+              f"changed={_hot40d} cloud={_fake_cloud40.calls}")
+
+        # (5) 改「某个机器人自己的设置」：不需要重载组件，但日志要说清是哪个机器人的哪个分组
+        _bot40 = str((config_manager.config.get("bots") or [{}])[0].get("id") or "bot1")
+        _msgs40 = []
+
+        class _CollectHandler40(logging.Handler):
+            def emit(self, record):
+                _msgs40.append(record.getMessage())
+
+        _logger40 = logging.getLogger("qqbotmerged")
+        _level40 = _logger40.level
+        _handler40 = _CollectHandler40()
+        _logger40.addHandler(_handler40)
+        _logger40.setLevel(logging.INFO)
+        try:
+            config_manager.set_for_bot(_bot40, "reply.max_queue_size",
+                                       int(config_manager.get_for_bot(
+                                           _bot40, "reply.max_queue_size", 10)) + 1)
+            config_manager.save()
+            _hot40e = runtime.on_config_changed(source="测试-改某机器人的回复设置")
+        finally:
+            _logger40.removeHandler(_handler40)
+            _logger40.setLevel(_level40)
+        check("只改某个机器人自己的设置时，不需要重载任何组件（changed 为空）",
+              _hot40e == [], str(_hot40e))
+        check("日志里写明是「哪个机器人的哪个分组」，不再只说 bots 或谎报云同步",
+              any(f"回复与消息（{_bot40}）" in message for message in _msgs40)
+              and all("云同步" not in message for message in _msgs40),
+              str(_msgs40)[:300])
+        # 把这条改动还原
+        config_manager.set_for_bot(_bot40, "reply.max_queue_size",
+                                   config_manager.get_for_bot(_bot40, "reply.max_queue_size", 10) - 1)
+        config_manager.save()
+        runtime.on_config_changed(source="测试-还原某机器人回复设置")
+
+        # (6) 外部直接改 config.json（走"文件监视"这条路）：必须同样只重载真的变了的组件
+        _disk_back40 = json.loads(json.dumps(config_manager.config.data))
+        _disk40 = json.loads(json.dumps(_disk_back40))
+        _disk40.setdefault("filters", {})
+        _disk40["filters"]["keywords_enabled"] = not bool(
+            (_disk_back40.get("filters") or {}).get("keywords_enabled"))
+        with open(config_manager.config_path, "w", encoding="utf-8") as _handle40:
+            json.dump(_disk40, _handle40, ensure_ascii=False, indent=2)
+        # Windows 的 NTFS 会"复用"同名文件的时间戳，所以这里直接模拟"监视线程记的是旧 mtime"
+        runtime._last_config_mtime = runtime._config_mtime() - 5
+        _fake_cloud40.calls.clear()
+        _tick40 = runtime._config_watch_tick()
+        check("外部改配置文件也会被监视线程认出来（指纹变化 → 热更新）", _tick40 is True, str(_tick40))
+        check("外部只改了过滤器时：过滤器真的重载了，云同步没有被重启",
+              runtime.message_filter.enabled
+              == bool(_disk40["filters"]["keywords_enabled"]) and _fake_cloud40.calls == [],
+              f"enabled={runtime.message_filter.enabled} cloud={_fake_cloud40.calls}")
+        # 还原磁盘上的配置
+        with open(config_manager.config_path, "w", encoding="utf-8") as _handle40b:
+            json.dump(_disk_back40, _handle40b, ensure_ascii=False, indent=2)
+        runtime.on_config_changed(source="测试-还原磁盘配置")
+        check("第 [40] 节结束时磁盘配置也还原了",
+              json.loads(open(config_manager.config_path, encoding="utf-8").read()) == _disk_back40
+              and runtime.message_filter.enabled
+              == bool((_disk_back40.get("filters") or {}).get("keywords_enabled")),
+              "磁盘配置不一致")
+    finally:
+        for _path40, _value40 in _back40.items():
+            config_manager.set_path(_path40, _value40)
+        config_manager.save()
+        runtime.cloud_sync = _cloud_back40
+        runtime.on_config_changed(source="测试-还原")
+    check("第 [40] 节结束后设置与云同步对象都已还原",
+          config_manager.config.get("ui", "animation") == _back40["ui.animation"]
+          and config_manager.config.get("cloud_sync", "interval_seconds")
+          == _back40["cloud_sync.interval_seconds"]
+          and runtime.cloud_sync is _cloud_back40,
+          f"{config_manager.config.get('ui', 'animation')} / "
+          f"{config_manager.config.get('cloud_sync', 'interval_seconds')}")
+
+    # ------------------------------------------------------------------ 41. 配置读取容错
+    print("\n[41] 配置读取容错：带 BOM 也能读、读不出来时绝不覆盖用户配置")
+
+    # (1) Windows 上 PowerShell 的 Out-File / 记事本写出来的「UTF-8」是带 BOM 的。
+    #     以前用普通 utf-8 读会被判成「读不出来」，接着就用默认配置把用户的配置覆盖掉。
+    _bom_path41 = os.path.join(test_root, f"config_bom_{run_id}.json")
+    _bom_payload41 = {"ui": {"animation": "lite"}, "bots": [
+        {"id": "bot_bom41", "name": "带BOM的机器人", "enabled": True, "app_id": "123",
+         "app_secret": "secret-41", "sandbox": False, "intents": 100663296,
+         "reconnect_attempts": 5, "reconnect_interval": 10}]}
+    with open(_bom_path41, "wb") as _handle41:
+        _handle41.write(b"\xef\xbb\xbf"
+                        + json.dumps(_bom_payload41, ensure_ascii=False).encode("utf-8"))
+    _bom41 = load_config(_bom_path41)
+    _bom_bots41 = _bom41.config.get("bots") or []
+    check("带 BOM 的 config.json 能正常读出来（不再被当成损坏文件）",
+          _bom41.config.get("ui", "animation") == "lite"
+          and [str(item.get("id")) for item in _bom_bots41] == ["bot_bom41"]
+          and _bom_bots41[0].get("app_secret") == "secret-41",
+          f"bots={_bom_bots41} anim={_bom41.config.get('ui', 'animation')}")
+    with open(_bom_path41, "rb") as _handle41b:
+        _after41 = json.loads(_handle41b.read().decode("utf-8-sig"))
+    check("补全默认项后，带 BOM 文件里的用户设置依然在（凭据没被清空）",
+          (_after41.get("ui") or {}).get("animation") == "lite"
+          and [_b.get("id") for _b in (_after41.get("bots") or [])] == ["bot_bom41"]
+          and ((_after41.get("bots") or [{}])[0] or {}).get("app_secret") == "secret-41",
+          str(_after41.get("ui"))[:120])
+
+    # (2) 文件真的坏了（少一个右括号）：必须留一份备份，而不是把用户配置抹掉
+    _broken_path41 = os.path.join(test_root, f"config_broken_{run_id}.json")
+    _broken_text41 = '{"bots": [{"id": "bot_broken41", "app_id": "999"}], ' \
+                     '"ai": {"api_key": "sk-keep-me"}'
+    with open(_broken_path41, "w", encoding="utf-8") as _handle41c:
+        _handle41c.write(_broken_text41)
+    _broken41 = load_config(_broken_path41)
+    _backups41 = sorted(name for name in os.listdir(test_root)
+                        if name.startswith(os.path.basename(_broken_path41) + ".broken-"))
+    check("损坏的 config.json 会被备份成 .broken-<时间>（不会直接抹掉）",
+          len(_backups41) == 1, str(_backups41))
+    _backup_text41 = ""
+    if _backups41:
+        with open(os.path.join(test_root, _backups41[0]), encoding="utf-8") as _handle41d:
+            _backup_text41 = _handle41d.read()
+    check("备份内容与原始损坏文件逐字节一致", _backup_text41 == _broken_text41,
+          _backup_text41[:120])
+    check("备份里还能找到用户的密钥（说明保留了现场，可手工恢复）",
+          "sk-keep-me" in _backup_text41, _backup_text41[:120])
+    check("配置文件坏了也能照常启动（用默认配置兜底，不崩）",
+          _broken41.config.get("bots") is not None
+          and _broken41.config.bool_of("plugins", "enabled", default=True) is True, "")
+    for _name41 in _backups41:
+        try:
+            os.remove(os.path.join(test_root, _name41))
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------ 42. 插件安全扫描接线
+    print("\n[42] 插件安全扫描：加载插件时顺带做 AST 静态扫描，并把结果给到后台")
+
+    _pm42 = runtime.plugin_manager
+    _infos42 = _pm42.list_plugins()
+    check("每个插件的 info 里都带上了 safety 扫描结果",
+          bool(_infos42) and all(isinstance(info.get("safety"), dict)
+                                 and info["safety"].get("level") in ("high", "medium", "info", "ok")
+                                 for info in _infos42),
+          str([(info.get("name"), info.get("safety")) for info in _infos42[:1]])[:200])
+    check("扫描结果里有摘要与命中清单（网页要展示）",
+          all("summary" in info["safety"] and isinstance(info["safety"].get("findings"), list)
+              for info in _infos42), "")
+    # 这条专门防"路径传错导致扫了个寂寞"：必须真的读到插件源码文件
+    check("扫描确实读到了插件的源码文件（不是空扫描）",
+          any(info["safety"].get("files") for info in _infos42),
+          str([(info.get("name"), info["safety"].get("files")) for info in _infos42])[:240])
+    check("仓库自带插件被扫出来的风险项是真实存在的写法（open/联网/线程等）",
+          any(item.get("evidence") for info in _infos42
+              for item in (info["safety"].get("findings") or [])),
+          str([[item.get("evidence") for item in (info["safety"].get("findings") or [])]
+               for info in _infos42])[:240])
+    _diag42 = _pm42.diagnostics()
+    check("诊断信息里有安全扫描汇总（插件页顶部提示用）",
+          isinstance(_diag42.get("safety"), dict)
+          and _diag42["safety"].get("level") in ("high", "medium", "info", "ok"),
+          str(_diag42.get("safety"))[:200])
+    check("汇总里的命中项带上了是哪个插件",
+          all(item.get("plugin") for item in (_diag42.get("safety") or {}).get("findings") or [])
+          or (_diag42.get("safety") or {}).get("level") == "ok",
+          str((_diag42.get("safety") or {}).get("findings"))[:200])
+    _api42 = client.get("/api/admin/plugins").get_json()
+    check("插件列表接口把 safety 一起返回（前端才画得出徽章）",
+          bool(_api42.get("success"))
+          and all("safety" in item for item in (_api42.get("plugins") or [])),
+          str([sorted(item.keys())[:6] for item in (_api42.get("plugins") or [])[:1]]))
+    check("安全扫描不会因为插件源码读不了就崩（失败也返回一个 ok 结构）",
+          _pm42._scan_safety({"name": "不存在的插件_x42", "module": "no_such_plugin_x42"}
+                             ).get("level") in ("high", "medium", "info", "ok"),
+          "")
+
+    # ------------------------------------------------------------------ 43. 云同步敏感字段
+    print("\n[43] 云同步上传前的敏感字段扫描（含密钥的文件不上传，本地文件不动）")
+
+    _sync43 = CloudSync(config_manager, logger_obj=log)
+    check("云同步实例默认开启「含密钥的文件不上传」", _sync43.skip_secret_files is True,
+          str(_sync43.skip_secret_files))
+    check("这个开关是全局设置（不按机器人隔离）",
+          not _schema.is_per_bot("cloud_sync.skip_secret_files"), "")
+    _payload43 = config_manager.payload()
+    check("设置页数据里带有这个开关（页面渲染得出来）",
+          (_payload43.get("config") or {}).get("cloud_sync", {})
+          .get("skip_secret_files") is True,
+          str((_payload43.get("config") or {}).get("cloud_sync"))[:160])
+    # 真实的插件数据场景：插件把 API Key 写进 data/plugin_data/<插件名>/*.json
+    _plugin_secret43 = json.dumps({"api_key": "sk-abcdefghijklmnop",
+                                   "model": "x"}).encode("utf-8")
+    from core.cloud_sync import find_sensitive_keys as _find43
+    check("插件数据里写了 api_key 会被识别出来（这正是要拦住的场景）",
+          _find43("data/plugin_data/astrbot_plugin_x/config.json", _plugin_secret43) == ["api_key"],
+          str(_find43("data/plugin_data/astrbot_plugin_x/config.json", _plugin_secret43)))
+    check("同样的内容放在聊天上下文里不会误伤（只看字段名）",
+          _find43("data/user_context/private/bot1__U.json",
+                  json.dumps({"role": "user",
+                              "content": "api_key = sk-abcdefghijklmnop"}).encode("utf-8")) == [],
+          "")
+
+    # ------------------------------------------------------------------ 44. Markdown 发送
+    print("\n[44] Markdown 发送与格式切换（网页 / 配置 / AI 回复）")
+
+    _md44 = "# 标题\n\n**加粗**内容"
+    _ov_back44 = json.loads(json.dumps(config_manager.bot_overrides(bot_id)))
+    _ai_chat_back44 = runtime.ai_client.chat
+    try:
+        # (8) 显式 fmt=markdown：一路透传到客户端
+        fake.calls.clear()
+        _info44 = runtime.send_text("private", "USER_MD44", _md44, bot_id=bot_id, fmt="markdown")
+        _calls44 = [c for c in fake.calls if c["kind"] == "text"]
+        check("显式 fmt=markdown 时客户端收到的格式就是 markdown",
+              bool(_calls44) and _calls44[-1].get("fmt") == "markdown",
+              str(_calls44[-1:])[:200])
+        check("返回值里带上实际使用的格式 format=markdown",
+              (_info44 or {}).get("format") == "markdown", str(_info44)[:200])
+        check("显式 markdown 时正文原样送出（网页分支不会先剥符号）",
+              any(c["content"] == _md44 for c in _calls44),
+              str([c["content"] for c in _calls44])[:200])
+
+        # (9) 不传 fmt：跟随该机器人生效配置 send.message_format
+        config_manager.set_for_bot(bot_id, "send.message_format", "markdown")
+        runtime.invalidate_bot_configs()
+        fake.calls.clear()
+        _info44b = runtime.send_text("private", "USER_MD44B", _md44, bot_id=bot_id)
+        _calls44b = [c for c in fake.calls if c["kind"] == "text"]
+        check("不传 fmt 时跟随该机器人的 send.message_format=markdown",
+              bool(_calls44b) and _calls44b[-1].get("fmt") == "markdown"
+              and (_info44b or {}).get("format") == "markdown", str(_calls44b[-1:])[:200])
+
+        fake.calls.clear()
+        runtime.send_text("private", "USER_MD44B", "显式覆盖", bot_id=bot_id, fmt="text")
+        _calls44b2 = [c for c in fake.calls if c["kind"] == "text"]
+        check("显式 fmt=text 优先于配置里的 markdown（网页临时选格式不改配置）",
+              bool(_calls44b2) and _calls44b2[-1].get("fmt") == "text", str(_calls44b2[-1:])[:200])
+        check("临时选 text 没有改掉该机器人的配置",
+              config_manager.get_for_bot(bot_id, "send.message_format") == "markdown",
+              str(config_manager.get_for_bot(bot_id, "send.message_format")))
+
+        config_manager.set_for_bot(bot_id, "send.message_format", "text")
+        runtime.invalidate_bot_configs()
+        fake.calls.clear()
+        runtime.send_text("private", "USER_MD44B", "回到默认", bot_id=bot_id)
+        _calls44b3 = [c for c in fake.calls if c["kind"] == "text"]
+        check("配置还原成 text 后，不传 fmt 又回到纯文本",
+              bool(_calls44b3) and _calls44b3[-1].get("fmt") == "text", str(_calls44b3[-1:])[:200])
+
+        # (10) 网页接口 POST /api/chat/send
+        fake.calls.clear()
+        _resp44 = client.post("/api/chat/send", json={
+            "targetType": "private", "openid": "USER_WEBMD44", "content": _md44,
+            "bot_id": bot_id, "format": "markdown"})
+        _body44 = _resp44.get_json()
+        check("POST /api/chat/send format=markdown 成功且回显格式",
+              _resp44.status_code == 200 and _body44.get("success")
+              and _body44.get("format") == "markdown", str(_body44)[:200])
+        check("网页选的 markdown 真的到达客户端",
+              any(c["kind"] == "text" and c.get("fmt") == "markdown" for c in fake.calls),
+              str([c for c in fake.calls if c["kind"] == "text"][-1:])[:200])
+
+        fake.calls.clear()
+        _resp44bad = client.post("/api/chat/send", json={
+            "targetType": "private", "openid": "USER_WEBMD44", "content": "x",
+            "bot_id": bot_id, "format": "xml"})
+        check("format=xml 被拒（400，且一条都没发出去）",
+              _resp44bad.status_code == 400
+              and _resp44bad.get_json().get("success") is False
+              and not [c for c in fake.calls if c["kind"] == "text"],
+              f"status={_resp44bad.status_code} calls={fake.calls[:1]}")
+
+        fake.calls.clear()
+        _resp44plain = client.post("/api/chat/send", json={
+            "targetType": "private", "openid": "USER_WEBPLAIN44", "content": "网页纯文本",
+            "bot_id": bot_id})
+        _body44plain = _resp44plain.get_json()
+        _calls44p = [c for c in fake.calls if c["kind"] == "text"]
+        check("不带 format 时行为与现在一致（纯文本，且客户端收到 text）",
+              _resp44plain.status_code == 200 and _body44plain.get("success")
+              and _body44plain.get("format") == "text"
+              and bool(_calls44p) and _calls44p[-1].get("fmt") == "text",
+              str(_body44plain)[:200])
+
+        # (11) AI 回复链路：markdown 模式下不剥 markdown 符号
+        runtime.ai_client.chat = lambda messages, **kwargs: "# 标题\n**加粗**内容"
+        config_manager.set_for_bot(bot_id, "reply.strip_markdown", True)
+        # 本节不写上下文文件（只验证"剥离与否"，避免多写 data/ 下的文件）
+        config_manager.set_for_bot(bot_id, "reply.context_enabled", False)
+        config_manager.set_for_bot(bot_id, "send.message_format", "markdown")
+        runtime.invalidate_bot_configs()
+        fake.calls.clear()
+        runtime.processor._ai_reply(
+            {"type": "private", "bot_id": bot_id, "openid": "USER_AI44", "username": "小爱",
+             "msg_id": "IN_AI44", "content": "说点什么"},
+            "说点什么", bot_id, "USER_AI44", False, "private", "USER_AI44", [])
+        _ai44 = [c for c in fake.calls if c["kind"] == "text"]
+        check("markdown 模式 + strip_markdown=true 时 AI 回复的 markdown 符号不被剥离",
+              bool(_ai44) and "**加粗**" in (_ai44[-1].get("content") or "")
+              and _ai44[-1].get("fmt") == "markdown", str(_ai44[-1:])[:200])
+
+        config_manager.set_for_bot(bot_id, "send.message_format", "text")
+        runtime.invalidate_bot_configs()
+        fake.calls.clear()
+        runtime.processor._ai_reply(
+            {"type": "private", "bot_id": bot_id, "openid": "USER_AI44B", "username": "小爱",
+             "msg_id": "IN_AI44B", "content": "说点什么"},
+            "说点什么", bot_id, "USER_AI44B", False, "private", "USER_AI44B", [])
+        _ai44b = [c for c in fake.calls if c["kind"] == "text"]
+        check("纯文本模式下 AI 回复的 markdown 符号仍会被剥离",
+              bool(_ai44b) and "**" not in (_ai44b[-1].get("content") or "")
+              and "加粗" in (_ai44b[-1].get("content") or "")
+              and _ai44b[-1].get("fmt") == "text", str(_ai44b[-1:])[:200])
+    finally:
+        runtime.ai_client.chat = _ai_chat_back44
+        for _target44 in (config_manager._file_data, config_manager.config.data):
+            _entry44 = config_manager._find_bot(_target44, bot_id)
+            if isinstance(_entry44, dict):
+                if _ov_back44:
+                    _entry44["overrides"] = json.loads(json.dumps(_ov_back44))
+                else:
+                    _entry44.pop("overrides", None)
+        runtime.invalidate_bot_configs()
+        try:
+            config_manager.save()
+        except Exception as exc:                     # noqa: BLE001
+            log.warning("第 [44] 节还原配置落盘失败：%s", exc)
+    check("第 [44] 节用完后该机器人的覆盖配置已还原",
+          config_manager.bot_overrides(bot_id) == _ov_back44,
+          str(config_manager.bot_overrides(bot_id))[:200])
+    check("第 [44] 节结束后 send.message_format 回到原值（不影响后续）",
+          config_manager.get_for_bot(bot_id, "send.message_format")
+          == (_ov_back44.get("send") or {}).get("message_format", "text"),
+          str(config_manager.get_for_bot(bot_id, "send.message_format")))
+
+    # ------------------------------------------------------------------ 45. 群 @ 某人
+    print("\n[45] 群聊 @ 某人：官方 qqbot-at-user 标签（文本 / markdown / 网页发送 / 候选名单）")
+
+    # (1) 旧写法在发送口统一换成官方新标签（定时任务、插件里写旧写法也能用）
+    fake.calls.clear()
+    runtime.send_text("group", "GROUP_AT45", "你好 <@MEMBER_AT45>", bot_id=bot_id)
+    _sent45 = [c for c in fake.calls if c["kind"] == "text"]
+    check("群聊里旧写法 <@openid> 被换成官方标签 <qqbot-at-user id=\"…\" />",
+          bool(_sent45) and '<qqbot-at-user id="MEMBER_AT45" />' in (_sent45[-1].get("content") or "")
+          and "<@MEMBER_AT45>" not in (_sent45[-1].get("content") or ""),
+          str(_sent45[-1:])[:220])
+
+    # (2) markdown 模式下同样生效（官方：markdown 消息也支持 @某人）
+    config_manager.set_for_bot(bot_id, "send.message_format", "markdown")
+    runtime.invalidate_bot_configs()
+    fake.calls.clear()
+    runtime.send_text("group", "GROUP_AT45", "## 通知\n\n<@MEMBER_AT45> 来看", bot_id=bot_id)
+    _sent45b = [c for c in fake.calls if c["kind"] == "text"]
+    check("markdown 模式下 @ 标签同样生效",
+          bool(_sent45b) and _sent45b[-1].get("fmt") == "markdown"
+          and '<qqbot-at-user id="MEMBER_AT45" />' in (_sent45b[-1].get("content") or ""),
+          str(_sent45b[-1:])[:220])
+    config_manager.set_for_bot(bot_id, "send.message_format", "text")
+    runtime.invalidate_bot_configs()
+
+    # (3) 私聊：官方不支持 @ 标签，程序不擅自删改（平台会显示成普通文字）
+    fake.calls.clear()
+    runtime.send_text("private", "USER_AT45",
+                      '你好 <qqbot-at-user id="MEMBER_AT45" />', bot_id=bot_id)
+    _sent45c = [c for c in fake.calls if c["kind"] == "text"]
+    check("私聊里 @ 标签原样送出（不静默删改，README 里说明了只有群聊支持）",
+          bool(_sent45c) and "qqbot-at-user" in (_sent45c[-1].get("content") or ""),
+          str(_sent45c[-1:])[:200])
+
+    # (4) @ 候选名单接口：群成员缓存 + 最近发言者兜底（官方成员接口要管理员）
+    try:
+        runtime.store.upsert_members(bot_id, "GROUP_AT45", [
+            {"member_openid": "MEMBER_AT45", "username": "群成员甲", "role": "member"}])
+    except Exception as exc:
+        log.warning("写入群成员缓存失败（不影响后续断言）：%s", exc)
+    runtime.store.add({"bot_id": bot_id, "direction": "in", "type": "group",
+                       "group_openid": "GROUP_AT45", "openid": "USER_RECENT45",
+                       "username": "最近说话的人", "content": "我先说一句", "msg_id": "AT45_1"})
+    _m45 = client.get(f"/api/chat/mentions?group=GROUP_AT45&bot={bot_id}").get_json()
+    _m45_ids = [item.get("openid") for item in (_m45.get("members") or [])]
+    check("候选名单里有群成员缓存里的人", "MEMBER_AT45" in _m45_ids, str(_m45)[:220])
+    check("候选名单里有「最近在群里说过话的人」（成员接口拉不到时的兜底）",
+          "USER_RECENT45" in _m45_ids, str(_m45_ids))
+    check("候选名单里每个人都带可读名字（网页下拉要显示人）",
+          bool(_m45.get("members"))
+          and all(item.get("name") for item in (_m45.get("members") or [])),
+          str(_m45.get("members"))[:220])
+    check("缺 group 参数时返回 400",
+          client.get("/api/chat/mentions").status_code == 400, "")
+
+    # (5) 网页发送：官方标签能原样发出；旧写法由后端兜底转换
+    fake.calls.clear()
+    _web45 = client.post("/api/chat/send", json={
+        "targetType": "group", "openid": "GROUP_AT45", "bot_id": bot_id,
+        "content": '<qqbot-at-user id="MEMBER_AT45" /> 早上好'}).get_json()
+    _calls45 = [c for c in fake.calls if c["kind"] == "text"]
+    check("网页发送官方 @ 标签能原样到达客户端",
+          bool(_web45.get("success")) and bool(_calls45)
+          and '<qqbot-at-user id="MEMBER_AT45" />' in (_calls45[-1].get("content") or ""),
+          f"{str(_web45)[:120]} calls={str(_calls45[-1:])[:120]}")
+    fake.calls.clear()
+    client.post("/api/chat/send", json={
+        "targetType": "group", "openid": "GROUP_AT45", "bot_id": bot_id,
+        "content": "旧写法 <@MEMBER_AT45> 也能用"})
+    _calls45b = [c for c in fake.calls if c["kind"] == "text"]
+    check("网页发送旧写法也会被后端换成官方标签",
+          bool(_calls45b)
+          and '<qqbot-at-user id="MEMBER_AT45" />' in (_calls45b[-1].get("content") or ""),
+          str(_calls45b[-1:])[:200])
+
+    # (6) @全体成员：官方仅文字子频道可用，群里退化成可读文字（不发无效真标签）
+    fake.calls.clear()
+    runtime.send_text("group", "GROUP_AT45", "<@all> 集合", bot_id=bot_id)
+    _calls45c = [c for c in fake.calls if c["kind"] == "text"]
+    check("群聊里的 <@all> 变成纯文本「@全体成员」（官方：@全部成员仅文字子频道可用）",
+          bool(_calls45c) and (_calls45c[-1].get("content") or "").strip() == "@全体成员 集合",
+          str(_calls45c[-1:])[:200])
+
+    # ------------------------------------------------------------------ 46. @/指令标签自动改用 Markdown
+    print("\n[46] 带 @ / 指令标签的消息自动改用 Markdown"
+          "（实测这两类标签只有 markdown 消息会被渲染）")
+
+    # (1) 显式选了纯文本，但正文里有 @ 某人 → 后端自动升级成 markdown
+    fake.calls.clear()
+    _info46 = runtime.send_text("group", "GROUP_TAG46",
+                                '早上好 <qqbot-at-user id="MEMBER_46" />',
+                                bot_id=bot_id, fmt="text")
+    _calls46 = [c for c in fake.calls if c["kind"] == "text"]
+    check("@ 某人 + 纯文本请求 → 实际用 markdown 发出去",
+          bool(_calls46) and _calls46[-1].get("fmt") == "markdown",
+          str(_calls46[-1:])[:220])
+    check("返回值 format=markdown 且 auto_format=true",
+          (_info46 or {}).get("format") == "markdown"
+          and (_info46 or {}).get("auto_format") is True, str(_info46)[:220])
+    check("_note 里说清了为什么自动换格式（用户看得到）",
+          "@某人" in str((_info46 or {}).get("_note"))
+          and "Markdown" in str((_info46 or {}).get("_note")),
+          str((_info46 or {}).get("_note"))[:200])
+
+    # (2) 旧写法 <@openid> 同理（定时任务/插件里写老写法也能用）
+    fake.calls.clear()
+    _info46b = runtime.send_text("group", "GROUP_TAG46", "你好 <@MEMBER_46>",
+                                 bot_id=bot_id, fmt="text")
+    _calls46b = [c for c in fake.calls if c["kind"] == "text"]
+    check("旧写法 <@openid> 同样触发自动改用 markdown",
+          bool(_calls46b) and _calls46b[-1].get("fmt") == "markdown"
+          and (_info46b or {}).get("auto_format") is True, str(_calls46b[-1:])[:200])
+
+    # (3) 指令标签（官方同样只有 markdown 支持）
+    fake.calls.clear()
+    _info46c = runtime.send_text("group", "GROUP_TAG46",
+                                 '点这个 <qqbot-cmd-enter text="%2Fhelp" />',
+                                 bot_id=bot_id, fmt="text")
+    _calls46c = [c for c in fake.calls if c["kind"] == "text"]
+    check("指令标签同样触发自动改用 markdown",
+          bool(_calls46c) and _calls46c[-1].get("fmt") == "markdown"
+          and "指令标签" in str((_info46c or {}).get("_note")),
+          str(_calls46c[-1:])[:220])
+    check("指令标签原样送出（不擅自删改正文）",
+          bool(_calls46c)
+          and '<qqbot-cmd-enter text="%2Fhelp" />' in (_calls46c[-1].get("content") or ""),
+          str(_calls46c[-1:])[:220])
+
+    # (4) 没有这类标签时不擅自改格式
+    fake.calls.clear()
+    _info46d = runtime.send_text("private", "USER_TAG46", "普通文本消息",
+                                 bot_id=bot_id, fmt="text")
+    _calls46d = [c for c in fake.calls if c["kind"] == "text"]
+    check("普通文本仍按纯文本发（不会一律改成 markdown）",
+          bool(_calls46d) and _calls46d[-1].get("fmt") == "text"
+          and not (_info46d or {}).get("auto_format"), str(_calls46d[-1:])[:200])
+    fake.calls.clear()
+    _info46e = runtime.send_text("group", "GROUP_TAG46", "<@all> 集合",
+                                 bot_id=bot_id, fmt="text")
+    _calls46e = [c for c in fake.calls if c["kind"] == "text"]
+    check("@全体成员 在群里退化成纯文字 → 仍然是纯文本格式（纯文字在两种格式里都正常）",
+          bool(_calls46e) and _calls46e[-1].get("fmt") == "text"
+          and not (_info46e or {}).get("auto_format"), str(_calls46e[-1:])[:200])
+
+    # (5) 已经选了 markdown：不再重复提示"自动改了格式"
+    fake.calls.clear()
+    _info46f = runtime.send_text("group", "GROUP_TAG46",
+                                 '<qqbot-at-user id="MEMBER_46" /> 在吗',
+                                 bot_id=bot_id, fmt="markdown")
+    check("显式 markdown + @ → 不重复提示 auto_format（本来就是 markdown）",
+          (_info46f or {}).get("format") == "markdown"
+          and not (_info46f or {}).get("auto_format"), str(_info46f)[:200])
+
+    # (6) 网页接口：format=text + @ → 回传真实格式与自动说明
+    fake.calls.clear()
+    _web46 = client.post("/api/chat/send", json={
+        "targetType": "group", "openid": "GROUP_TAG46", "bot_id": bot_id,
+        "content": '<qqbot-at-user id="MEMBER_46" /> 早上好',
+        "format": "text"}).get_json()
+    _wcalls46 = [c for c in fake.calls if c["kind"] == "text"]
+    check("网页选了纯文本但正文带 @：接口回传 format=markdown / auto_format=true",
+          bool(_web46.get("success")) and _web46.get("format") == "markdown"
+          and _web46.get("auto_format") is True, str(_web46)[:220])
+    check("网页这条消息确实按 markdown 发到客户端",
+          bool(_wcalls46) and _wcalls46[-1].get("fmt") == "markdown",
+          str(_wcalls46[-1:])[:200])
+    check("网页响应里的 note 说明了自动改格式的原因",
+          "@某人" in str(_web46.get("note")), str(_web46.get("note"))[:200])
+
+    # (7) 网页发送指令标签：不填 format（跟随配置）= 纯文本，也应自动升级
+    fake.calls.clear()
+    _web46b = client.post("/api/chat/send", json={
+        "targetType": "group", "openid": "GROUP_TAG46", "bot_id": bot_id,
+        "content": '打卡 <qqbot-cmd-input text="%2Fsign" show="%E6%89%93%E5%8D%A1" />'}).get_json()
+    _wcalls46b = [c for c in fake.calls if c["kind"] == "text"]
+    check("网页发指令标签（不带 format）也会自动改用 markdown",
+          bool(_web46b.get("success")) and _web46b.get("format") == "markdown"
+          and bool(_wcalls46b) and _wcalls46b[-1].get("fmt") == "markdown",
+          str(_web46b)[:220])
+    check("网页发出去的指令标签正文完整（urlencode 值没被改动）",
+          bool(_wcalls46b)
+          and '<qqbot-cmd-input text="%2Fsign" show="%E6%89%93%E5%8D%A1" />'
+          in (_wcalls46b[-1].get("content") or ""), str(_wcalls46b[-1:])[:220])
+
+    # (8) 网页发普通文本：格式还是纯文本，接口 auto_format=false
+    fake.calls.clear()
+    _web46c = client.post("/api/chat/send", json={
+        "targetType": "private", "openid": "USER_TAG46", "bot_id": bot_id,
+        "content": "普通一句话", "format": "text"}).get_json()
+    check("网页发普通文本时格式不变（auto_format=false）",
+          _web46c.get("format") == "text" and not _web46c.get("auto_format"),
+          str(_web46c)[:200])
+    check("第 [46] 节没有改动机器人的发送格式配置（自动升级只在这一次发送内生效）",
+          config_manager.get_for_bot(bot_id, "send.message_format")
+          == (_ov_back44.get("send") or {}).get("message_format", "text"),
+          str(config_manager.get_for_bot(bot_id, "send.message_format")))
 
     # ------------------------------------------------------------------ 收尾
     runtime.processor.stop()

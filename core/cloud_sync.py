@@ -138,6 +138,56 @@ def check_text_payload(rel: str, blob: bytes) -> str:
     return ""
 
 
+# 上传前的"敏感字段"扫描：字段名像密钥的一律不往云端传（PROGRESS.md P1）。
+# 只认字段名，不猜值 —— 聊天记录里出现 "api_key" 这个词不会被误伤。
+SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(api[_-]?key|apikey|api[_-]?token|access[_-]?token|refresh[_-]?token|"
+    r"client[_-]?secret|app[_-]?secret|secret[_-]?key|private[_-]?key|"
+    r"password|passwd|credential|authorization|bearer[_-]?token|session[_-]?key)")
+# 纯文本行："api_key = xxxxxxxx" / "\"token\": xxxxxxxx"（值要够长，避免把说明文字当成密钥）
+SENSITIVE_LINE_RE = re.compile(
+    r"(?im)^\s*[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_\-]{0,40})[\"']?\s*[:=]\s*[\"']?(?P<value>\S{12,})")
+
+
+def find_sensitive_keys(rel: str, blob: bytes) -> List[str]:
+    """扫文本/JSON 里"像密钥的字段名"，返回命中的键（空列表 = 可以上传）。
+
+    - `.json`：递归只看 dict 的 key（`{"role":"user","content":"... api_key ..."}` 不会命中）；
+    - 其它文本：只认 `api_key = <够长的值>` 这类"键 + 分隔符 + 值"的行；
+    - 二进制/解码失败：不算命中（图片、sqlite 之类本来就不该按文本判定）。
+    """
+    if not is_text_like(rel):
+        return []
+    text = None
+    try:
+        text = blob.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    if rel.lower().endswith(".json") and text.strip():
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if data is not None:
+            hits: List[str] = []
+
+            def walk(node):
+                if isinstance(node, dict):
+                    for key, value in node.items():
+                        if SENSITIVE_KEY_RE.search(str(key)):
+                            hits.append(str(key))
+                        walk(value)
+                elif isinstance(node, list):
+                    for item in node:
+                        walk(item)
+
+            walk(data)
+            return sorted(set(hits))
+    hits = [match.group("key") for match in SENSITIVE_LINE_RE.finditer(text)
+            if SENSITIVE_KEY_RE.search(match.group("key"))]
+    return sorted(set(hits))
+
+
 class D1Backend:
     """Cloudflare D1 的极简客户端（REST API）。"""
 
@@ -219,11 +269,17 @@ class CloudSync:
         self.first_sync_done = False
         self.totals = {"uploaded": 0, "downloaded": 0, "deleted": 0, "skipped": 0, "errors": 0}
         self._skipped_rels: List[str] = []
+        self._sensitive_rels: List[str] = []
 
     # ------------------------------------------------------------------ 配置
     @property
     def config(self):
         return self.config_manager.config
+
+    @property
+    def skip_secret_files(self) -> bool:
+        """含"密钥类字段"的文本/JSON 是否跳过上传（默认是：宁可少备份，也别把密钥传上云）。"""
+        return self.config.bool_of("cloud_sync", "skip_secret_files", default=True)
 
     @property
     def enabled(self) -> bool:
@@ -323,7 +379,7 @@ class CloudSync:
 
         started = time.time()
         result = {"uploaded": 0, "downloaded": 0, "deleted": 0, "skipped": 0, "errors": 0,
-                  "cloud_newer": 0}
+                  "cloud_newer": 0, "sensitive": 0}
         try:
             backend.ensure_table()
             remote = backend.fetch_all()
@@ -338,6 +394,7 @@ class CloudSync:
 
         with self._lock:
             self._skipped_rels = []
+            self._sensitive_rels = []
             result["out_of_scope"] = 0
             # 1) 云端有、本地没有 → 下载（或按墓碑删除）
             for rel, item in remote.items():
@@ -375,8 +432,11 @@ class CloudSync:
                 local_mtime = int(stat.st_mtime * 1000)
                 remote_item = remote.get(rel)
                 if remote_item is None:
-                    if self._upload(backend, path, rel, local_mtime):
+                    outcome = self._upload(backend, path, rel, local_mtime)
+                    if outcome == "ok":
                         result["uploaded"] += 1
+                    elif outcome == "sensitive":
+                        result["sensitive"] += 1
                     else:
                         result["errors"] += 1
                     continue
@@ -388,8 +448,12 @@ class CloudSync:
                         if remote_item["updated_at"] > local_mtime:
                             result["skipped"] += 1
                             self._note_skip(rel)
-                        elif self._upload(backend, path, rel, local_mtime):
-                            result["uploaded"] += 1
+                        else:
+                            outcome = self._upload(backend, path, rel, local_mtime)
+                            if outcome == "ok":
+                                result["uploaded"] += 1
+                            elif outcome == "sensitive":
+                                result["sensitive"] += 1
                         continue
                     if remote_item["updated_at"] > local_mtime:
                         try:
@@ -397,8 +461,12 @@ class CloudSync:
                             result["deleted"] += 1
                         except OSError:
                             result["errors"] += 1
-                    elif self._upload(backend, path, rel, local_mtime):
-                        result["uploaded"] += 1
+                    else:
+                        outcome = self._upload(backend, path, rel, local_mtime)
+                        if outcome == "ok":
+                            result["uploaded"] += 1
+                        elif outcome == "sensitive":
+                            result["sensitive"] += 1
                     continue
                 if remote_item["updated_at"] > local_mtime + 1000:
                     outcome = self._download(backend, rel, remote_item, only_if_newer=True)
@@ -410,8 +478,11 @@ class CloudSync:
                     else:
                         result["errors"] += 1
                 elif local_mtime > remote_item["updated_at"] + 1000:
-                    if self._upload(backend, path, rel, local_mtime):
+                    outcome = self._upload(backend, path, rel, local_mtime)
+                    if outcome == "ok":
                         result["uploaded"] += 1
+                    elif outcome == "sensitive":
+                        result["sensitive"] += 1
                     else:
                         result["errors"] += 1
                 else:
@@ -422,32 +493,53 @@ class CloudSync:
             self.totals[key] += result.get(key, 0)
         result["ok"] = result["errors"] == 0
         result["seconds"] = round(time.time() - started, 2)
+        result["sensitive_files"] = list(self._sensitive_rels)
         result["message"] = (f"上传 {result['uploaded']}，恢复 {result['downloaded']}，"
                              f"删除 {result['deleted']}，跳过 {result['skipped']}，"
                              f"失败 {result['errors']}，用时 {result['seconds']} 秒")
+        if result["sensitive"]:
+            result["message"] += (f"（另有 {result['sensitive']} 个文件含密钥字段，"
+                                  f"按设置没有上传）")
         result["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.last_result = result
         if result.get("out_of_scope"):
             self.log.info("云端另有 %d 条记录不属于本程序（其它程序写的日志/锁文件等），已跳过不算失败",
                           result["out_of_scope"])
+        if result["sensitive"]:
+            self.log.warning("有 %d 个文件含密钥字段、按设置没有上传：%s",
+                             result["sensitive"], "；".join(result["sensitive_files"][:6]))
         if result["errors"]:
             self.log.warning("云同步完成但有失败：%s", result["message"])
         else:
             self.log.info("云同步完成：%s", result["message"])
         return result
 
-    def _upload(self, backend: D1Backend, path: str, rel: str, mtime: int) -> bool:
+    def _upload(self, backend: D1Backend, path: str, rel: str, mtime: int) -> str:
+        """上传一个文件。返回 `ok` / `sensitive`（含密钥字段，故意没传）/ `fail`。"""
         try:
             with open(path, "rb") as handle:
                 blob = handle.read()
+            if self.skip_secret_files:
+                hits = find_sensitive_keys(rel, blob)
+                if hits:
+                    # 只跳过上传，本地文件一个字节都不动；说清原因，别让人以为同步坏了
+                    self.log.warning(
+                        "跳过上传 %s：内容里有像密钥的字段（%s）。"
+                        "本程序的 config.json 本来就不同步；插件数据里的密钥也不该上云。"
+                        "如果这个文件确实需要备份，请在「设置 → 云同步」关掉「含密钥的文件不上传」",
+                        rel, "、".join(hits[:6]))
+                    self._note_skip(rel)
+                    if len(self._sensitive_rels) < 20:
+                        self._sensitive_rels.append(f"{rel}（{'、'.join(hits[:4])}）")
+                    return "sensitive"
             backend.put(self._key(rel), encode_value(blob), mtime, 0)
             self._note_success(rel)
             self.log.debug("已上传 %s（%d 字节）", rel, len(blob))
-            return True
+            return "ok"
         except Exception as exc:
             self.log.warning("上传 %s 失败：%s", rel, exc)
             self._note_failure(rel)
-            return False
+            return "fail"
 
     def _download(self, backend: D1Backend, rel: str, item: Dict[str, Any],
                   only_if_newer: bool = False) -> str:

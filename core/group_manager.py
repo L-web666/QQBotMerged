@@ -47,6 +47,8 @@ class GroupManager:
         self._lock = threading.RLock()
         self._settings: Dict[str, Dict[str, Any]] = {}
         self._member_refreshing: set = set()
+        # 哪些群已经"从历史报文补齐过成员身份"（只补一次，避免每次打开群都扫库）
+        self._roles_backfilled: set = set()
         self._name_refreshing: set = set()
         self._mute_state_cache: Dict[str, Dict[str, Any]] = {}
         self._name_updated: Dict[str, float] = {}
@@ -410,6 +412,20 @@ class GroupManager:
                 result["stale"] = False
             else:
                 result["api_error"] = refreshed.get("message", "")
+        # 平台成员接口不可用时（不是管理员 / 没白名单）身份拿不到，
+        # 但每条群消息的 author.member_role 都带真实身份，且老报文明明存在库里。
+        # 第一次真正用这个群时补一次；`_roles_backfilled` 保证之后不再重复扫描。
+        if group_openid not in self._roles_backfilled:
+            self._roles_backfilled.add(group_openid)
+            try:
+                from core.member_roles import backfill_from_history
+                stats = backfill_from_history(self.store)
+                if stats.get("members"):
+                    result["members"] = self.store.list_members(group_openid, bot_id)
+                    self.log.info("已从历史消息补齐群成员身份：%d 个群、%d 位成员",
+                                  stats.get("groups"), stats.get("members"))
+            except Exception as exc:
+                self.log.debug("补齐群成员身份失败: %s", exc)
         # 官方「查询群禁言状态」：全员禁言模式 + QQ 群里真实被禁言的成员
         platform = self.platform_mute_state(group_openid, bot_id, refresh=refresh)
         result["platform"] = platform
@@ -445,7 +461,8 @@ class GroupManager:
             platform_map[openid] = item
             entry = known.setdefault(openid, {
                 "member_openid": openid, "group_openid": group_openid, "username": "",
-                "role": "member", "bot_id": bot_id, "source": "platform",
+                # 身份未知：这些人是"从历史消息/禁言名单里认出来的"，平台没给身份
+                "role": ROLE_UNKNOWN, "bot_id": bot_id, "source": "platform",
             })
             # 官方禁言名单带昵称，正好补上"从历史消息里识别不到名字"的成员
             if item.get("username") and not entry.get("username"):
@@ -466,7 +483,8 @@ class GroupManager:
                         continue
                     entry = known.setdefault(openid, {
                         "member_openid": openid, "group_openid": group_openid,
-                        "username": "", "role": "member", "bot_id": bot_id, "source": "history",
+                        "username": "", "role": ROLE_UNKNOWN, "bot_id": bot_id,
+                        "source": "history",
                     })
                     if msg.get("username"):
                         entry["username"] = msg["username"]
@@ -516,7 +534,7 @@ class GroupManager:
                 members.append({
                     "member_openid": openid,
                     "username": item.get("username") or item.get("nickname") or "",
-                    "role": item.get("role") or ("owner" if item.get("is_owner") else "member"),
+                    "role": _normalize_role(item),
                 })
             if members:
                 self.store.upsert_members(bot_id, group_openid, members)
@@ -805,3 +823,47 @@ def _human_remaining(seconds: int) -> str:
     if seconds < 3600:
         return f"{seconds // 60} 分钟"
     return f"{seconds // 3600} 小时{(seconds % 3600) // 60} 分钟"
+
+
+# 已知的成员角色。**注意**：这里不含"成员"的兜底 —— 以前到处默认写 "member"，
+# 结果页面把每个识别不到身份的成员都显示成「成员」，看起来像"全都是成员"。
+# 真正认不出来时用 ROLE_UNKNOWN，页面显示「未知」，这是唯一诚实的选择。
+ROLE_UNKNOWN = "unknown"
+ROLE_VALUES = ("owner", "admin", "member", ROLE_UNKNOWN)
+
+
+def _normalize_role(item: Dict[str, Any]) -> str:
+    """把平台返回的成员身份字段归一成 owner / admin / member / unknown。
+
+    QQ 官方群成员接口在不同版本/白名单下字段名不一样：`role`、`member_role`、
+    `is_owner`、`is_admin` 都出现过。**先看"是不是群主"再看 role** —— 平台有时把群主
+    也标成 `admin`，只看 role 会显示错。
+    都拿不到就返回 `unknown`（不再默认成 member，否则页面会谎报"他是普通成员"）。
+    """
+    if not isinstance(item, dict):
+        return ROLE_UNKNOWN
+    if item.get("is_owner") in (True, 1, "1", "true", "True"):
+        return "owner"
+    for key in ("role", "member_role", "member_role_type", "role_type"):
+        value = str(item.get(key) or "").strip().lower()
+        if value in ("owner", "admin", "member"):
+            return value
+        # 中文/其它写法
+        if value in ("群主", "创建者"):
+            return "owner"
+        if value in ("管理员", "群管理"):
+            return "admin"
+    if item.get("is_admin") in (True, 1, "1", "true", "True"):
+        return "admin"
+    return ROLE_UNKNOWN
+
+
+def member_role(value: Any) -> str:
+    """只解析一个身份值（群消息里的 `author.member_role` / `mentions[].member_role`）。
+
+    官方**实测**取值：普通成员 `member`、管理员 `admin`、群主 `owner`。
+    返回空串代表"这条消息没带身份" —— 调用方据此**不做任何改动**，
+    绝不能把空串当成"他是普通成员"写回数据库（那正是之前整列显示「成员」的原因）。
+    """
+    role = _normalize_role({"role": value})
+    return "" if role == ROLE_UNKNOWN else role

@@ -121,7 +121,40 @@
                 <input type="file" id="fileInput" hidden>
               </label>
               <input class="url-input" id="imageUrl" placeholder="或粘贴图片链接（http/https）">
+              <label class="tool-btn" title="本次发送用哪种格式：纯文本按原样发；Markdown 用 QQ 原生 markdown 发送（标题/加粗/列表等），被平台拒绝时会自动回退为纯文本">
+                🅼 格式
+                <select id="sendFormat">
+                  <option value="text">纯文本</option>
+                  <option value="markdown">Markdown</option>
+                </select>
+              </label>
+              <label class="tool-btn" id="mentionWrap" title="在群里 @ 某人：选中后会在输入框插入官方 @ 标签（&lt;qqbot-at-user id=&quot;对方openid&quot; /&gt;）。只有群聊支持；@ 标签只在 Markdown 消息里渲染，选中后会自动切到 Markdown">
+                ＠ 提及
+                <select id="mentionPicker">
+                  <option value="">（先选一个群会话）</option>
+                </select>
+              </label>
+              <button class="tool-btn" id="cmdBtn" title="插入指令标签（仅 Markdown 生效）：回车指令=用户点击后直接发送；参数指令=用户点击后把文本插进输入框自己改着发。文本最长 100 字符，程序会自动 urlencode">
+                ⌘ 指令
+              </button>
+              <span class="tool-hint" id="mentionHint"></span>
+              <span class="tool-hint" id="cmdHint"></span>
               <span class="tool-hint" id="fileHint"></span>
+            </div>
+            <div class="cmd-panel" id="cmdPanel" style="display:none">
+              <select id="cmdKind" title="回车指令：用户点一下就直接把文本发出去（官方：群聊/文字子频道不支持，仅私聊等场景）；参数指令：用户点一下把文本插进输入框自己编辑">
+                <option value="enter">回车指令（点击直接发送）</option>
+                <option value="input">参数指令（点击插入输入框）</option>
+              </select>
+              <input class="url-input" id="cmdText" maxlength="100"
+                     placeholder="点击后发送/插入的文本（≤100 字符，例如 /帮助）">
+              <input class="url-input" id="cmdShow" maxlength="100"
+                     placeholder="显示文本（选填，默认与上一格相同）">
+              <label class="cmd-check" title="只有「参数指令」用得上：用户点击后插入输入框时，带上这条消息的引用回复">
+                <input type="checkbox" id="cmdReference"> 带引用回复
+              </label>
+              <button class="btn" id="cmdInsert">插入</button>
+              <button class="icon-btn" id="cmdClose" title="收起">✕</button>
             </div>
             <div class="composer-row">
               <textarea id="content" rows="2" placeholder="输入消息，Enter 发送 / Shift+Enter 换行"></textarea>
@@ -186,6 +219,7 @@
         </div>
       </div>
       <div class="hint" id="pluginsDir"></div>
+      <div class="hint" id="pluginsBotScope"></div>
       <div id="pluginIssues"></div>
       <div class="card"><div class="tbl-wrap"><table id="pluginsTable"></table></div></div>
       <div class="hint" id="pluginsPending"></div>

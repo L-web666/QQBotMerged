@@ -7,6 +7,9 @@
 
 要点：
 - 相同 URL 只下载一次（按 URL 哈希去重，命中已有记录直接复用）；
+- **相同内容也只存一份**（按 sha256 去重）：多个机器人同在一个群时，同一条消息里的
+  图片会分别下发给每个机器人，每份下载地址都带各自的 rkey 签名（URL 不同），
+  只按 URL 去重是拦不住的；
 - QQ 图片有防盗链，下载时带上 Referer / User-Agent；
 - 文件名用 `URL哈希_时间戳.ext`，避免同名覆盖与路径穿越；
 - 下载失败也记一条 `state=failed` 的媒体记录，界面上可提示“未能留存”。
@@ -56,6 +59,13 @@ DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 def url_hash(url: str) -> str:
     return hashlib.sha1((url or "").encode("utf-8", "ignore")).hexdigest()[:20]
+
+
+def content_hash(blob: bytes) -> str:
+    """内容指纹（sha256）。用来判断"这张图是不是已经存过了"。"""
+    if not blob:
+        return ""
+    return hashlib.sha256(blob).hexdigest()
 
 
 def guess_ext(url: str, content_type: str = "", fallback: str = ".bin") -> str:
@@ -155,6 +165,10 @@ class MediaStore:
         self._locks: Dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._inflight: set = set()
+        # "查重 → 落盘 → 登记"这一小段必须串行：两个机器人同时收到同一条群消息时，
+        # 两条线程会同时查到"还没存过"，然后各写一份文件。持锁的只有这段快操作，
+        # 真正的网络下载在锁外面，不会把并发下载拖成串行。
+        self._save_lock = threading.Lock()
         os.makedirs(self.media_dir, exist_ok=True)
 
     # ------------------------------------------------------------------ 配置
@@ -181,47 +195,91 @@ class MediaStore:
     # ------------------------------------------------------------------ 下载
     def save_bytes(self, blob: bytes, content_type: str = "", file_name: str = "",
                    source: str = "received", bot_id: str = "", conv_key: str = "",
-                   msg_id: str = "", url: str = "", record: bool = True) -> Dict[str, Any]:
-        """把字节流落盘并（可选）登记到媒体表，返回记录。"""
-        ext = guess_ext(file_name or url, content_type)
-        size = len(blob)
+                   msg_id: str = "", url: str = "", record: bool = True,
+                   sha256: str = "", dedup: bool = True) -> Dict[str, Any]:
+        """把字节流落盘并（可选）登记到媒体表，返回记录。
+
+        去重（`dedup=True`，默认开）：**内容相同就复用已经存好的那一份** —— 不写第二个
+        文件，也不再登记第二条记录，返回已有记录（带 `reused=True`）。
+        原因：多个机器人同在一个群时，同一条消息里的图片会分别下发给每个机器人，
+        内容一模一样但下载地址（带 rkey 签名）各不相同；只按 URL 去重拦不住，
+        而按文件名去重既不可靠（同名不同图）也不够（不同名同一图）。
+        """
         if not blob:
             raise ValueError("媒体内容为空")
+        size = len(blob)
         limit = int(float(self.config.float_of("send", "max_file_mb", default=8) or 8) * 1024 * 1024)
         if size > max(limit, self.max_bytes):
             raise ValueError(f"文件过大（{size / 1048576:.1f} MB），已跳过留存")
 
-        base = safe_name(file_name) if file_name else ""
-        if not base:
-            base = f"{(url_hash(url) if url else uuid.uuid4().hex[:16])}_{int(time.time())}{ext}"
-        elif not os.path.splitext(base)[1]:
-            base += ext
-        local_name = base
-        full = os.path.join(self.media_dir, local_name)
-        index = 1
-        while os.path.exists(full):
-            stem, dot, tail = local_name.rpartition(".")
-            local_name = f"{stem}_{index}{dot}{tail}" if dot else f"{local_name}_{index}{ext}"
+        digest = sha256 or content_hash(blob)
+        with self._save_lock:
+            if dedup and digest:
+                existing = self.find_duplicate(digest)
+                if existing:
+                    logger.debug("媒体内容重复，复用已有文件：%s", existing.get("local_name"))
+                    return existing
+
+            ext = guess_ext(file_name or url, content_type)
+            base = safe_name(file_name) if file_name else ""
+            if not base:
+                base = f"{(url_hash(url) if url else uuid.uuid4().hex[:16])}_{int(time.time())}{ext}"
+            elif not os.path.splitext(base)[1]:
+                base += ext
+            local_name = base
             full = os.path.join(self.media_dir, local_name)
-            index += 1
+            index = 1
+            while os.path.exists(full):
+                stem, dot, tail = local_name.rpartition(".")
+                local_name = f"{stem}_{index}{dot}{tail}" if dot else f"{local_name}_{index}{ext}"
+                full = os.path.join(self.media_dir, local_name)
+                index += 1
 
-        os.makedirs(self.media_dir, exist_ok=True)
-        with open(full, "wb") as handle:
-            handle.write(blob)
+            os.makedirs(self.media_dir, exist_ok=True)
+            with open(full, "wb") as handle:
+                handle.write(blob)
 
-        record_data = {
-            "bot_id": bot_id, "conv_key": conv_key, "msg_id": msg_id, "source": source,
-            "url": url, "url_hash": url_hash(url) if url else "", "local_name": local_name,
-            "file_name": base, "content_type": content_type, "size": size,
-            "state": "done", "created_at": time.time(),
-        }
-        if record:
-            try:
-                self.store.add_media(record_data)
-            except Exception as exc:  # 记录失败不影响文件已留存的事实
-                logger.warning("登记媒体记录失败: %s", exc)
-        record_data["local_url"] = self.local_url(local_name)
-        return record_data
+            record_data = {
+                "bot_id": bot_id, "conv_key": conv_key, "msg_id": msg_id, "source": source,
+                "url": url, "url_hash": url_hash(url) if url else "", "sha256": digest,
+                "local_name": local_name,
+                "file_name": base, "content_type": content_type, "size": size,
+                "state": "done", "created_at": time.time(),
+            }
+            if record:
+                try:
+                    self.store.add_media(record_data)
+                except Exception as exc:  # 记录失败不影响文件已留存的事实
+                    logger.warning("登记媒体记录失败: %s", exc)
+            record_data["local_url"] = self.local_url(local_name)
+            return record_data
+
+    def find_duplicate(self, sha256: str) -> Optional[Dict[str, Any]]:
+        """按内容指纹找一份已留存且文件还在的记录（找不到返回 None）。"""
+        digest = str(sha256 or "").strip()
+        if not digest:
+            return None
+        finder = getattr(self.store, "find_media_by_sha256", None)
+        if not callable(finder):
+            return None
+        try:
+            existing = finder(digest)
+        except Exception as exc:
+            logger.debug("按内容查重失败: %s", exc)
+            return None
+        return self._reusable(existing)
+
+    def _reusable(self, existing: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """记录里的文件确实还在磁盘上，才算"能复用"。"""
+        if not existing or not existing.get("local_name"):
+            return None
+        full = os.path.join(self.media_dir, existing["local_name"])
+        if not os.path.isfile(full):
+            return None
+        item = dict(existing)
+        item["local_url"] = self.local_url(item["local_name"])
+        item["reused"] = True
+        return item
 
     def fetch(self, url: str) -> Tuple[bytes, str]:
         """下载 URL 内容，返回 (字节, Content-Type)。"""
@@ -249,39 +307,64 @@ class MediaStore:
             raise ValueError("下载内容为空")
         return blob, response.headers.get("Content-Type", "")
 
+    def _key_lock(self, key: str) -> threading.Lock:
+        """按去重键取一把锁（同一个 URL 同时被两条线程要下载时只下一次）。"""
+        with self._locks_guard:
+            # 锁表不能无限长：偶尔清一次"没人持有"的锁。清掉的锁万一还有线程在用，
+            # 最坏结果只是多下一次（`_save_lock` 仍然保证不会存出第二份文件）。
+            if len(self._locks) > 1024:
+                for name in [n for n, lock in self._locks.items() if not lock.locked()]:
+                    self._locks.pop(name, None)
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[key] = lock
+            return lock
+
     def download(self, url: str, file_name: str = "", source: str = "received", bot_id: str = "",
                  conv_key: str = "", msg_id: str = "") -> Optional[Dict[str, Any]]:
-        """下载并留存一个媒体链接（失败返回 None，并登记失败记录）。"""
+        """下载并留存一个媒体链接（失败返回 None，并登记失败记录）。
+
+        去重有两道：① 同 URL（`url_hash`）已经存过就直接复用，省掉一次下载；
+        ② 内容相同（sha256）复用同一个文件，见 `save_bytes` —— 多机器人同群时
+        每个机器人拿到的下载地址不一样，只有第二道拦得住。
+        """
         if not url:
             return None
         key = url_hash(url)
-        # 去重：同 URL 已经留存过，直接复用
-        if key:
-            existing = None
+        existing = self._find_by_url(key)
+        if existing:
+            return existing
+        with self._key_lock("url:" + (key or url)):
+            # 拿到锁之后再查一次：刚才可能在别的线程里已经下完了
+            existing = self._find_by_url(key)
+            if existing:
+                return existing
             try:
-                existing = self.store.find_media_by_hash(key)
-            except Exception:
-                existing = None
-            if existing and existing.get("local_name"):
-                full = os.path.join(self.media_dir, existing["local_name"])
-                if os.path.isfile(full):
-                    existing["local_url"] = self.local_url(existing["local_name"])
-                    return existing
-        try:
-            blob, content_type = self.fetch(url)
-            return self.save_bytes(blob, content_type, file_name=file_name, source=source,
-                                   bot_id=bot_id, conv_key=conv_key, msg_id=msg_id, url=url)
-        except Exception as exc:
-            logger.warning("媒体留存失败（%s）：%s", url[:120], exc)
-            try:
-                self.store.add_media({
-                    "bot_id": bot_id, "conv_key": conv_key, "msg_id": msg_id, "source": source,
-                    "url": url, "url_hash": key, "state": "failed", "error": str(exc)[:300],
-                    "created_at": time.time(),
-                })
-            except Exception:
-                pass
+                blob, content_type = self.fetch(url)
+                return self.save_bytes(blob, content_type, file_name=file_name, source=source,
+                                       bot_id=bot_id, conv_key=conv_key, msg_id=msg_id, url=url)
+            except Exception as exc:
+                logger.warning("媒体留存失败（%s）：%s", url[:120], exc)
+                try:
+                    self.store.add_media({
+                        "bot_id": bot_id, "conv_key": conv_key, "msg_id": msg_id, "source": source,
+                        "url": url, "url_hash": key, "state": "failed", "error": str(exc)[:300],
+                        "created_at": time.time(),
+                    })
+                except Exception:
+                    pass
+                return None
+
+    def _find_by_url(self, key: str) -> Optional[Dict[str, Any]]:
+        """同一个 URL 已经留存过 → 直接复用（文件还在磁盘上才算）。"""
+        if not key:
             return None
+        try:
+            existing = self.store.find_media_by_hash(key)
+        except Exception:
+            existing = None
+        return self._reusable(existing)
 
     def download_async(self, url: str, **kwargs) -> None:
         """后台线程下载（不阻塞消息处理）。"""

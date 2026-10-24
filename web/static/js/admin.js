@@ -7,8 +7,13 @@
 
   var Admin = {
     plugins: [],
-    pluginChanges: {},
-    pluginServer: {},
+    pluginChanges: {},       // 全局启用/停用的暂存修改（点「保存插件设置」才生效）
+    pluginServer: {},        // 全局启用状态（服务端）
+    pluginBot: '',           // 当前选中的机器人 id（空字符串 = 没选）
+    pluginBotName: '',       // 当前机器人的显示名
+    pluginBots: [],          // 全部机器人 [{id, name, enabled}]
+    pluginBotAllowed: {},    // 当前机器人运行哪些插件 {插件名: true/false}
+    pluginBotSaving: false,  // 「按机器人启用插件」请求进行中，防止重复点击
     logTimer: null,
     statusTimer: null
   };
@@ -27,8 +32,9 @@
         kv('当前访问地址', data.web_url || '--'),
         kv('机器人', (data.online_count || 0) + ' / ' + (data.bot_count || 0) + ' 在线',
            data.online_count ? 'ok-text' : 'warn-text'),
-        kv('内置 AI', data.ai && data.ai.usable ? (data.ai.model || '可用') :
-           (data.ai && data.ai.enabled ? '未配置完整' : '已关闭'),
+        kv('内置 AI', data.ai && data.ai.usable
+           ? ((data.ai.model || '可用') + (data.ai.bot_name ? ' · ' + data.ai.bot_name : ''))
+           : (data.ai && data.ai.enabled ? '未配置完整' : '已关闭'),
            data.ai && data.ai.usable ? 'ok-text' : 'warn-text'),
         kv('存储', (data.storage && data.storage.kind === 'sqlite' ? 'SQLite' : '内存') +
            ' · ' + ((data.storage && data.storage.messages) || 0) + ' 条消息'),
@@ -41,8 +47,7 @@
              }).join(' ') : '无'),
         kv('存图开关', data.media && data.media.save_enabled ? '已开启' : '已关闭',
            data.media && data.media.save_enabled ? 'ok-text' : 'warn-text'),
-        kv('服务器时间', data.beijing_time),
-        kv('版本', data.version)
+        kv('服务器时间', data.beijing_time)
       ].join('');
 
       if (data.bots_disabled) {
@@ -220,12 +225,20 @@
 
   /* ============================ 插件 ============================ */
   function loadPlugins() {
-    return U.getJSON('/api/admin/plugins').then(function (data) {
+    // 插件列表是「按机器人」的（每个机器人能跑的插件不同），请求必须带上当前机器人
+    var wantBot = U.ActiveBot.id || '';
+    return U.getJSON(U.qs('/api/admin/plugins')).then(function (data) {
+      // 请求期间用户又切了机器人：这份响应属于上一个机器人，丢掉不渲染
+      if (U.ActiveBot.id !== wantBot) return data;
       Admin.plugins = data.plugins || [];
       Admin.pluginServer = {};
       for (var i = 0; i < Admin.plugins.length; i++) {
         Admin.pluginServer[Admin.plugins[i].name] = !!Admin.plugins[i].disabled;
       }
+      Admin.pluginBot = data.bot_id || '';
+      Admin.pluginBotName = data.bot_name || '';
+      Admin.pluginBots = data.bots || [];
+      Admin.pluginBotAllowed = data.bot_allowed || {};
       renderPluginDiagnostics(data);
       renderPlugins();
       updatePluginPending();      // 重新加载后要刷新“待保存”提示，否则保存完还挂着旧提示
@@ -234,6 +247,20 @@
       U.el('pluginsTable').innerHTML = '<tr><td class="err-text">加载失败：' +
         U.esc(error.message) + '</td></tr>';
     });
+  }
+
+  /* 「当前机器人」勾选框的说明行 */
+  function renderBotScopeHint() {
+    var node = U.el('pluginsBotScope');
+    if (!node) return;
+    var bots = Admin.pluginBots || [];
+    if (!bots.length) {
+      node.innerHTML = '配置里还没有机器人';
+      return;
+    }
+    var name = Admin.pluginBotName || Admin.pluginBot || '未选择';
+    node.innerHTML = '当前机器人：<b>' + U.esc(name) + '</b>（在左上角切换机器人）· ' +
+      '勾选 = 这个机器人运行该插件；不勾 = 只对其它机器人生效，不影响全局启用状态。';
   }
 
   function renderPluginDiagnostics(data) {
@@ -251,6 +278,15 @@
     if (diag.astrbot_ready === false) {
       parts.push('<b class="warn-text">AstrBot 兼容层未就绪</b>');
     }
+    // 安全扫描汇总（每行插件的 safety 由后端 AST 扫描得到）
+    var safetyAll = diag.safety || {};
+    if (safetyAll.level === 'high') {
+      parts.push('<b class="err-text">⚠️ 有插件用到高风险写法：' + U.esc(safetyAll.summary || '') +
+        '（见下表「状态」列的提示）</b>');
+    } else if (safetyAll.level === 'medium') {
+      parts.push('<span class="warn-text">安全提示：' + U.esc(safetyAll.summary || '') +
+        '（插件是任意 Python 代码，见下方说明）</span>');
+    }
     if (diag.discovered && diag.discovered.length) {
       parts.push('扫描到 ' + diag.discovered.length + ' 个候选文件');
     }
@@ -261,7 +297,10 @@
       '插件配置在 <code>data/config/&lt;插件名&gt;_config.json</code>，' +
       '插件数据在 <code>data/plugin_data/&lt;插件名&gt;/</code>。' +
       '插件是任意 Python 代码，请只放你信任的插件；' +
-      '插件页会列出每个插件注册的处理器与用到的、本程序暂不支持的能力。</div>';
+      '插件页会列出每个插件注册的处理器与用到的、本程序暂不支持的能力。' +
+      '<b>安全提示</b>来自对插件源码的静态扫描（只看代码、不执行）：' +
+      '标出的都是"这段代码能做什么"（执行命令 / 读写文件 / 联网 / 动态执行 / 读配置），' +
+      '不代表一定是恶意，但装第三方插件前值得看一眼。</div>';
 
     // 加载失败 / 被跳过的文件：直接展示原因（以前只写日志，页面上完全看不出来）
     var issues = diag.issues || [];
@@ -329,7 +368,18 @@
         rules.push('<span class="warn-text">不支持：' + plugin.unsupported.join('、') + '</span>');
       }
       var formatBadge = '<span class="badge ok">AstrBot</span>';
-      var riskBadge = '';
+      // 安全扫描（core/plugin_safety.py，AST 静态分析，不执行插件代码）：
+      // 有 high/medium 时在插件名后面挂一个提示徽章，鼠标悬停能看到命中的具体写法。
+      var safety = plugin.safety || {};
+      var safetyBadge = '';
+      if (safety.level === 'high' || safety.level === 'medium') {
+        var detail = (safety.findings || []).map(function (item) {
+          return '· ' + item.label + '（' + (item.evidence || []).join('、') + '）';
+        }).join('\n');
+        safetyBadge = '<span class="badge ' + (safety.level === 'high' ? 'err' : 'warn') +
+          '" title="' + U.esc(detail) + '">⚠️ 安全提示 ' + (safety.summary || '') + '</span>';
+      }
+      var riskBadge = safetyBadge;
       var metaBits = [];
       if (plugin.astrbot_version) metaBits.push('要求 AstrBot ' + plugin.astrbot_version);
       if (plugin.support_platforms && plugin.support_platforms.length) {
@@ -339,6 +389,19 @@
         metaBits.push('<a href="' + U.esc(plugin.repo) + '" target="_blank" rel="noopener">仓库</a>');
       }
       var kindText = 'AstrBot 目录';
+      // 「当前机器人」列：勾选 = 这个机器人运行该插件。
+      // 全局已停用的插件仍然允许勾（勾了等全局启用后才会真正跑），用 title 说明。
+      var botAllowed = Admin.pluginBotAllowed[plugin.name] !== false;
+      var botHint = '';
+      if (!Admin.pluginBot) botHint = '请先在左上角选择机器人';
+      else if (Admin.pluginServer[plugin.name] || Admin.pluginChanges[plugin.name]) {
+        botHint = '该插件已全局停用，先启用再按机器人分配（这里可以先勾上）';
+      } else {
+        botHint = '勾选 = 机器人 ' + (Admin.pluginBotName || Admin.pluginBot) + ' 运行该插件';
+      }
+      var botCell = '<label class="chk" title="' + U.esc(botHint) + '">' +
+        '<input type="checkbox" class="bot-plugin" data-plugin-bot="' + U.esc(plugin.name) + '"' +
+        (botAllowed ? ' checked' : '') + (Admin.pluginBot ? '' : ' disabled') + '></label>';
       return '<tr' + (staged ? ' style="background:rgba(217,119,6,.08)"' : '') + '>' +
         '<td><b>' + U.esc(plugin.title || plugin.name) + '</b> ' + formatBadge + riskBadge +
         '<div class="tiny">' + U.esc(plugin.file || '') + ' · v' + U.esc(plugin.version || '') +
@@ -348,15 +411,19 @@
         '<td class="nowrap">' + U.esc(kindText) + '</td>' +
         '<td>' + (rules.length ? rules.join('；') : '<span class="tiny">无匹配规则</span>') + '</td>' +
         '<td class="nowrap">' + statusBadge + '</td>' +
+        '<td class="nowrap">' + botCell + '</td>' +
         '<td class="cell-act"><button class="btn tiny" data-plugin="' + U.esc(plugin.name) +
         '" data-disable="' + (disabled ? '0' : '1') + '">' +
         (disabled ? '▶️ 启用' : '⏸️ 停用') + '</button></td></tr>';
     }).join('');
     U.el('pluginsTable').innerHTML =
-      '<colgroup><col style="width:22%"><col style="width:30%"><col style="width:9%">' +
-      '<col style="width:20%"><col style="width:9%"><col style="width:10%"></colgroup>' +
-      '<thead><tr><th>插件</th><th>说明</th><th>类型</th><th>匹配规则</th><th>状态</th><th>操作</th></tr></thead>' +
-      '<tbody>' + (rows || '<tr><td colspan="6" class="tiny">plugins/ 目录里还没有插件</td></tr>') + '</tbody>';
+      '<colgroup><col style="width:20%"><col style="width:27%"><col style="width:8%">' +
+      '<col style="width:18%"><col style="width:8%"><col style="width:9%">' +
+      '<col style="width:10%"></colgroup>' +
+      '<thead><tr><th>插件</th><th>说明</th><th>类型</th><th>匹配规则</th><th>状态</th>' +
+      '<th title="勾选 = 当前机器人运行该插件">当前机器人</th><th>操作</th></tr></thead>' +
+      '<tbody>' + (rows || '<tr><td colspan="7" class="tiny">plugins/ 目录里还没有插件</td></tr>') + '</tbody>';
+    renderBotScopeHint();
     var buttons = U.el('pluginsTable').querySelectorAll('[data-plugin]');
     for (var i = 0; i < buttons.length; i++) {
       buttons[i].addEventListener('click', function () {
@@ -368,6 +435,55 @@
         updatePluginPending();
       });
     }
+    var toggles = U.el('pluginsTable').querySelectorAll('.bot-plugin');
+    for (var j = 0; j < toggles.length; j++) {
+      toggles[j].addEventListener('change', onBotPluginToggle);
+    }
+  }
+
+  /* 勾选框请求中先把所有勾选框锁住，避免连点产生互相覆盖的请求 */
+  function setBotPluginBusy(busy) {
+    Admin.pluginBotSaving = busy;
+    var table = U.el('pluginsTable');
+    if (!table) return;
+    var boxes = table.querySelectorAll('.bot-plugin');
+    for (var i = 0; i < boxes.length; i++) {
+      boxes[i].disabled = busy ? true : !Admin.pluginBot;
+    }
+  }
+
+  /* 点一下勾选框就立刻保存（不参与 pluginChanges 暂存流程）。
+     allowed 是该机器人要运行的全部插件名（全量列表，不是增量）。 */
+  function onBotPluginToggle() {
+    var box = this;
+    var want = !!box.checked;
+    if (Admin.pluginBotSaving) { box.checked = !want; return; }
+    if (!Admin.pluginBot) {
+      box.checked = !want;
+      U.toast('请先在左上角选择机器人', 'warn');
+      return;
+    }
+    var table = U.el('pluginsTable');
+    var boxes = table.querySelectorAll('.bot-plugin');
+    var allowed = [];
+    for (var i = 0; i < boxes.length; i++) {
+      if (boxes[i].checked) allowed.push(boxes[i].getAttribute('data-plugin-bot'));
+    }
+    setBotPluginBusy(true);
+    U.postJSON('/api/admin/plugins/bot', { bot_id: Admin.pluginBot, allowed: allowed })
+      .then(function (data) {
+        Admin.pluginBotSaving = false;
+        Admin.pluginBotAllowed = data.bot_allowed || {};
+        renderPlugins();
+        U.toast(data.message || '已保存', 'ok');
+      })
+      .catch(function (error) {
+        // 失败：把勾选框恢复到点击前的状态（不依赖浏览器的默认行为）
+        Admin.pluginBotSaving = false;
+        box.checked = !want;
+        setBotPluginBusy(false);
+        U.toast(error.message, 'err');
+      });
   }
 
   function updatePluginPending() {
@@ -398,20 +514,9 @@
     Admin.pluginChanges = {};
     return U.postJSON('/api/admin/plugins/reload', {}).then(function (data) {
       U.toast(data.message || '已重载', data.count ? 'ok' : 'warn', 6000);
-      Admin.plugins = data.plugins || [];
-      Admin.pluginServer = {};
-      for (var i = 0; i < Admin.plugins.length; i++) {
-        Admin.pluginServer[Admin.plugins[i].name] = !!Admin.plugins[i].disabled;
-      }
-      renderPluginDiagnostics({
-        dir: data.diagnostics && data.diagnostics.dir,
-        enabled: true,
-        plugins: Admin.plugins,
-        diagnostics: data.diagnostics,
-      });
-      renderPlugins();
-      updatePluginPending();
-      return data;
+      updatePluginPending();      // 先清掉“有 N 项修改待保存”
+      // 重新拉一次列表：除了插件本身，bot_allowed / bots 这些按机器人的字段也要一起刷新
+      return loadPlugins();
     }).catch(function (error) { U.toast(error.message, 'err'); });
   }
 
@@ -539,43 +644,96 @@
 
   /* ============================ 指令面板 ============================ */
   function loadPanels() {
-    return U.getJSON('/api/admin/panels').then(function (data) {
+    // 面板是「每个机器人各有一份」的：请求必须带上当前机器人
+    var wantBot = U.ActiveBot.id || '';
+    return U.getJSON(U.qs('/api/admin/panels')).then(function (data) {
+      // 请求期间用户又切了机器人：这份响应属于上一个机器人，丢掉不渲染
+      if (U.ActiveBot.id !== wantBot) return data;
+      if (data.bot_id && data.bot_id !== U.ActiveBot.id) return data;
+      var current = U.ActiveBot.id || '';
+      var showId = data.bot_id || current;
+      var showName = data.bot_name || showId || '未选择';
+      var registered = data.registered || {};
       var panels = data.panels || [];
       var rows = panels.map(function (panel) {
         var scope = panel.scope || panel.panel_scope || '';
+        // 后端没回 registered 字段时保持中性，只有明确 false 才断言"线上多出"
+        var state = panel.registered === true
+          ? '<span class="ok-text">已登记</span>'
+          : (panel.registered === false
+            ? '<span class="warn-text tiny">线上多出</span>'
+            : '<span class="tiny">—</span>');
         return '<tr><td>' + U.esc(scope === 'group' ? '群聊' : (scope === 'c2c' ? '私聊' : scope || '--')) +
           '</td><td class="nowrap"><code>' + U.esc(panel.panel_id || panel.id || '') + '</code></td>' +
           '<td>' + U.esc(panel.remark || panel.panel_remark || '') + '</td>' +
+          '<td>' + state + '</td>' +
           '<td class="cell-act"><button class="btn tiny danger" data-panel="' +
           U.esc(panel.panel_id || panel.id || '') + '">删除</button></td></tr>';
       }).join('');
       U.el('panelsTable').innerHTML =
-        '<thead><tr><th>场景</th><th>面板 ID</th><th>备注</th><th>操作</th></tr></thead><tbody>' +
-        (rows || '<tr><td colspan="4" class="tiny">还没有注册任何指令面板</td></tr>') + '</tbody>';
+        '<thead><tr><th>场景</th><th>面板 ID</th><th>备注</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+        (rows || '<tr><td colspan="5" class="tiny">还没有注册任何指令面板</td></tr>') + '</tbody>';
       var diag = data.diag || {};
       var diagText = Object.keys(diag).filter(function (key) { return diag[key]; })
         .map(function (key) { return '【' + key + '】' + diag[key]; }).join('\n\n');
-      U.el('panelsDiag').textContent = diagText;
-      var buttons = U.el('panelsTable').querySelectorAll('[data-panel]');
+      U.el('panelsDiag').textContent = '当前机器人：' + showName + '（' + (showId || '未选择') +
+        '） · 已登记：私聊 ' + (registered.c2c || '无') + ' / 群聊 ' + (registered.group || '无') +
+        (diagText ? '\n\n' + diagText : '');
+      var table = U.el('panelsTable');
+      var buttons = table.querySelectorAll('[data-panel]');
       for (var i = 0; i < buttons.length; i++) {
         buttons[i].addEventListener('click', function () {
           var panelId = this.getAttribute('data-panel');
-          U.confirm({ title: '删除指令面板', text: '确定删除面板 ' + panelId + ' 吗？', okText: '删除' })
+          // 删除必须显式指定机器人，否则会删到别的机器人的同 ID 面板
+          var botId = data.bot_id || U.ActiveBot.id || '';
+          U.confirm({ title: '删除指令面板',
+            text: '确定删除机器人 ' + (botId || '未选择') + ' 的面板 ' + panelId + ' 吗？', okText: '删除' })
             .then(function (ok) {
               if (!ok) return;
-              U.postJSON('/api/admin/panels/delete', { panel_id: panelId })
+              U.postJSON('/api/admin/panels/delete', { panel_id: panelId, bot_id: botId })
                 .then(function (result) { U.toast(result.message || '已删除', 'ok'); loadPanels(); })
-                .catch(function (error) { U.toast(error.message, 'err'); });
+                .catch(function (error) {
+                  var payload = error.payload || {};
+                  var message = error.message || '';
+                  // 页面显示的机器人跟服务端对不上（409/403）：重新拉一次列表
+                  if (payload.bot_id || message.indexOf('不属于') >= 0 || message.indexOf('刷新') >= 0) {
+                    U.toast(message || '页面与服务端的机器人不一致，请刷新后重试', 'err', 6000);
+                    loadPanels();
+                    return;
+                  }
+                  U.toast(message || '删除失败', 'err');
+                });
             });
         });
       }
       return data;
-    }).catch(function (error) { U.toast('面板查询失败：' + error.message, 'err'); });
+    }).catch(function (error) {
+      var message = (error && error.message) || '';
+      if (message.indexOf('409') >= 0 || message.indexOf('403') >= 0) {
+        U.toast('页面显示的机器人与服务端不一致，请刷新页面后重试（' + message + '）', 'err', 6000);
+        return;
+      }
+      U.toast('面板查询失败：' + message, 'err');
+    });
   }
 
   function reloadPanels() {
     return U.postJSON('/api/admin/panels/reload', {}).then(function (data) {
       U.toast(data.message || '已重新注册', 'ok');
+      var detail = data.detail || {};
+      var summary = Object.keys(detail).map(function (botId) {
+        var info = detail[botId] || {};
+        if (info.skipped) return botId + '：' + info.skipped;
+        var parts = ['c2c', 'group'].filter(function (scope) { return info[scope]; })
+          .map(function (scope) {
+            var one = info[scope] || {};
+            return (scope === 'group' ? '群聊' : '私聊') +
+              (one.ok ? ' ' + (one.panel_id || '已注册') : ' 注册失败');
+          });
+        return botId + '：' + (parts.join(' / ') || '无指令（已关闭）');
+      }).join(' · ');
+      U.el('panelsDiag').textContent = '重新注册结果（所有机器人）：' +
+        (summary || '无（没有已启用且填好凭据的机器人）') + '\n\n正在加载当前机器人的面板…';
       return loadPanels();
     }).catch(function (error) { U.toast(error.message, 'err', 6000); });
   }
@@ -656,9 +814,13 @@
     U.el('contextRefresh').addEventListener('click', loadContext);
     U.el('contextClearAll').addEventListener('click', clearAllContext);
     // 切换机器人后：上下文页要跟着换成新机器人的文件（以前必须手动刷新，
-    // 而且不刷新时还留着上一个机器人的列表，容易删错对象）
+    // 而且不刷新时还留着上一个机器人的列表，容易删错对象）；
+    // 指令面板同样是「每个机器人各一份」，也得跟着重新拉；
+    // 插件页的「当前机器人」勾选同样是按机器人的，必须一起刷新。
     U.ActiveBot.onChange(function () {
       loadContext();
+      loadPanels();
+      loadPlugins();
       if (U.el('ctxHint')) {
         U.el('ctxHint').innerHTML = '<span class="tiny">已切换机器人，正在重新加载上下文…</span>';
       }
@@ -679,5 +841,7 @@
   Admin.loadContext = loadContext;
   Admin.loadPanels = loadPanels;
   Admin.loadMedia = loadMedia;
-  global.Admin = Admin;
+    // 防止整个对象被别人替换掉（对象内部字段照旧可改，见 util.js 的 protectGlobal）
+  if (typeof global.__qbmProtect === 'function') global.__qbmProtect('Admin', Admin);
+  else global.Admin = Admin;
 })(window);

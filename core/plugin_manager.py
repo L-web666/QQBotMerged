@@ -261,7 +261,26 @@ class PluginManager:
             "astrbot_version": getattr(self.host, "astrbot_version", "") or "",
             "unsupported": sorted({item for info in self.plugins
                                    for item in (info.get("unsupported") or [])}),
+            # 插件安全扫描汇总（high/medium/info 各几条），插件页用来做整体提示
+            "safety": self._safety_summary(),
         }
+
+    def _safety_summary(self) -> Dict[str, Any]:
+        """把所有插件的安全扫描结果汇总成一份（给插件页顶部提示用）。"""
+        findings: List[Dict[str, Any]] = []
+        for info in self.plugins:
+            items = ((info.get("safety") or {}).get("findings") or [])
+            for item in items:
+                merged = dict(item)
+                merged["plugin"] = str(info.get("name") or "")
+                findings.append(merged)
+        try:
+            from core import plugin_safety
+            return plugin_safety.summarize(findings,
+                                           [str(info.get("name") or "") for info in self.plugins])
+        except Exception:
+            return {"level": "ok", "counts": {}, "findings": findings, "files": [],
+                    "summary": "未扫描"}
 
     # ------------------------------------------------------------------ 启停清单
     def _load_disabled(self):
@@ -311,6 +330,43 @@ class PluginManager:
         if self.bot is not None:
             self.bot.set_config(config)
 
+    # ------------------------------------------------------------------ 按机器人隔离
+    def bot_policy(self, bot_id: str) -> Dict[str, List[str]]:
+        """该机器人的插件策略（读的是"全局配置 + 该机器人覆盖"里的生效值）。
+
+        - `allow`（`plugins.enabled_names`）：白名单，空 = 不限制；
+        - `deny`（`plugins.disabled_names`）：黑名单，优先级高于白名单。
+        两个都为空 = 沿用旧行为（所有已启用的插件对该机器人都生效）。
+        """
+        allow: List[str] = []
+        deny: List[str] = []
+        if not bot_id:
+            return {"allow": allow, "deny": deny}
+        runtime = getattr(self.bot, "_runtime", None)
+        if runtime is None or not hasattr(runtime, "bot_config"):
+            return {"allow": allow, "deny": deny}
+        try:
+            config = runtime.bot_config(bot_id)
+            allow = [str(item).strip() for item in (config.list_of("plugins", "enabled_names",
+                                                                    default=[]) or [])
+                     if str(item).strip()]
+            deny = [str(item).strip() for item in (config.list_of("plugins", "disabled_names",
+                                                                   default=[]) or [])
+                    if str(item).strip()]
+        except Exception as exc:
+            self.log.debug("[%s] 读取插件策略失败，按「全部插件可用」处理：%s", bot_id, exc)
+        return {"allow": allow, "deny": deny}
+
+    def allowed_names(self, bot_id: str) -> Optional[set]:
+        """该机器人可用的插件名集合；返回 None 表示"不限制"（全部插件）。"""
+        policy = self.bot_policy(bot_id)
+        allow, deny = policy["allow"], policy["deny"]
+        if not allow and not deny:
+            return None
+        names = {str(item.get("name") or "") for item in self.plugins}
+        return {name for name in names if name and name not in deny
+                and (not allow or name in allow)}
+
     def reload(self) -> List[Dict[str, Any]]:
         with self._lock:
             self.plugins = []
@@ -357,11 +413,29 @@ class PluginManager:
                 host.load(item["name"], os.path.join(self.plugin_dir, item["name"]))
             for info in host.list_plugins():
                 info["disabled"] = bool(self.disabled.get(info["name"]))
+                # 安全扫描（AST 静态分析，不执行插件代码）：只做提示，绝不阻断加载
+                info["safety"] = self._scan_safety(info)
                 self.plugins.append(info)
             host.call_initialize()
             host.call_loaded_hooks()
             self.issues.extend(host.issues)
             return self.plugins
+
+    def _scan_safety(self, info: Dict[str, Any]) -> Dict[str, Any]:
+        """扫一个插件的源码，返回给插件页展示的风险摘要（失败也不影响加载）。"""
+        try:
+            from core import plugin_safety
+            module = str(info.get("module") or info.get("name") or "")
+            path = str(info.get("path") or "")
+            if path and os.path.isfile(path):
+                path = os.path.dirname(path)          # info["path"] 是入口文件时取它所在目录
+            if not path or not os.path.isdir(path):
+                path = os.path.join(self.plugin_dir, module)
+            return plugin_safety.scan_plugin_dir(path)
+        except Exception as exc:                       # 扫描只是提示，不能拖垮加载
+            self.log.debug("插件 %s 的安全扫描失败：%s", info.get("name"), exc)
+            return {"level": "ok", "counts": {}, "findings": [], "files": [],
+                    "summary": "扫描失败（不影响使用）"}
 
     def _astrbot_host(self) -> Optional[AstrBotHost]:
         if self.host is None:
@@ -391,7 +465,9 @@ class PluginManager:
             self._send_components(runtime, msg, components)
 
         try:
-            result = host.dispatch(msg, runtime=runtime, sink=sink)
+            # 按机器人隔离：该机器人没勾选的插件不参与这条消息的分发
+            result = host.dispatch(msg, runtime=runtime, sink=sink,
+                                   allowed=self.allowed_names(msg.get("bot_id") or ""))
         except Exception as exc:
             self.log.error("AstrBot 插件分发失败: %s", exc)
             return None

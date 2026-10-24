@@ -80,6 +80,19 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
                 return str(body["bot_id"]).strip()
         return config_manager.active_bot_id()
 
+    def known_bot(bot_id: str) -> bool:
+        """该 id 是不是配置里登记过的机器人（用来识别"页面上的机器人已经过期"）。"""
+        candidate = str(bot_id or "").strip()
+        if not candidate:
+            return False
+        rt = runtime()
+        if rt is not None and candidate in rt.bots:
+            return True
+        for item in (config_manager.config.get("bots") or []):
+            if isinstance(item, dict) and str(item.get("id") or "").strip() == candidate:
+                return True
+        return False
+
     def parse_conv_key(key: str):
         """把 `bot:group:xxx` / `group:xxx` 拆成 (bot_id, type, openid)。"""
         parts = (key or "").split(":")
@@ -151,7 +164,7 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
             "messages": (rt.store.count() if rt is not None else 0),
             "media_saved": (
                 (rt.store.media_stats().get("done") or {}).get("count", 0) if rt is not None else 0),
-            "ai_usable": bool(rt is not None and rt.ai_client.usable),
+            "ai_usable": bool(rt is not None and rt.ai_status().get("usable")),
         })
 
     # ---------------- 静态媒体 ----------------
@@ -317,6 +330,11 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         reply_msg_id = (field("msg_id") or "").strip()
         image_url = (field("image_url") or "").strip()
         bot_id = (field("bot_id") or field("bot")).strip()
+        # 发送格式（Markdown / 纯文本）：留空 = 按该机器人的配置走（见 .recon/md-plan.md 1.4）。
+        # 只有纯文本分支会用到它，图片/文件分支一律不带格式。
+        send_format = (field("format") or "").strip().lower()
+        if send_format not in ("", "text", "markdown"):
+            return jsonify({"success": False, "message": "format 只能是 text 或 markdown"}), 400
 
         if target_type in ("group", "群聊"):
             target_type = "group"
@@ -400,8 +418,11 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
                                 "image_url": result.get("image_url") or "",
                                 "note": result.get("note") or ""})
             info = rt.send_text(target_type, openid, content, bot_id=bot_id,
-                                reply_msg_id=reply_msg_id)
+                                reply_msg_id=reply_msg_id, fmt=send_format)
             return jsonify({"success": True, "mode": "text", "data": info,
+                            "format": str(info.get("format") or send_format or "text"),
+                            # 正文里有 @/指令标签时后端会自动改用 markdown（见 Runtime.send_text）
+                            "auto_format": bool(info.get("auto_format")),
                             "note": info.get("_note") or ""})
         except ValueError as exc:
             return jsonify({"success": False, "message": str(exc)}), 400
@@ -571,7 +592,89 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
                         "hint": "QQ 私聊事件通常不返回昵称，可在这里给用户起个名字，"
                                 "起名后会显示在聊天窗口与会话列表里"})
 
+    # ================================================================== 群 @ 候选名单
+    @app.route("/api/chat/mentions")
+    def chat_mentions():
+        """群聊 @ 候选名单：群成员缓存 + 最近在群里说过话的人。
+
+        官方「@某人」只支持**群聊 / 文字子频道**，且必须用成员 openid 拼
+        `<qqbot-at-user id="openid" />` 嵌进正文；官方群成员接口要求机器人是群管理员，
+        拉不到时用「最近发言者」兜底，保证普通群里也能 @ 到人。
+        """
+        blocked = check_token()
+        if blocked:
+            return blocked
+        rt = runtime()
+        if rt is None:
+            return jsonify({"success": False, "message": "服务尚未就绪"}), 503
+        group_openid = (request.args.get("group") or request.args.get("group_openid") or "").strip()
+        if not group_openid:
+            return jsonify({"success": False, "message": "缺少 group（群 openid）"}), 400
+        bot_id = current_bot_id()
+        refresh = request.args.get("refresh") in ("1", "true", "yes")
+        names = rt.store.user_names()
+        aliases = rt.store.aliases()
+        found: Dict[str, Dict[str, Any]] = {}
+
+        def add(openid: str, name: str = "", role: str = "", source: str = ""):
+            value = str(openid or "").strip()
+            if not value:
+                return
+            entry = found.setdefault(value, {"openid": value, "name": "", "role": "",
+                                             "sources": []})
+            if not entry["name"]:
+                resolved = ((name or "").strip() or aliases.get(value) or names.get(value)
+                            or rt.lookup_name(value) or "")
+                if resolved:
+                    entry["name"] = str(resolved)[:60]
+            if role and not entry["role"]:
+                entry["role"] = str(role)
+            if source and source not in entry["sources"]:
+                entry["sources"].append(source)
+
+        member_error = ""
+        try:
+            data = rt.group_manager.members(group_openid, bot_id, refresh=refresh)
+            member_error = str(data.get("api_error") or "")
+            for item in data.get("members") or []:
+                if isinstance(item, dict):
+                    add(item.get("member_openid") or item.get("openid"),
+                        item.get("username") or item.get("nickname") or "",
+                        item.get("role") or "", "member")
+        except Exception as exc:                       # 拉成员失败不该让 @ 功能整体不可用
+            member_error = str(exc)
+            logger.debug("读取群成员失败：%s", exc)
+        try:
+            conv_key = conv_key_for(bot_id, "group", group_openid, "")
+            for row in rt.store.recent_senders(conv_key, limit=200):
+                add(row.get("openid"), row.get("username") or "", "", "recent")
+        except Exception as exc:
+            logger.debug("读取最近发言者失败：%s", exc)
+
+        def sort_key(item: Dict[str, Any]):
+            role = str(item.get("role") or "").lower()
+            rank = 0 if role in ("owner", "admin", "administrator") else 1
+            return (rank, item.get("name") or item.get("openid") or "")
+
+        people = []
+        for item in sorted(found.values(), key=sort_key):
+            people.append({"openid": item["openid"],
+                           "name": item["name"] or rt.short_label(item["openid"]),
+                           "role": item["role"],
+                           "sources": item["sources"]})
+        return jsonify({
+            "success": True,
+            "group_openid": group_openid,
+            "bot_id": bot_id,
+            "members": people,
+            "count": len(people),
+            "member_api_error": member_error,
+            "hint": "选中后会在输入框插入官方的 @ 标签（只有群聊支持 @ 某人）；"
+                    "成员接口需要机器人是群管理员，拉不到时会用「最近在群里说过话的人」兜底",
+        })
+
     # ================================================================== 运维接口
+
     @app.route("/api/admin/status")
     def admin_status():
         blocked = check_token()
@@ -580,7 +683,9 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         rt = runtime()
         if rt is None:
             return jsonify({"success": False, "message": "服务尚未就绪"}), 503
-        status = rt.status()
+        # 带上当前选中的机器人：「内置 AI」那一格要按这个机器人的有效配置报，
+        # 否则切换机器人后它永远不变（用户看到的"切了机器人也不改"）。
+        status = rt.status(current_bot_id())
         status["success"] = True
         status["queue_detail"] = rt.processor.queue_detail()
         status["logs"] = _log_tail(60)
@@ -637,8 +742,29 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         incoming = body.get("config") if isinstance(body.get("config"), dict) else body
         if not isinstance(incoming, dict):
             return jsonify({"success": False, "message": "请求体需要是配置对象或 {config: {...}}"}), 400
-        # 设置页作用于"当前选中的机器人"：按机器人的分组写进它的覆盖
-        target_bot = str(body.get("bot_id") or config_manager.active_bot_id()).strip()
+        # 设置页作用于"当前选中的机器人"：按机器人的分组写进它的覆盖。
+        # 注意：`bot_id="   "` 是 truthy，所以必须先 strip 再判空——否则纯空白会被当成
+        # 一个"有效 id"传下去，apply_incoming 里 `if bot_id` 判假，per-bot 段
+        # （panels / ai / reply / filters / features / send / scheduler）就会被静默
+        # 写进**全局**配置，等于一次性改了所有机器人。
+        requested_bot = str(body.get("bot_id") or "").strip()
+        # 没带 id（或只带了空白）→ 回退到后台当前选中的机器人；
+        # active_bot_id() 自己会跳过已被删除的 id。
+        target_bot = requested_bot or str(config_manager.active_bot_id() or "").strip()
+        has_per_bot = any(schema.is_per_bot(path) for path in schema.flatten(incoming))
+        if target_bot and not known_bot(target_bot):
+            # 页面缓存的机器人已经不存在：宁可报错让用户刷新，也不静默把保存丢进全局
+            return jsonify({"success": False,
+                            "message": f"未知机器人 {target_bot}："
+                                       "请刷新页面后在左上角重新选择机器人"}), 400
+        if not requested_bot and has_per_bot and (config_manager.config.get("bots") or []):
+            # 请求里没有可用的机器人 id（缺失，或只给了空白/纯空格的 bot_id），却带着
+            # per-bot 段：此时**不能**按"当前选中"猜——页面过期时会静默改错机器人，
+            # 而 apply_incoming(incoming, "") 更会把 per-bot 段写进全局、串到所有机器人。
+            return jsonify({"success": False,
+                            "message": "这个请求包含「每个机器人自己的设置」，但没带机器人 id："
+                                       "请刷新页面后在左上角选择机器人再保存"}), 400
+        # 配置里一个机器人都没有时 target_bot 必然为空，per-bot 段照旧写全局（兜底，不拦）
         try:
             applied, need_restart, changed = config_manager.apply_incoming(incoming, target_bot)
         except Exception as exc:
@@ -720,14 +846,91 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         # 自愈：万一插件目录不是绝对路径（老实例/手工构造），这里按程序根目录纠正
         if manager.plugin_dir and not os.path.isabs(manager.plugin_dir):
             manager.plugin_dir = os.path.join(paths.BASE_DIR, manager.plugin_dir)
+        # 按机器人隔离：返回"当前选中的机器人"能用的插件（供页面打勾）
+        bot_id = current_bot_id()
+        plugins = manager.list_plugins()
+        allowed = manager.allowed_names(bot_id)          # None = 不限制（全部可用）
+        bot_allowed = {}
+        for info in plugins:
+            name = str(info.get("name") or "")
+            bot_allowed[name] = True if allowed is None else (name in allowed)
+        bot_entry = next((item for item in (config_manager.config.get("bots") or [])
+                          if isinstance(item, dict) and str(item.get("id")) == bot_id), None)
         return jsonify({
             "success": True,
             "enabled": config_manager.config.bool_of("plugins", "enabled", default=True),
-            "plugins": manager.list_plugins(),
+            "plugins": plugins,
             "dir": manager.plugin_dir,
             "data_dir": manager.data_dir,
             "diagnostics": manager.diagnostics(),
+            "bot_id": bot_id,
+            "bot_name": str((bot_entry or {}).get("name") or bot_id),
+            "bots": [{"id": str(item.get("id") or ""), "name": str(item.get("name") or ""),
+                      "enabled": bool(item.get("enabled"))}
+                     for item in (config_manager.config.get("bots") or [])
+                     if isinstance(item, dict)],
+            "bot_allowed": bot_allowed,
+            "bot_policy": manager.bot_policy(bot_id),
         })
+
+    @app.route("/api/admin/plugins/bot", methods=["POST"])
+    def admin_plugins_bot():
+        """按机器人设置"启用哪些插件"（每个机器人可以跑不同的插件）。
+
+        请求：`{"bot_id": "...", "allowed": ["插件名", ...]}`。
+        服务端会归一化成"黑名单"存储（`plugins.disabled_names`）；勾满全部插件 =
+        两个名单都清空（该机器人不限制）。插件名必须是当前已加载的插件。
+        """
+        blocked = check_token()
+        if blocked:
+            return blocked
+        rt = runtime()
+        if rt is None:
+            return jsonify({"success": False, "message": "服务尚未就绪"}), 503
+        body = request.get_json(silent=True) or {}
+        bot_id = str(body.get("bot_id") or "").strip()
+        if not bot_id:
+            return jsonify({"success": False,
+                            "message": "没带机器人 id：请刷新页面后在左上角重新选择机器人"}), 400
+        if not known_bot(bot_id):
+            return jsonify({"success": False, "message": f"未知机器人 {bot_id}：请刷新页面后重试"}), 400
+        raw = body.get("allowed")
+        if not isinstance(raw, list):
+            return jsonify({"success": False,
+                            "message": "allowed 需要是插件名数组（例如 [\"astrbot_plugin_dice\"]）"}), 400
+        manager = rt.plugin_manager
+        known = [str(name) for name in manager.names()]
+        allowed: List[str] = []
+        for item in raw:
+            name = str(item or "").strip()
+            if name and name not in allowed:
+                allowed.append(name)
+        unknown = [name for name in allowed if name not in known]
+        if unknown:
+            return jsonify({"success": False,
+                            "message": f"未知插件：{'、'.join(unknown)}（请先点「重载」重新扫描）"}), 400
+        if set(allowed) >= set(known):
+            enabled_names: List[str] = []
+            disabled_names: List[str] = []
+        else:
+            enabled_names = []                  # 统一用黑名单表达，避免两份名单互相打架
+            disabled_names = [name for name in known if name not in allowed]
+        config_manager.set_for_bot(bot_id, "plugins.enabled_names", enabled_names)
+        config_manager.set_for_bot(bot_id, "plugins.disabled_names", disabled_names)
+        config_manager.save()
+        try:
+            rt.on_config_changed(source="插件按机器人设置")
+        except Exception as exc:
+            logger.warning("插件按机器人设置后热更新失败：%s", exc)
+        allowed_now = manager.allowed_names(bot_id)
+        summary = "全部插件" if allowed_now is None else f"{len(allowed_now)}/{len(known)} 个插件"
+        logger.info("机器人 %s 的插件范围已更新：%s", bot_id, summary)
+        return jsonify({"success": True, "bot_id": bot_id, "bot_allowed": {
+            str(info.get("name") or ""): (True if allowed_now is None
+                                          else str(info.get("name") or "") in allowed_now)
+            for info in manager.list_plugins()},
+            "bot_policy": manager.bot_policy(bot_id),
+            "message": f"机器人 {bot_id} 现在使用{summary}"})
 
     @app.route("/api/admin/plugins/apply", methods=["POST"])
     def admin_plugins_apply():
@@ -909,18 +1112,50 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         rt = runtime()
         if rt is None:
             return jsonify({"success": False, "message": "服务尚未就绪"}), 503
-        client = rt.get_client()
+        # ⚠️ 必须用**服务端当前选中的机器人**取客户端：
+        # 以前这里是 rt.get_client()（不传 bot_id），拿到的是"第一个在线/可用的机器人"，
+        # 于是切到 bot2 后看到的仍是 bot1 的面板（用户报告的核心问题）；
+        # 而且绝不允许在没有 bot_id 的情况下回退到 rt.get_client()。
+        active_bot = config_manager.active_bot_id()
+        requested = (request.args.get("bot") or request.args.get("bot_id") or "").strip()
+        if requested and requested != active_bot and known_bot(requested):
+            # 页面缓存的机器人已经不是服务端选中的那个 → 和 /api/admin/context/delete 一样拒掉
+            return jsonify({"success": False, "bot_id": active_bot,
+                            "message": f"页面显示的是机器人 {requested}，服务端当前是 "
+                                       f"{active_bot}，请刷新页面后重试"}), 409
+        bot_id = current_bot_id()
+        if not bot_id:
+            return jsonify({"success": False, "message": "没有选中的机器人"}), 400
+        client = rt.get_client(bot_id)
         if client is None:
-            return jsonify({"success": False, "message": "没有可用的机器人"}), 400
+            return jsonify({"success": False,
+                            "message": f"机器人 {bot_id} 没有可用的连接（未启用或未填凭据）"}), 400
+        panel_ids = rt._load_panel_ids()
+        registered = {scope: panel_ids.get(f"{bot_id}:{scope}", "")
+                      for scope in ("c2c", "group")}
         panels, diag = [], {}
         for scope in ("c2c", "group"):
             try:
                 items, raw = client.list_command_panels(scope, with_raw=True)
-                panels.extend(items)
+                for item in items or []:
+                    if not isinstance(item, dict):
+                        continue
+                    item = dict(item)
+                    item["bot_id"] = bot_id
+                    item_scope = str(item.get("scope") or item.get("panel_scope") or "")
+                    item_panel_id = str(item.get("panel_id") or "")
+                    compare = ((item_scope,) if item_scope in ("c2c", "group")
+                               else ("c2c", "group"))
+                    item["registered"] = bool(item_panel_id) and any(
+                        item_panel_id == registered.get(name) for name in compare)
+                    panels.append(item)
                 diag[scope] = raw[:500] if not items else ""
             except Exception as exc:
                 diag[scope] = f"{exc}"
-        return jsonify({"success": True, "panels": panels, "diag": diag})
+        bot = rt.bots.get(bot_id)
+        return jsonify({"success": True, "bot_id": bot_id,
+                        "bot_name": (bot.name if bot else bot_id),
+                        "panels": panels, "registered": registered, "diag": diag})
 
     @app.route("/api/admin/panels/delete", methods=["POST"])
     def admin_panels_delete():
@@ -928,18 +1163,70 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         if blocked:
             return blocked
         rt = runtime()
+        if rt is None:
+            return jsonify({"success": False, "message": "服务尚未就绪"}), 503
         body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            body = {}         # 数组/字符串等非 dict 的 JSON 一律当空体，别让 .get 抛 500
         panel_id = str(body.get("panel_id") or "").strip()
-        if rt is None or not panel_id:
+        if not panel_id:
             return jsonify({"success": False, "message": "缺少 panel_id"}), 400
-        client = rt.get_client(str(body.get("bot_id") or ""))
+        # 机器人来源：body.bot_id → ?bot=/?bot_id= → 服务端当前选中的那个
+        active_bot = config_manager.active_bot_id()
+        requested = str(body.get("bot_id") or "").strip() or \
+            (request.args.get("bot") or request.args.get("bot_id") or "").strip()
+        if requested and requested != active_bot and known_bot(requested):
+            return jsonify({"success": False, "bot_id": active_bot,
+                            "message": f"页面显示的是机器人 {requested}，服务端当前是 "
+                                       f"{active_bot}，请刷新页面后重试"}), 409
+        bot_id = requested or active_bot
+        if not bot_id:
+            return jsonify({"success": False, "message": "没有选中的机器人"}), 400
+        client = rt.get_client(bot_id)
         if client is None:
-            return jsonify({"success": False, "message": "没有可用的机器人"}), 400
+            return jsonify({"success": False,
+                            "message": f"机器人 {bot_id} 没有可用的连接（未启用或未填凭据）"}), 400
+        # 归属校验：**线上列表为准**——面板列表项本身没有 bot 字段，但"用本机器人的 client
+        # 查出来的列表"就是权威的所有权证明；缓存只作兜底（刚注册/权限暂时查不到时用）。
+        # 校验不通过时绝不调用平台的删除接口。
+        owned_scope = ""
+        for scope in ("c2c", "group"):
+            try:
+                items = client.list_command_panels(scope) or []
+            except Exception as exc:
+                rt.log.debug("[%s] 校验面板归属时查询 %s 列表失败：%s", bot_id, scope, exc)
+                continue
+            for item in items:
+                if isinstance(item, dict) and str(item.get("panel_id") or "") == panel_id:
+                    owned_scope = scope
+                    break
+            if owned_scope:
+                break
+        if not owned_scope:
+            panel_ids = rt._load_panel_ids()
+            for scope in ("c2c", "group"):
+                if panel_ids.get(f"{bot_id}:{scope}") == panel_id:
+                    owned_scope = scope
+                    break
+        if not owned_scope:
+            return jsonify({"success": False, "bot_id": bot_id,
+                            "message": f"这个面板不属于机器人 {bot_id}，或已被删除"
+                                       "（页面可能没刷新），已拒绝删除"}), 403
         try:
             ok = client.delete_command_panel(panel_id)
         except Exception as exc:
             return jsonify({"success": False, "message": f"删除失败：{exc}"}), 502
-        return jsonify({"success": bool(ok), "message": "已删除面板" if ok else "删除失败"})
+        if ok:
+            # 删掉本机器人对应 scope 的缓存键，避免下次注册又去更新一个已不存在的面板。
+            # 与注册流程共用同一把锁，防止两边"整份读-改-写"互相覆盖。
+            with rt._panel_ids_lock:
+                panel_ids = rt._load_panel_ids()
+                if panel_ids.get(f"{bot_id}:{owned_scope}") == panel_id:
+                    panel_ids.pop(f"{bot_id}:{owned_scope}", None)
+                    rt._save_panel_ids(panel_ids)
+        return jsonify({"success": bool(ok), "message": "已删除面板" if ok else "删除失败",
+                        "bot_id": bot_id,
+                        "removed": {"scope": owned_scope, "panel_id": panel_id}})
 
     @app.route("/api/admin/panels/reload", methods=["POST"])
     def admin_panels_reload():
@@ -953,7 +1240,12 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
             result = rt.register_command_panels()
         except Exception as exc:
             return jsonify({"success": False, "message": f"注册失败：{exc}"}), 502
-        return jsonify({"success": True, "message": "已按当前配置重新注册指令面板", "detail": result})
+        bot_id = current_bot_id()
+        bot = rt.bots.get(bot_id)
+        bot_name = bot.name if bot else bot_id
+        return jsonify({"success": True, "bot_id": bot_id, "bot_name": bot_name,
+                        "message": f"已按当前配置重新注册指令面板（当前机器人：{bot_name}；"
+                                   f"共 {len(rt.bots)} 个机器人）", "detail": result})
 
     @app.route("/api/admin/receiver/<bot_id>/<action>", methods=["POST"])
     def admin_receiver(bot_id: str, action: str):

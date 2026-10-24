@@ -394,8 +394,8 @@ class MessageProcessor:
         # AstrBot 插件的 on_llm_request 钩子：允许插件追加 system_prompt / 额外上下文
         try:
             host = getattr(runtime.plugin_manager, "host", None)
-            if host is not None and host.llm_request_hooks():
-                request = host.build_llm_request(content, system_prompt, image_urls)
+            if host is not None and host.llm_request_hooks(bot_id):
+                request = host.build_llm_request(content, system_prompt, image_urls, bot_id=bot_id)
                 system_prompt = request.system_prompt or system_prompt
                 extra_text = request.extra_user_text()
                 if extra_text:
@@ -433,7 +433,10 @@ class MessageProcessor:
             return
 
         answer = ai_client.filter_thinking(answer)
-        if config.bool_of("reply", "strip_markdown", default=True):
+        # markdown 发送模式下保留 AI 回复里的 markdown 语法，否则会先被剥成纯文本再发 markdown
+        is_markdown_send = (str(config.str_of("send", "message_format", default="text") or "")
+                            .strip().lower() == "markdown")
+        if config.bool_of("reply", "strip_markdown", default=True) and not is_markdown_send:
             answer = message_text.strip_markdown(answer)
         if message_filter.contains_sensitive(answer):
             answer = message_filter.mask_sensitive(answer)

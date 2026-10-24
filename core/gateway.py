@@ -370,6 +370,10 @@ class QQGateway:
             "member_openid": member_openid,
             "unified_openid": openid,
             "username": author.get("username", ""),
+            # 群成员身份：官方群消息的 author 里自带 member_role（owner / admin / member），
+            # 每条消息都有、不需要管理员权限，比群成员接口（要白名单）可靠得多。
+            # 私聊的 author 没有这个字段，拿到了就是空串。
+            "member_role": author.get("member_role", "") or "",
             "content": payload.get("content", "") or "",
             "attachments": self._collect_attachments(payload),
             "quote": self._extract_quote(payload),
@@ -510,5 +514,7 @@ class QQGateway:
                 "username": str(item.get("username") or "")[:60],
                 "is_you": bool(item.get("is_you")),
                 "is_bot": bool(item.get("bot") or item.get("is_you")),
+                # 被 @ 的人也带身份（owner/admin/member）；is_you 的那条就是机器人自己
+                "member_role": str(item.get("member_role") or "")[:20],
             })
         return mentions

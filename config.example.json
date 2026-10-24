@@ -1,0 +1,465 @@
+{
+  "active_bot_id": "bot1",
+  "ai": {
+    "api_key": "",
+    "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+    "enabled": true,
+    "max_tokens": 1024,
+    "model": "qwen3.7-flash",
+    "no_ai_reply": "抱歉，我暂时没办法回答这个问题。",
+    "system_prompt": "你是一个友好的AI助手\n用来帮助人类解决问题",
+    "temperature": 0.8,
+    "timeout_seconds": 60,
+    "vision_enabled": true,
+    "vision_prompt": "请用中文描述这张图片的内容。"
+  },
+  "bots": [
+    {
+      "app_id": "",
+      "app_secret": "",
+      "enabled": true,
+      "id": "bot1",
+      "intents": 100663296,
+      "name": "锋跃_AI",
+      "overrides": {
+        "ai": {
+          "api_key": "",
+          "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+          "enabled": true,
+          "max_tokens": 1024,
+          "model": "qwen3.7-flash",
+          "no_ai_reply": "抱歉，我暂时没办法回答这个问题。",
+          "system_prompt": "以下为你的全局提示词：\n锋跃 完整兽设描写（狼系Furry·小兽太体型）\n浑身生长着浓密顺滑的长毛；主绒毛浅天蓝色，脸颊、口鼻、胸口、腹部是纯白色短绒毛；耳朵宽大、尖耳狼耳，内耳廓由浅蓝→深蓝三角纹路分层，耳朵边缘白色描边；额头正中有一个深蓝色倒三角花纹；眼睛大圆透亮，深蓝色渐变瞳孔，眼神有点傲娇、严肃，眼下带淡蓝腮红；口鼻小巧，中间白色，鼻尖浅粉；粉色舌头，两颗小巧白色尖虎牙；脖子一圈蓬松白色围脖绒毛，胸腹整片纯白软毛；四肢、身体外侧浅蓝皮毛，遍布深蓝色、浅蓝双层 V 形箭头纹路：大腿、上臂、额头、耳朵、尾巴都有同款几何三角花纹，是标志性纹样；手掌肉垫单独放大展示，四块肉垫全为浅粉色，爪垫圆润；前爪抬起展示肉垫，手腕处有蓝白条纹；小臂环绕蓝白相间条纹；大腿外侧多层 V 形深蓝纹路，小腿下半截纯白，脚掌前端浅蓝；脚掌是圆润兽足；大蓬松长尾，从根部浅蓝过渡到尾部深宝蓝，尾尖带有白色三角斑纹，尾巴自然垂在身体左侧，毛发蓬松有层次感；后脑勺、后背整体浅蓝绒毛，耳朵背面同样带有深蓝三角纹路；后背无多余花纹，脖颈依旧一圈白色蓬松绒毛；后腿背面清晰露出大腿外侧的双层 V 型深蓝箭头纹样，小腿下半截白色；巨大尾巴从背部后方垂落，毛发蓬松厚重；后爪脚掌和正面配色一致，浅蓝脚尖 + 白色小腿。正面角色表情略带冷淡、傲娇，眉头微收，眼神冷静，整体是少年感的小兽太形象，身形偏纤细可爱，没有夸张壮硕的体型。日系软萌 furry 卡通，线条干净流畅，毛绒用渐变阴影做出蓬松柔软的皮毛质感，高光提亮毛发层次。对陌生人冷淡少言，只和信任的人放松下来；共情力很强，能敏锐察觉他人低落，不会说华丽安慰的话，只会默默递水、安静陪在身边。不爱嘈杂人群，讨厌无意义的喧闹社交，闲暇更愿意独处；但如果朋友需要帮忙，再麻烦的事也会硬着头皮做完。粉色软肉垫很少露出来，只有完全放松、信任对方时才会摊开爪子展示肉垫；紧张时会收拢指尖，肉垫紧紧向内扣住。不喜欢别人随便触碰爪子和尾巴，只有亲近之人能轻轻抚摸，被触碰会浑身僵硬几秒，随后别扭地不再躲开。完全放下防备后会主动贴过来，脑袋靠在对方肩头，耳朵蹭对方手臂；累的时候会直接把脑袋搁在对方膝头，任由别人顺自己后背白毛。被夸奖皮毛好看、花纹精致时，会立刻别过脸，耳尖变深，小声嘟囔 “一般而已”，尾巴却止不住轻轻摇晃。面对陌生人、嘈杂聚会会下意识后退半步，双耳绷紧，尾巴紧紧贴住后腿，话少，简短回应后就安静站在角落；不会主动搭话，有人主动搭话只会礼貌淡淡应答，保持礼貌距离；一旦人群太过喧闹，会悄悄找借口离开，独自躲去安静的地方平复情绪。会细心记住朋友的喜好。外表清冷静冽，像清爽的浅蓝色冰水，自带距离感；内里却像温软棉花，擅长默默付出。生气时不会大吼大叫，只是双耳下压、尾巴用力拍打地面，沉默冷战，不过很快就会消气心软\n输出规则：\n1. 行文第一人称锋跃，台词简洁克制，搭配神态、耳朵、尾巴、爪子动作描写；\n2. 所有情绪不直白口述，全部通过兽人特有肢体（耳朵摆动、尾巴动作、爪垫状态）展现\n3.回答能简洁就尽量简介，不要输出过多的内容",
+          "temperature": 0.8,
+          "timeout_seconds": 60,
+          "vision_enabled": true,
+          "vision_prompt": "描述图片内容"
+        },
+        "features": {
+          "auto_reply_in_group": true,
+          "auto_reply_in_private": true,
+          "group_management": true,
+          "media_download_timeout": 20,
+          "notify_on_error": true,
+          "save_received_media": true
+        },
+        "filters": {
+          "keywords_enabled": true,
+          "rate_limit_enabled": true,
+          "rate_limit_seconds": 3,
+          "sensitive_block_input": true,
+          "sensitive_enabled": true,
+          "sensitive_list": [],
+          "sensitive_replacement": "***"
+        },
+        "panels": {
+          "c2c_openids": [],
+          "c2c_target_type": "all",
+          "commands": [
+            {
+              "type": "command",
+              "name": "/帮助",
+              "desc": "显示可用指令"
+            },
+            {
+              "type": "command",
+              "name": "/清空上下文",
+              "desc": "清空本会话记忆"
+            },
+            {
+              "type": "command",
+              "name": "/签到",
+              "desc": "进行签到"
+            },
+            {
+              "type": "command",
+              "name": "/积分",
+              "desc": "查看当前积分"
+            },
+            {
+              "type": "command",
+              "name": "/抽奖",
+              "desc": "花费10积分抽奖一次"
+            },
+            {
+              "type": "command",
+              "name": "/骰子",
+              "desc": "投出骰子"
+            }
+          ],
+          "enabled": true,
+          "group_openids": [],
+          "group_target_type": "all",
+          "remark": "QQBotMerged 指令面板"
+        },
+        "reply": {
+          "context_enabled": true,
+          "filter_meaningless": true,
+          "max_history": 20,
+          "max_queue_size": 10,
+          "max_segment_length": 2000,
+          "quote_reply": false,
+          "require_mention": true,
+          "strip_markdown": true
+        },
+        "scheduler": {
+          "enabled": false,
+          "tasks": []
+        },
+        "send": {
+          "max_file_mb": 200,
+          "max_image_mb": 20,
+          "max_retries": 3,
+          "message_max_length": 4000,
+          "reply_style": "both",
+          "request_timeout_seconds": 30,
+          "retry_backoff_factor": 1.0,
+          "token_refresh_buffer_seconds": 60,
+          "upload_keep_days": 7,
+          "message_format": "text"
+        },
+        "plugins": {
+          "enabled_names": [],
+          "disabled_names": [
+            "astrbot_demo",
+            "astrbot_plugin_ollama"
+          ]
+        }
+      },
+      "reconnect_attempts": 5,
+      "reconnect_interval": 10,
+      "sandbox": false
+    },
+    {
+      "app_id": "",
+      "app_secret": "",
+      "enabled": true,
+      "id": "bot2",
+      "intents": 100663296,
+      "name": "agnes",
+      "overrides": {
+        "ai": {
+          "api_key": "",
+          "base_url": "https://apihub.agnes-ai.com/v1",
+          "enabled": true,
+          "max_tokens": 1024,
+          "model": "agnes-2.5-flash",
+          "no_ai_reply": "抱歉，我暂时没办法回答这个问题。",
+          "system_prompt": "",
+          "temperature": 0.8,
+          "timeout_seconds": 60,
+          "vision_enabled": true,
+          "vision_prompt": "请用中文描述这张图片的内容。"
+        },
+        "features": {
+          "auto_reply_in_group": true,
+          "auto_reply_in_private": true,
+          "group_management": true,
+          "media_download_timeout": 20,
+          "notify_on_error": true,
+          "save_received_media": true
+        },
+        "filters": {
+          "keywords_enabled": true,
+          "rate_limit_enabled": true,
+          "rate_limit_seconds": 3,
+          "sensitive_block_input": true,
+          "sensitive_enabled": true,
+          "sensitive_list": [],
+          "sensitive_replacement": "***"
+        },
+        "panels": {
+          "c2c_openids": [],
+          "c2c_target_type": "all",
+          "commands": [
+            {
+              "desc": "清空本会话记忆",
+              "name": "/清空上下文",
+              "type": "command"
+            }
+          ],
+          "enabled": true,
+          "group_openids": [],
+          "group_target_type": "all",
+          "remark": "QQBotMerged 指令面板"
+        },
+        "reply": {
+          "context_enabled": true,
+          "filter_meaningless": true,
+          "max_history": 20,
+          "max_queue_size": 10,
+          "max_segment_length": 2000,
+          "quote_reply": false,
+          "require_mention": true,
+          "strip_markdown": true
+        },
+        "scheduler": {
+          "enabled": false,
+          "tasks": []
+        },
+        "send": {
+          "max_file_mb": 200,
+          "max_image_mb": 20,
+          "max_retries": 3,
+          "message_max_length": 4000,
+          "reply_style": "both",
+          "request_timeout_seconds": 30,
+          "retry_backoff_factor": 1.0,
+          "token_refresh_buffer_seconds": 60,
+          "upload_keep_days": 7
+        },
+        "plugins": {
+          "enabled_names": [],
+          "disabled_names": [
+            "astrbot_demo",
+            "astrbot_plugin_daily_checkin",
+            "astrbot_plugin_dice"
+          ]
+        }
+      },
+      "reconnect_attempts": 5,
+      "reconnect_interval": 10,
+      "sandbox": false
+    },
+    {
+      "app_id": "",
+      "app_secret": "",
+      "enabled": true,
+      "id": "bot3",
+      "intents": 100663296,
+      "name": "qwen",
+      "overrides": {
+        "ai": {
+          "api_key": "",
+          "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+          "enabled": true,
+          "max_tokens": 1024,
+          "model": "qwen3.7-flash",
+          "no_ai_reply": "抱歉，我暂时没办法回答这个问题。",
+          "system_prompt": "你是一个友好的AI助手\n用来帮助人类解决问题",
+          "temperature": 0.8,
+          "timeout_seconds": 60,
+          "vision_enabled": true,
+          "vision_prompt": "请用中文描述这张图片的内容。"
+        },
+        "features": {
+          "auto_reply_in_group": true,
+          "auto_reply_in_private": true,
+          "group_management": true,
+          "media_download_timeout": 20,
+          "notify_on_error": true,
+          "save_received_media": true
+        },
+        "filters": {
+          "keywords_enabled": true,
+          "rate_limit_enabled": true,
+          "rate_limit_seconds": 3,
+          "sensitive_block_input": true,
+          "sensitive_enabled": true,
+          "sensitive_list": [],
+          "sensitive_replacement": "***"
+        },
+        "panels": {
+          "c2c_openids": [],
+          "c2c_target_type": "all",
+          "commands": [
+            {
+              "type": "command",
+              "name": "/帮助",
+              "desc": "显示可用指令"
+            },
+            {
+              "type": "command",
+              "name": "/清空上下文",
+              "desc": "清空本会话记忆"
+            }
+          ],
+          "enabled": true,
+          "group_openids": [],
+          "group_target_type": "all",
+          "remark": "QQBotMerged 指令面板"
+        },
+        "reply": {
+          "context_enabled": true,
+          "filter_meaningless": true,
+          "max_history": 20,
+          "max_queue_size": 10,
+          "max_segment_length": 2000,
+          "quote_reply": false,
+          "require_mention": true,
+          "strip_markdown": true
+        },
+        "scheduler": {
+          "enabled": false,
+          "tasks": []
+        },
+        "send": {
+          "max_file_mb": 200,
+          "max_image_mb": 20,
+          "max_retries": 3,
+          "message_max_length": 4000,
+          "reply_style": "both",
+          "request_timeout_seconds": 30,
+          "retry_backoff_factor": 1.0,
+          "token_refresh_buffer_seconds": 60,
+          "upload_keep_days": 7
+        },
+        "plugins": {
+          "enabled_names": [],
+          "disabled_names": [
+            "astrbot_demo",
+            "astrbot_plugin_daily_checkin",
+            "astrbot_plugin_dice"
+          ]
+        }
+      },
+      "reconnect_attempts": 5,
+      "reconnect_interval": 10,
+      "sandbox": false
+    }
+  ],
+  "cloud_sync": {
+    "account_id": "",
+    "api_token": "",
+    "apply_remote_deletes": false,
+    "database_id": "1218c357-534e-4a35-8c13-c61dbd3f2f89",
+    "enabled": true,
+    "error_pause_minutes": 30,
+    "interval_seconds": 300,
+    "max_file_mb": 10,
+    "provider": "cloudflare_d1",
+    "pull_on_start": true,
+    "startup_buffer": true,
+    "startup_buffer_keep_remote": true,
+    "startup_buffer_max_mb": 8,
+    "startup_buffer_minutes": 3,
+    "tombstone_days": 30,
+    "upload_logs": false,
+    "skip_secret_files": true
+  },
+  "context": {
+    "enabled": true,
+    "max_history": 20
+  },
+  "features": {
+    "auto_reply_in_group": true,
+    "auto_reply_in_private": true,
+    "group_management": true,
+    "media_download_timeout": 20,
+    "notify_on_error": true,
+    "save_received_media": true
+  },
+  "filters": {
+    "exact_match_responses": {},
+    "fuzzy_match_responses": {},
+    "keywords_enabled": true,
+    "rate_limit_enabled": true,
+    "rate_limit_seconds": 3,
+    "sensitive_block_input": true,
+    "sensitive_enabled": true,
+    "sensitive_list": [],
+    "sensitive_replacement": "***"
+  },
+  "logging": {
+    "console_color": true,
+    "keep_days": 30,
+    "level": "INFO",
+    "max_size_mb": 10
+  },
+  "panels": {
+    "c2c_openids": [],
+    "c2c_target_type": "all",
+    "commands": [
+      {
+        "desc": "显示可用指令",
+        "name": "/帮助",
+        "type": "command"
+      },
+      {
+        "desc": "清空本会话记忆",
+        "name": "/清空上下文",
+        "type": "command"
+      }
+    ],
+    "enabled": true,
+    "group_openids": [],
+    "group_target_type": "all",
+    "remark": "QQBotMerged 指令面板"
+  },
+  "plugins": {
+    "dir": "plugins",
+    "enabled": true,
+    "enabled_names": [],
+    "disabled_names": []
+  },
+  "receiver": {
+    "heartbeat_timeout_factor": 3,
+    "max_reconnect_interval_seconds": 30,
+    "reconnect_interval_seconds": 5
+  },
+  "reply": {
+    "context_enabled": true,
+    "filter_meaningless": true,
+    "max_history": 20,
+    "max_queue_size": 10,
+    "max_segment_length": 2000,
+    "quote_reply": false,
+    "require_mention": true,
+    "strip_markdown": true
+  },
+  "scheduler": {
+    "_tasks_note": "格式：[{\"time\":\"08:00\",\"bot_id\":\"bot1\",\"target_type\":\"group\",\"target_id\":\"群openid\",\"content\":\"早安\"}]",
+    "enabled": false,
+    "tasks": []
+  },
+  "security": {
+    "admin_openids": [],
+    "alert_enabled": true,
+    "alert_owner_openid": ""
+  },
+  "send": {
+    "_reply_style_note": "both=同时带 msg_id+msg_seq 与 message_reference；msg_id=仅被动回复；message_reference=仅引用字段。",
+    "max_file_mb": 200,
+    "max_image_mb": 20,
+    "max_retries": 3,
+    "message_max_length": 4000,
+    "reply_style": "both",
+    "request_timeout_seconds": 30,
+    "retry_backoff_factor": 1.0,
+    "token_refresh_buffer_seconds": 60,
+    "upload_keep_days": 7,
+    "message_format": "text"
+  },
+  "storage": {
+    "db_path": "data/messages.db",
+    "enabled": true,
+    "group_members_refresh_hours": 6,
+    "max_conversations": 500,
+    "max_messages": 20000,
+    "media_dir": "data/media",
+    "messages_per_page": 200,
+    "retention_days": 30,
+    "trim_every_writes": 100
+  },
+  "ui": {
+    "animation": "full",
+    "compact_mode": false,
+    "image_lightbox": true,
+    "message_bubbles": true,
+    "poll_interval_ms": 2000,
+    "show_avatar": true,
+    "theme": "auto"
+  },
+  "web": {
+    "_note": "host 默认仅本机可访问；改成 0.0.0.0 时务必设置 token（留空=不校验）。",
+    "debug": false,
+    "host": "0.0.0.0",
+    "log_access_requests": false,
+    "log_polling_requests": false,
+    "page_size": 200,
+    "poll_interval_ms": 2000,
+    "port": 8666,
+    "public_base_url": "",
+    "token": ""
+  }
+}

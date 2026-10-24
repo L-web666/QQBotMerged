@@ -13,10 +13,14 @@
     botId: '',
     botName: '',
     muteMode: 'local',        // 本次操作使用的禁言方式（在群管理页选择）
+    muteModeReady: false,     // 是否已经从用户那里"问过"（用户选过就不再被服务端覆盖）
+    lastMuteNotice: null,     // 上一次禁言/解禁的结果（失败原因常驻显示，见 renderDetail）
     muteMinutes: 10,
     pollTimer: null,
     detailTimer: null,
     signature: '',            // 列表内容指纹：没变就不重绘，页面不会闪
+    detailSignature: '',      // 详情内容指纹：没变就不重绘，卡片动画不会重播
+    detailShownAt: 0,         // 上次真正重绘详情的时间（倒计时到点后允许刷新一次文字）
     lastLoadedAt: 0
   };
 
@@ -49,7 +53,14 @@
       Groups.list = data.groups || [];
       Groups.botId = data.bot_id || '';
       Groups.botName = data.bot_name || data.bot_id || '';
-      Groups.muteMode = data.mute_mode || Groups.muteMode;
+      // 服务端给的是**初始值**：以前这里每次都覆盖 Groups.muteMode，
+      // 导致用户选了"官方接口"之后，群列表 15 秒的自动刷新又把它改回 local，
+      // 点禁言就变成本地禁言了（用户看到的就是"选了官方却还是本地"）。
+      // 规则：用户没选过 → 用服务端的；选过 → 一直用用户选的。
+      if (!Groups.muteModeReady && data.mute_mode) {
+        Groups.muteMode = data.mute_mode;
+        Groups.muteModeReady = true;
+      }
       Groups.lastLoadedAt = Date.now();
       U.el('groupsHint').innerHTML = '当前机器人：<b>' + U.esc(Groups.botName) + '</b>' +
         '（在左侧导航栏顶部可切换）· 这里只列出<b>该机器人</b>看到过的群，' +
@@ -84,6 +95,16 @@
       return [group.group_openid, group.name || '', group.message_count || 0,
               group.muted_count || 0, group.name_updated || 0].join('|');
     }).join(';');
+  }
+
+  /* 成员身份显示。以前这里写成"不是 owner/admin 就是成员"，而大部分成员是从历史消息
+     识别出来的、平台根本没给身份，于是整列全是「成员」—— 看着像查错了。
+     现在认不出来的老实显示「未知（平台未提供）」。 */
+  function roleLabel(role) {
+    if (role === 'owner') return '群主';
+    if (role === 'admin') return '管理员';
+    if (role === 'member') return '成员';
+    return '<span class="tiny">未知</span>';
   }
 
   function updateFreshness() {
@@ -145,6 +166,37 @@
     }
   }
 
+  /* 详情内容指纹：没变就不重绘。
+     20 秒一次的自动刷新以前每次都整体重写 innerHTML，等于把整块卡片重建一遍，
+     卡片入场动画（`.page.active .card` 的 fadeInUp）会跟着重播 —— 用户看到的就是
+     "群管理页什么都没更新也在播动画"。这里把"会显示出来的字段"拼成指纹，
+     只有真的变了才重绘。
+     注意：**倒计时类文字不能进指纹**（`remaining_text` / `remaining_seconds` 每次轮询
+     都在变），否则每 20 秒都会判定为"变了"，等于没修。 */
+  function detailSignature(data) {
+    if (!data) return '';
+    var parts = [data.group_openid || '', data.name || '', data.source || '',
+                 data.api_error || '', data.bot_id || ''];
+    var globalMute = data.global_mute || {};
+    parts.push(globalMute.mode || '', globalMute.text || '', globalMute.error || '',
+               globalMute.ok ? '1' : '0');
+    (data.members || []).forEach(function (member) {
+      parts.push([member.member_openid, member.username || '', member.role || '',
+                  member.message_count || 0, member.platform_muted ? '1' : '0',
+                  member.platform_expire_at || ''].join('~'));
+    });
+    (data.mutings || []).forEach(function (mute) {
+      parts.push([mute.member_openid, mute.until || 0].join('~'));
+    });
+    (data.platform_mutings || []).forEach(function (mute) {
+      parts.push([mute.member_openid, mute.mute_expire_at || '',
+                  mute.permanent ? '1' : '0'].join('~'));
+    });
+    var settings = (data.settings || {});
+    parts.push(JSON.stringify(settings.effective || {}), JSON.stringify(settings.stored || {}));
+    return parts.join('|');
+  }
+
   function openGroup(groupOpenid, refresh, silent) {
     var changed = groupOpenid !== Groups.active;
     Groups.active = groupOpenid;
@@ -154,6 +206,8 @@
     if (!silent) {
       detail.innerHTML = '<div class="card"><div class="loading-row"><span class="spinner"></span>' +
         '正在加载群信息…</div></div>';
+      // 手动加载会重建内容，允许本次重绘
+      Groups.detailSignature = '';
     }
     return U.getJSON('/api/groups/detail?group_openid=' + encodeURIComponent(groupOpenid) +
       (refresh ? '&refresh=1' : ''))
@@ -165,7 +219,17 @@
         // 详情接口返回的是"当前机器人"，以它为准（避免切换机器人后残留上一个）
         Groups.botId = data.bot_id || Groups.botId;
         if (data.bot_name) Groups.botName = data.bot_name;
-        renderDetail(data);
+        var signature = detailSignature(data);
+        // 内容没变就不重绘：不重建 DOM，也就不会重播卡片入场动画。
+        // 例外：本地禁言/QQ群禁言徽章上显示的是倒计时文字，它不在指纹里（否则每秒都"变"），
+        // 所以最多每 DETAIL_POLL_MS 让文案跟着刷新一次。
+        var staleCountdown = signature === Groups.detailSignature && Groups.detailShownAt
+          && (Date.now() - Groups.detailShownAt) >= DETAIL_POLL_MS;
+        if (signature !== Groups.detailSignature || staleCountdown) {
+          Groups.detailSignature = signature;
+          Groups.detailShownAt = Date.now();
+          renderDetail(data);
+        }
         if (Groups.signature !== listSignature(Groups.list)) {
           Groups.signature = listSignature(Groups.list);
           renderList();
@@ -202,8 +266,7 @@
       }
       return '<tr><td><b>' + U.esc(member.username || member.member_openid) + '</b>' +
         '<div class="tiny">' + U.esc(member.member_openid) + '</div></td>' +
-        '<td class="nowrap">' + U.esc(member.role === 'owner' ? '群主' :
-          (member.role === 'admin' ? '管理员' : '成员')) + '</td>' +
+        '<td class="nowrap">' + roleLabel(member.role) + '</td>' +
         '<td class="nowrap">' + (member.message_count || 0) + '</td>' +
         '<td class="nowrap">' + (badges || '<span class="tiny">--</span>') + '</td>' +
         '<td class="cell-act">' +
@@ -224,6 +287,23 @@
     var muteError = (!globalMute.ok && globalMute.error)
       ? '<div class="hint warn-text">⚠️ 无法读取 QQ 群内的真实禁言状态：' +
         U.esc(globalMute.error) + '</div>' : '';
+    // 身份列全是「未知」时说明白：平台没给成员身份，不是程序没去查。
+    // 只有在"确实一个身份都拿不到"时才提示，正常情况不占用版面。
+    var noRoles = members.length && !members.some(function (member) {
+      return member.role === 'owner' || member.role === 'admin' || member.role === 'member';
+    });
+    var roleHint = noRoles
+      ? '<div class="hint">ℹ️ 身份显示「未知」：平台没有给出这些成员的身份' +
+        (data.source === 'api' ? '（官方成员接口返回里不带 role）'
+                               : '（当前成员是从历史消息/禁言名单里识别出来的，' +
+                                 '官方成员接口不可用或未返回身份）') +
+        '。点上面的「🔄 拉取成员」可再试一次官方接口。</div>' : '';
+    // 上一次「官方禁言」失败的原因：只弹 toast 的话过几秒就看不见了，
+    // 用户会以为"选了官方接口却没生效"是页面没反应。这里常驻显示到下次操作。
+    var muteNotice = Groups.lastMuteNotice
+      ? '<div class="hint ' + (Groups.lastMuteNotice.ok ? 'ok-text' : 'warn-text') + '">' +
+        (Groups.lastMuteNotice.ok ? '✅ ' : '⚠️ ') + U.esc(Groups.lastMuteNotice.text) +
+        '<span class="tiny">（本条提示会在下一次禁言/解禁操作后更新）</span></div>' : '';
 
     U.el('groupDetail').innerHTML =
       '<div class="card">' +
@@ -238,7 +318,7 @@
       '<button class="btn tiny" id="grpRefreshMembers">🔄 拉取成员</button>' +
       '<button class="btn tiny" id="grpRefreshMutes">🛡️ 刷新官方禁言状态</button>' +
       '<button class="btn tiny" id="grpOpenChat">💬 打开聊天</button>' +
-      '</div>' + muteModeBar() + apiError + muteError +
+      '</div>' + muteModeBar() + muteNotice + apiError + muteError + roleHint +
       '<div class="member-list tbl-wrap"><table>' +
       '<thead><tr><th>成员</th><th>身份</th><th>发言</th><th>禁言</th><th>操作</th></tr></thead>' +
       '<tbody>' + (memberRows || '<tr><td colspan="5" class="tiny">暂时没有识别到成员</td></tr>') +
@@ -317,8 +397,10 @@
 
 
   function settingRow(key, label, value, kind) {
-    return '<label class="field" style="border:0;padding:6px 0"><span class="field-label">' +
-      U.esc(label) + '</span>' +
+    // `.field.inline`：标签与勾选框/输入框同一行（见 app.css）。
+    // 不加 inline 的话 `.field` 是纵向 flex，标签压在控件上面，三列表格里很难看。
+    return '<label class="field inline" style="border:0;padding:6px 0">' +
+      '<span class="field-label">' + U.esc(label) + '</span>' +
       (kind === 'bool'
         ? '<input type="checkbox" data-setting="' + key + '"' + (value ? ' checked' : '') + '>'
         : '<input type="number" data-setting="' + key + '" step="0.5" value="' +
@@ -331,7 +413,16 @@
     // 记住这次选择的禁言方式与时长（重绘后保持不变）
     var modeSel = U.el('muteModeSel');
     if (modeSel) {
-      modeSel.addEventListener('change', function () { Groups.muteMode = this.value; });
+      modeSel.addEventListener('change', function () {
+        Groups.muteMode = this.value;
+        Groups.muteModeReady = true;   // 用户已经表过态，别再被服务端默认值覆盖
+        // 选"官方接口"时给一句明确反馈：很多人以为是页面卡住了没生效
+        if (this.value !== 'local') {
+          U.toast('禁言方式已切换为「' +
+            ((MUTE_MODES.filter(function (p) { return p[0] === Groups.muteMode; })[0] || [])[1]
+              || Groups.muteMode) + '」', 'ok', 3000);
+        }
+      });
     }
     var minutesInput = U.el('muteMinutesInput');
     if (minutesInput) {
@@ -480,6 +571,14 @@
         group_openid: Groups.active, member_openid: memberOpenid,
         username: username || '', minutes: minutes, mode: mode
       }).then(function (data) {
+        // 官方模式失败时必须把平台原话留在页面上：只弹 toast 的话用户会以为没生效
+        var api = data.api || {};
+        var failedApi = (mode !== 'local') && api.success === false;
+        Groups.lastMuteNotice = {
+          ok: !failedApi,
+          text: (failedApi ? '官方禁言未生效：' : '') + (data.message || '已处理') +
+            (failedApi && api.hint ? ' —— ' + api.hint : '')
+        };
         U.toast(data.message || '已处理', data.success ? 'ok' : 'warn', 6000);
         openGroup(Groups.active, true);
       }).catch(function (error) { U.toast(error.message, 'err', 6000); });
@@ -498,6 +597,7 @@
         if (!official && data.api && data.api.success === false) {
           text += '（官方接口：' + data.api.message + '）';
         }
+        Groups.lastMuteNotice = { ok: data.success !== false, text: text };
         U.toast(text, data.success ? 'ok' : 'warn', 6000);
         openGroup(Groups.active, true);
       })
@@ -599,5 +699,7 @@
   Groups.init = init;
   Groups.load = load;
   Groups.openGroup = openGroup;
-  global.Groups = Groups;
+    // 防止整个对象被别人替换掉（对象内部字段照旧可改，见 util.js 的 protectGlobal）
+  if (typeof global.__qbmProtect === 'function') global.__qbmProtect('Groups', Groups);
+  else global.Groups = Groups;
 })(window);

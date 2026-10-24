@@ -134,6 +134,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # ---------------- 发送策略 ----------------
     "send": {
         "reply_style": "both",
+        "message_format": "text",
         "message_max_length": 4000,
         # QQ 官方的软/硬限制：图片软 20MB、视频软 30MB、语音软 20MB、文件软 200MB，
         # 硬限制统一 200MB（超过软限制会降级为"文件"类型上传，超过硬限制报错）。
@@ -193,6 +194,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "plugins": {
         "enabled": True,
         "dir": "plugins",
+        # 按机器人隔离插件（在「插件管理」页勾选，或在这里手写插件名）
+        "enabled_names": [],        # 该机器人的插件白名单；空 = 不限制
+        "disabled_names": [],       # 该机器人的插件黑名单（优先级高于白名单）
     },
 
     # ---------------- 云同步 ----------------
@@ -205,6 +209,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "interval_seconds": 300,
         "pull_on_start": True,
         "upload_logs": False,
+        "skip_secret_files": True,
         "max_file_mb": 10,
         "tombstone_days": 30,
         "apply_remote_deletes": False,
@@ -325,6 +330,9 @@ FIELDS: Dict[str, Dict[str, Any]] = {
     # ---------------- send ----------------
     "send.reply_style": _f("enum", "引用消息字段", "平台报参数错误时可切换",
                            options=[["both", "两种都带（兼容性最好）"], ["msg_id", "仅 msg_id"], ["message_reference", "仅引用字段"]]),
+    "send.message_format": _f("enum", "消息格式",
+                              "markdown = 用 QQ 原生 markdown 发送（标题/加粗/列表等）；需要机器人有对应权限，被平台拒绝时会自动回退为纯文本",
+                              options=[["text", "纯文本"], ["markdown", "Markdown"]]),
     "send.message_max_length": _f("int", "发送文本上限", "字符", min=100, max=20000),
     "send.max_file_mb": _f("float", "发送文件上限", "MB（上传给 QQ）", min=0.1, max=200),
     "send.max_image_mb": _f("float", "图片大小上限", "MB", min=0.1, max=100),
@@ -364,9 +372,13 @@ FIELDS: Dict[str, Dict[str, Any]] = {
     "panels.group_openids": _f("list", "群聊面板指定群", "每行一个 group openid"),
 
     # ---------------- plugins ----------------
-    "plugins.enabled": _f("bool", "启用插件系统", "关闭后不加载任何插件"),
+    "plugins.enabled": _f("bool", "启用插件系统", "关闭后不加载任何插件（全局设置）"),
     "plugins.dir": _f("str", "插件目录",
-                      "相对程序根目录；里面放 AstrBot 插件目录（metadata.yaml + main.py）"),
+                      "相对程序根目录；里面放 AstrBot 插件目录（metadata.yaml + main.py）（全局设置）"),
+    "plugins.enabled_names": _f("list", "本机器人启用的插件",
+                                "每行一个插件名（插件管理页的名字）；留空=该机器人启用所有已启用插件"),
+    "plugins.disabled_names": _f("list", "本机器人停用的插件",
+                                 "每行一个插件名；该机器人不运行这些插件（优先级高于上面的白名单）"),
 
     # ---------------- cloud_sync ----------------
     "cloud_sync.enabled": _f("bool", "启用云同步", "把 data/ 下的用户数据同步到 Cloudflare D1"),
@@ -376,6 +388,9 @@ FIELDS: Dict[str, Dict[str, Any]] = {
     "cloud_sync.interval_seconds": _f("int", "同步间隔", "秒", min=30, max=86400),
     "cloud_sync.pull_on_start": _f("bool", "启动时拉取云端数据", "换机器恢复就靠它"),
     "cloud_sync.upload_logs": _f("bool", "日志也上云", "日志量大，默认关闭"),
+    "cloud_sync.skip_secret_files": _f("bool", "含密钥的文件不上传",
+                                       "上传前按字段名扫一遍：出现 api_key/secret/token/password "
+                                       "等字段就跳过上传（本地文件不动）"),
     "cloud_sync.max_file_mb": _f("float", "单文件大小上限", "MB，超过不同步", min=0.1, max=200),
     "cloud_sync.tombstone_days": _f("int", "删除标记保留天数", "0=永久", min=0, max=3650),
     "cloud_sync.apply_remote_deletes": _f("bool", "跟随云端删除本地", "关闭则本地永不因云端删除而消失"),
@@ -436,7 +451,11 @@ SECRET_MASK = "********"
 
 # 每个机器人自己的设置（在「设置」页里，这些分组作用于**当前选中的机器人**）
 # 未列出的分组都是全局设置（网页后台 / 存储 / 日志 / 界面 / 云同步 …）
-PER_BOT_SECTIONS = ("ai", "reply", "filters", "features", "send", "scheduler", "panels")
+PER_BOT_SECTIONS = ("ai", "reply", "filters", "features", "send", "scheduler", "panels", "plugins")
+
+# 分组虽然按机器人隔离，但这两项是"整台程序"的开关/目录：按机器人覆盖它们没有意义
+# （插件只加载一次），所以在上面统一判定的基础上单独放行成全局项。
+GLOBAL_ONLY_PATHS = {"plugins.enabled", "plugins.dir"}
 
 # 各分组在「设置」页里的作用域说明
 SCOPE_HINTS: Dict[str, str] = {
@@ -451,7 +470,8 @@ SCOPE_HINTS: Dict[str, str] = {
     "web": "全局设置（所有机器人共用）",
     "storage": "全局设置（所有机器人共用）",
     "receiver": "全局设置（所有机器人共用）",
-    "plugins": "全局设置（所有机器人共用）",
+    "plugins": "「本机器人启用/停用的插件」只作用于**当前选中的机器人**；"
+               "插件总开关与插件目录是全局设置（所有机器人共用）",
     "cloud": "全局设置（所有机器人共用）",
     "security": "全局设置（所有机器人共用；管理员按 openid 判定）",
     "logging": "全局设置（所有机器人共用）",
@@ -462,11 +482,14 @@ SCOPE_HINTS: Dict[str, str] = {
 
 def per_bot_paths() -> set:
     """所有属于"每个机器人自己"的配置路径。"""
-    return {path for path in FIELDS if path.split(".")[0] in PER_BOT_SECTIONS}
+    return {path for path in FIELDS if is_per_bot(path)}
 
 
 def is_per_bot(path: str) -> bool:
-    return str(path or "").split(".")[0] in PER_BOT_SECTIONS
+    path = str(path or "")
+    if path in GLOBAL_ONLY_PATHS:
+        return False
+    return path.split(".")[0] in PER_BOT_SECTIONS
 
 
 def default_config() -> Dict[str, Any]:
@@ -524,7 +547,8 @@ SECTION_FIELDS: Dict[str, List[str]] = {
                  "features.group_management",
                  "features.auto_reply_in_group", "features.auto_reply_in_private",
                  "features.notify_on_error"],
-    "send": ["send.reply_style", "send.message_max_length", "send.max_file_mb", "send.max_image_mb",
+    "send": ["send.reply_style", "send.message_format", "send.message_max_length",
+             "send.max_file_mb", "send.max_image_mb",
              "send.max_retries", "send.retry_backoff_factor", "send.request_timeout_seconds",
              "send.token_refresh_buffer_seconds", "send.upload_keep_days"],
     "storage": ["storage.enabled", "storage.db_path", "storage.media_dir", "storage.max_messages",
@@ -535,10 +559,12 @@ SECTION_FIELDS: Dict[str, List[str]] = {
     "scheduler": ["scheduler.enabled", "scheduler.tasks"],
     "panels": ["panels.enabled", "panels.remark", "panels.commands", "panels.c2c_target_type",
                "panels.c2c_openids", "panels.group_target_type", "panels.group_openids"],
-    "plugins": ["plugins.enabled", "plugins.dir"],
+    "plugins": ["plugins.enabled", "plugins.enabled_names", "plugins.disabled_names",
+                "plugins.dir"],
     "cloud": ["cloud_sync.enabled", "cloud_sync.account_id", "cloud_sync.database_id",
               "cloud_sync.api_token", "cloud_sync.interval_seconds", "cloud_sync.pull_on_start",
-              "cloud_sync.upload_logs", "cloud_sync.max_file_mb", "cloud_sync.tombstone_days",
+              "cloud_sync.upload_logs", "cloud_sync.skip_secret_files", "cloud_sync.max_file_mb",
+              "cloud_sync.tombstone_days",
               "cloud_sync.apply_remote_deletes", "cloud_sync.error_pause_minutes",
               "cloud_sync.startup_buffer", "cloud_sync.startup_buffer_minutes",
               "cloud_sync.startup_buffer_max_mb", "cloud_sync.startup_buffer_keep_remote"],
@@ -570,7 +596,9 @@ def sections_payload() -> List[Dict[str, Any]]:
             "icon": info.get("icon", ""),
             "tip": info.get("desc", ""),
             "scope_hint": SCOPE_HINTS.get(key, ""),
-            "per_bot": key in PER_BOT_SECTIONS,
+            # 只要分组里有"按机器人"的字段就算按机器人隔离（plugins 里两项是全局的，
+            # 但它们只是同一分组下的例外，见 GLOBAL_ONLY_PATHS）
+            "per_bot": any(is_per_bot(path) for path in fields),
             "fields": fields,
         })
     return out

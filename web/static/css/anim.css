@@ -101,7 +101,7 @@
 .ripple {
   position: absolute;
   border-radius: 50%;
-  background: rgba(127, 140, 255, .45);
+  background: var(--ripple);
   width: 12px; height: 12px;
   margin: -6px 0 0 -6px;
   transform: scale(0);
@@ -111,7 +111,7 @@
 
 /* 输入聚焦时标签轻微位移 */
 .field { transition: background var(--trans), transform var(--trans); }
-.field:focus-within { background: rgba(79, 70, 229, .05); border-radius: 10px; padding-left: 8px; padding-right: 8px; }
+.field:focus-within { background: rgba(var(--accent-rgb), .05); border-radius: 10px; padding-left: 8px; padding-right: 8px; }
 
 /* 统计柱状图动画 */
 .chart-bar { animation: growBar .5s cubic-bezier(.22, 1, .36, 1) backwards; }
