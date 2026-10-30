@@ -687,11 +687,38 @@ class ConfigManager:
 
     @staticmethod
     def _is_secret_key(key: str) -> bool:
-        name = str(key or "").lower().replace("_", "").replace("-", "")
+        """字段名像不像密钥（用于递归打码 per-bot 覆盖）。
+
+        **不要用"固定名字全等比较"**：那样 `access_token` / `api_token` /
+        `client_secret` / `app_token` / `bot_token` 这类带前后缀的名字全部漏掉，
+        将来新增任何按机器人的密钥字段就会**静默不打码**（与 `cloud_sync` 用的是
+        两套规则，同一类问题两种判法）。这里改用"去分隔符 + 词边界"的宽松匹配，
+        并显式排除 `max_tokens` / `token_refresh_buffer_seconds` / `skip_secret_files`
+        这类普通配置项（它们的 token/secret 不是独立成词）。
+        """
+        raw = str(key or "").strip().lower()
+        if not raw:
+            return False
+        # 普通配置项：名字是复数/形容词用法，不是密钥
+        if raw in ("max_tokens", "max_token", "min_tokens", "token_refresh_buffer_seconds",
+                   "skip_secret_files", "secret_files", "tokens", "tokenizer"):
+            return False
+        name = raw.replace("_", "").replace("-", "").replace(".", "")
         if not name:
             return False
-        return name in ("apikey", "appsecret", "token", "secret", "password", "passwd",
-                        "accesskey", "secretkey", "credential", "authorization")
+        # 精确的几种常见写法
+        if name in ("token", "secret", "password", "passwd", "credential",
+                    "authorization", "webhook"):
+            return True
+        # 带前后缀的写法：api_key / app_secret / access_token / client_secret /
+        # secret_key / private_key / bot_token / refresh_token …
+        for marker in ("token", "secret", "password", "passwd", "credential", "apikey",
+                       "privatekey", "accesskey", "secretkey"):
+            if name.endswith(marker) or name.startswith(marker):
+                return True
+        if "apikey" in name or "privatekey" in name:
+            return True
+        return False
 
     def payload(self) -> Dict[str, Any]:
         """给设置页的完整数据：当前值（密钥打码）、默认值、元信息与分组结构。

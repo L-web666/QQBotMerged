@@ -20,7 +20,7 @@ import types
 from enum import Enum, IntFlag
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from core.astrbot_shim.base import ASTRBOT_VERSION, logger
-from core.astrbot_shim.base import ASTRBOT_VERSION, logger
+from core import plugin_sandbox
 from core.astrbot_shim.runner import RUNNER
 from core.astrbot_shim.components import AstrBotMessage, AstrMessageEvent, At, BaseMessageComponent, EventMessageType, File, Group, Image, MessageChain, MessageEventResult, MessageMember, MessageType, PermissionType, Plain, PlatformAdapterType, Record, Video
 from core.astrbot_shim.filters import FILTERS_ATTR, REGISTRY
@@ -93,6 +93,8 @@ class AstrBotHost:
         # dispatch 时把"正在处理哪个机器人"放好，否则插件只能看到全局 AI 配置，
         # 而本程序的 AI 是**按机器人**配置的（密钥通常落在 bots[].overrides.ai）。
         self._current = threading.local()
+        # 最近一次 dispatch 用的机器人（send_message 延迟执行时用它兜底，见 send_to_umo）
+        self._last_dispatch_bot = ""
         self.astrbot_version = ASTRBOT_VERSION
         # 插件的 StarTools 数据目录跟随本程序的插件数据目录
         StarTools.set_resolver(self.data_dir_for)
@@ -122,6 +124,14 @@ class AstrBotHost:
         if self.manager is not None:
             return os.path.join(self.manager.data_dir, name)
         return StarTools.get_data_dir(name)
+
+    def _sandbox_mode(self) -> str:
+        """当前插件沙箱档位（`plugins.sandbox`：off / loose / strict，默认 loose）。"""
+        runtime = self.runtime
+        config = getattr(runtime, "config", None) if runtime is not None else None
+        if config is None:
+            return "loose"
+        return plugin_sandbox.sandbox_config(config)
 
     # ------------------------------------------------------------------ 加载
     def load(self, name: str, dir_path: str) -> Optional[AstrBotPlugin]:
@@ -155,7 +165,14 @@ class AstrBotHost:
             if dir_path not in sys.path:
                 sys.path.insert(0, dir_path)
             before = len(REGISTRY)
-            spec.loader.exec_module(module)
+            # 插件代码在**软限制**下执行（见 core/plugin_sandbox.py）：
+            # loose 拦「执行系统命令/起子进程」，strict 另外限制导入白名单、
+            # 文件写入范围与联网域名。装不装补丁都不能让插件加载崩掉。
+            mode = self._sandbox_mode()
+            with plugin_sandbox.PluginSandbox(mode, dir_path, data_dir, name, self.log) as box:
+                spec.loader.exec_module(module)
+            if box.violations:
+                self._note(name, "加载期被沙箱拦截：" + "；".join(box.violations[:3]), "warning")
         except SyntaxError as exc:
             self._note(name, f"语法错误（第 {exc.lineno} 行）：{exc.msg}  ← {entry}")
             return None
@@ -542,6 +559,10 @@ class AstrBotHost:
         # 供插件侧 `context.get_using_provider()` 取到"当前机器人"的 AI 配置；
         # 用线程局部而不是实例属性：多个机器人各自一条线程在跑，实例属性会串。
         self._current.bot_id = str((msg or {}).get("bot_id") or "")
+        # 同时留一份"最近一次分发用的机器人"：插件的 send_message 可能在
+        # dispatch 返回之后才执行（线程局部已被清空），用它兜底。
+        if self._current.bot_id:
+            self._last_dispatch_bot = self._current.bot_id
         if not self.plugins:
             return None
         self._emit_sink = sink
@@ -577,7 +598,22 @@ class AstrBotHost:
                         continue
                 matched.append(f"{plugin.name}.{handler['name']}")
                 try:
-                    result = self._invoke(handler["func"], event, call_args)
+                    # 运行期同样过一遍软限制：插件在**消息处理时**起的进程/写盘/联网
+                    # 与加载期一样受约束（见 core/plugin_sandbox.py）。
+                    plugin_path = plugin.path or self.data_dir_for(plugin.name)
+                    with plugin_sandbox.PluginSandbox(
+                            self._sandbox_mode(), plugin_path,
+                            self.data_dir_for(plugin.meta.get("name") or plugin.name),
+                            plugin.name, self.log) as box:
+                        result = self._invoke(handler["func"], event, call_args)
+                    if box.violations:
+                        self.log.warning("AstrBot 插件 %s 的 %s 触发沙箱拦截：%s",
+                                         plugin.name, handler["name"],
+                                         "；".join(box.violations[:3]))
+                except plugin_sandbox.SandboxViolation as exc:
+                    self.log.warning("AstrBot 插件 %s 的 %s 被沙箱拒绝：%s",
+                                     plugin.name, handler["name"], exc)
+                    continue
                 except Exception as exc:
                     self.log.error("AstrBot 插件 %s 的 %s 执行失败：%s",
                                    plugin.name, handler["name"], exc)
@@ -704,8 +740,28 @@ class AstrBotHost:
         # 用**当前正在处理的那条消息的机器人**发出去。
         # 以前这里写死 bot_id=""，多机器人时 runtime 只能"挑第一个可用的"，
         # 结果 A 收到消息、回复却由 B 发出（审计 SEC-05）。
-        # `current_bot_id` 是 dispatch 时按线程放好的（见 dispatch()），线程内有效。
+        #
+        # `current_bot_id` 是 dispatch 时按线程放好的，但**不总是可用**：
+        # 插件把 `context.send_message` 的调用推迟到 dispatch 返回之后（例如存起来、
+        # 在定时器/协程里再发），线程局部已经被清掉或被下一条消息覆盖。
+        # 这时先回退到"本次 dispatch 记录过的机器人"（_last_dispatch_bot），
+        # 只有**确实只有一个机器人**时才允许它兜底；有多个且无法确定时按
+        # "宁可失败也不发错号"处理（审计 2.1）。
         bot_id = self.current_bot_id
+        if not bot_id:
+            fallback = str(getattr(self, "_last_dispatch_bot", "") or "")
+            enabled = [bid for bid, bot in (getattr(runtime, "bots", {}) or {}).items()
+                       if getattr(bot, "enabled", True)]
+            if fallback:
+                bot_id = fallback
+            elif len(enabled) == 1:
+                # 只有一个启用的机器人：不存在"发错号"的可能
+                bot_id = enabled[0]
+            else:
+                self.log.warning(
+                    "[AstrBot 兼容] 无法确定当前机器人，已拒绝发送（umo=%r）。"
+                    "插件若在自建线程/协程里主动发消息，请显式带上 bot_id。", umo)
+                return False
         target = {"type": "group" if is_group else "private",
                   "group_openid": openid if is_group else "",
                   "user_openid": "" if is_group else openid,

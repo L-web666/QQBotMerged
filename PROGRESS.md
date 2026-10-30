@@ -26,7 +26,8 @@
   - 端到端：`python tests/test_offline.py`（575 项）
   - 单元：`python tests/unit/test_markdown_send.py`、`test_at_mentions.py`、`test_cmd_tags.py`、
     `test_plugin_safety.py`、`test_cloud_secrets.py`、`test_media_dedup.py`、`test_ai_scope.py`、
-    `test_member_role.py`（含身份解析 / gateway 解析 / 历史补齐）、`test_security_fixes.py`（审计回归）
+    `test_member_role.py`（含身份解析 / gateway 解析 / 历史补齐）、`test_security_fixes.py`（审计回归）、
+    `test_csp_boot.py`（CSP 与前端启动数据）、`test_plugin_sandbox.py`（插件软限制）
   - 单实例锁：`python tests/test_instance_lock.py`
   - 前端契约：`python tests/check_frontend.py`
   - DOM 会话列表：`node tests/dom_test_conversations.js`
@@ -234,17 +235,62 @@
 
 ## 最近变更（新会话从这里接着看）
 
-- 2026-10-29：**「关闭程序」按钮从「使用说明」页移到「运行状态」页右上角**（用户要求）：
-  - `index.html`：`#shutdownBtn` 从 `page-about` 的 `page-head` 挪到 `page-status` 的
-    `page-head`，和「刷新」并排（`head-actions` 自带 `margin-left:auto`，自然靠右）；
-    使用说明页保留一段说明文字，告诉用户按钮现在在运行状态页，并去掉了那里的红色警告边框。
-  - `app.js`：按钮事件从"启动时绑定 `#shutdownBtn`"改成**事件委托**（`document` 上监听 +
-    `closest('#shutdownBtn')`）—— 以后按钮再换页面/位置都不用改 JS，也不会因为
-    "绑定发生在 DOM 变化之前"而失效。
-  - 验证：headless Edge 离线截图核对过两页（运行状态右上角有「⏻ 关闭程序」，使用说明页没有按钮）；
-    `check_frontend` / `test_offline` 576 项 / 9 个单元 / 3 个 DOM 全绿。
+> **书写规范（每次更新本文件都必须遵守）**
+> 每条记录只写「**日期 + 改了什么 + 为什么改 + 怎么验证**」四件事。
+> **不要写入**：谁提出/谁反馈的需求来源、对话过程、个人身份或口径、真实配置内容、
+> 真实数据规模（群数/成员数/消息条数等）、实例环境的操作过程、截图来源。
+> 修复类问题用中性描述写"问题现象"（例如「正文含 @ 某人时不会自动切到 Markdown」），
+> 不引用任何人的原话。只保留"修复后行为正确"这类可验证的结论。
 
-- 2026-10-29：**按《安全审计报告》修完全部问题**（用户要求一次性修完；本轮起不再读取 `config.json`）：
+- 2026-10-31：**修复 CSP 拦死自身启动脚本（P0 回归）+ 脱敏规则统一 + 插件进程内软限制**：
+  - **P0 CSP 回归**：上一轮为防 XSS 加的 `script-src 'self'`（无 `'unsafe-inline'`、无 nonce）
+    会**拒绝执行内联脚本**，而页面当时靠一段内联 `<script>` 注入 `window.__BOOT__` 与访问令牌 ——
+    结果：配了令牌时前端拿不到 token（所有接口 401，后台空壳），不配令牌时 `BOOT` 退化为空对
+    （主题/分页等设置全部失效）。
+    **改法**：启动数据改为 `<script type="application/json" id="boot-data">`（该类型不会被执行，
+    不受 `script-src` 约束），`util.js` 新增 `readBoot()` 从该块 `JSON.parse`，令牌改为在
+    `readToken()` 里从 URL 读取；保留 `window.__BOOT__` 兜底以兼容离线单测。**没有放宽 CSP**。
+  - **配套回归测试**（`tests/unit/test_csp_boot.py`，22 项）：断言 CSP 仍无 `unsafe-inline`、
+    模板无**可执行**内联脚本、`#boot-data` 是合法 JSON 且含 `ui`/`limits`、前端确实从该块读取、
+    静态资源是站内路径且可取。**已回退成旧写法验证过该测试会红（6 项同时失败）**，
+    旧的安全测试只断言"响应头里有 CSP"，不会在破坏页面时变红。
+  - **P2 脱敏规则统一**：`ConfigManager._is_secret_key()` 原为固定名字**全等**比较，
+    `access_token` / `api_token` / `client_secret` / `app_token` / `bot_token` 等带前后缀的名字
+    全部漏检（当前无实际泄露，但新增按机器人密钥字段时会静默绕过打码）。
+    改为"去分隔符 + 后缀/前缀"的宽松匹配，并显式排除 `max_tokens` /
+    `token_refresh_buffer_seconds` / `skip_secret_files` 这类普通配置项。
+  - **P3 插件发送不许发错号**：`send_to_umo()` 在无法确定机器人时**拒绝发送并告警**，
+    不再静默退回"任选一个可用机器人"。补充回退顺序：线程局部 →
+    本次 dispatch 记录的机器人 → **仅当只有一个启用机器人时**才用它兜底。
+  - **P3 关键词检索范围**：`read_tail()` 带 `level`/`keyword` 时改为**分块顺序扫描**
+    （新增 `_iter_lines`，增量解码避免块边界截断多字节字符），很旧的条目也能搜到；
+    无过滤时仍走尾部倒读。内存占用与 `limit` 成正比，不会整文件入内存。
+  - **插件进程内软限制**（新增 `core/plugin_sandbox.py` + 配置 `plugins.sandbox`）：
+    - 档位 `off` / `loose`（默认）/ `strict`；`loose` 只拦"执行系统命令 / 起子进程"，
+      不影响现有插件；`strict` 另加导入白名单、只允许写插件目录与插件数据目录、
+      联网域名白名单（QQ / 常见 AI 服务）。
+    - 在**加载期**与**事件派发期**各包一层；离开上下文后所有补丁**原样还原**，
+      不污染宿主与其它插件（恢复逻辑按 key 统一解析，避免漏还原）。
+    - 定位说明写在模块 docstring 与配置项提示里：这是**进程内软限制**（降低误伤范围），
+      **不是**可运行不可信代码的保证；真正的隔离需要独立进程 + 独立低权限账户。
+  - **验证**：新增 `tests/unit/test_csp_boot.py`（22 项）与 `tests/unit/test_plugin_sandbox.py`
+    （41 项）；全套回归 `test_offline` **576 项**、`check_frontend`、11 个单元测试、
+    3 个 DOM、单实例锁全绿；另实测严格 CSP 下首页样式与启动数据正常、4 个内置插件在
+    `loose` 沙箱下全部正常加载。
+
+- 2026-10-29：**「关闭程序」按钮从「使用说明」页移到「运行状态」页右上角**：
+  - **改了什么**：`index.html` 里 `#shutdownBtn` 从 `page-about` 的 `page-head` 挪到
+    `page-status` 的 `page-head`，和「刷新」并排（`head-actions` 自带 `margin-left:auto`，
+    自然靠右）；使用说明页保留一段说明文字指出按钮新位置，并去掉那里的红色警告边框。
+    `app.js` 的绑定方式从"启动时 `U.el('shutdownBtn')` 直接绑定"改成**事件委托**
+    （`document` 上监听 + `closest('#shutdownBtn')`）。
+  - **为什么改**：关闭按钮属于"运维操作"，跟运行状态放在一起更符合使用路径；
+    事件委托让按钮以后再换页面/位置都不用改 JS，也避免"绑定早于 DOM 就绪"导致点了没反应。
+  - **怎么验证**：离线渲染两页核对（运行状态页右上角出现「⏻ 关闭程序」，使用说明页无按钮，
+    全站 `#shutdownBtn` 只出现 1 次）；`check_frontend` / `test_offline` 576 项 /
+    9 个单元 / 3 个 DOM 全绿。
+
+- 2026-10-29：**按《安全审计报告》修复全部问题**（SEC-01 ~ SEC-16、NEW-01 ~ NEW-07）：
   - **P0 SEC-03/NEW-01 密钥脱敏**：`ConfigManager.mask_secrets()` 现在会**递归打码 `bots[].overrides`**
     （新增 `_mask_sensitive_fields()` + `_is_secret_key()`，按字段名判断），
     `payload()` 里的 `bot_overrides` 也过一遍。实测 `/api/admin/config` 不再出现明文 AI 密钥。
@@ -278,97 +324,97 @@
     全套回归：`test_offline` **576 项**、`check_frontend`、9 个单元测试、3 个 DOM、单实例锁全绿；
     另用临时沙箱配置**实测**了启动拒绝、`/media` 401/200、SVG 强制下载、CSP 头、
     `mask_secrets` 不返回明文。
-  - **未做（说明理由）**：SEC-15 插件沙箱是架构性风险，需要独立进程/独立账户才能真解决，本轮只保留
-    "扫描 + 提示"；README 的 DOC-01/DOC-02 数字漂移另行处理。
+  - **未做（说明理由）**：SEC-15 插件沙箱是架构性风险，需要独立进程/独立账户才能真解决，
+    目前只保留"扫描 + 提示"；README 的 DOC-01/DOC-02 数字漂移另行处理。
 
-- 2026-10-25：**群成员身份改为从群消息里取（官方 `author.member_role`）**
-  （用户实测发现：群里每条消息的 `author` 都带 `member_role`，取值
-  `member` / `admin` / `owner`，**不需要机器人是管理员**）：
-  - `core/gateway.py`：入站消息新增 `member_role`；`mentions[]` 也带 `member_role`
-    （被 @ 的人的身份，其中 `is_you` 的那条就是机器人自己的身份 = 它在群里的身份）。
-  - `core/runtime_pkg/messaging.py`：新增 `_remember_member_role()`，收到群消息时把
-    "发消息的人 + 消息里被 @ 的人"的身份写进 `group_members`（`upsert_members`）。
-  - `core/group_manager.py`：新增 `member_role(value)`（只解析单个值，认不出返回空串）
-    + `ROLE_UNKNOWN` 常量；`_normalize_role()` 对平台成员接口仍可用。
-  - `core/storage.py`：`upsert_members()` 改成**不拿空身份/unknown 覆盖已知身份**
-    （`CASE WHEN excluded.role NOT IN ('', 'unknown')`），昵称同理不拿空串覆盖；
-    新增 `member_role_rows()` 读历史报文。
-  - **历史数据能补回来**（不用联网）：新增 `core/member_roles.py` 的
-    `backfill_from_history()` —— 老版本把 `member_role` 丢了，但原始报文一直存在
-    `messages.raw_event` 里，解析出来就能补齐。`members()` 第一次真正用到某个群时自动跑一次
-    （`GroupManager._roles_backfilled` 保证不重复扫描）。
-    实测：用户库里 6 个群、78 位成员一次补齐（群 1 群主 + 若干管理员/成员，昵称也补上了）。
-  - 测试：`tests/unit/test_member_role.py` **29 项**（用用户给的真实报文喂 gateway →
-    解析出 owner/admin → 落库 → 空身份不降级 → 身份变化能更新 → 私聊不写 →
-    历史补齐 + 幂等）。全套回归（575 项 + 契约 + 10 个单元 + 3 个 DOM）全绿。
-- 2026-10-11：**群成员「身份」不再一律显示「成员」+ 群管理页没变化就不重播动画**（用户提的两点）：
+- 2026-10-25：**群成员身份改为从群消息里取（官方 `author.member_role`）**：
+  - **为什么改**：群成员的 owner / admin / member 身份在官方**群消息报文**里每条都带
+    （`author.member_role`），且**不要求机器人是群管理员**；而官方群成员接口需要管理员身份 +
+    平台白名单，拿不到时群管理页的「身份」列只能显示「未知」。
+  - **改了什么**：
+    - `core/gateway.py`：入站消息新增 `member_role`；`mentions[]` 也带 `member_role`
+      （被 @ 的人的身份，其中 `is_you` 的那条就是机器人自己在群里的身份）。
+    - `core/runtime_pkg/messaging.py`：新增 `_remember_member_role()`，收到群消息时把
+      "发消息的人 + 消息里被 @ 的人"的身份写进 `group_members`（`upsert_members`）。
+    - `core/group_manager.py`：新增 `member_role(value)`（只解析单个值，认不出返回空串）
+      + `ROLE_UNKNOWN` 常量；`_normalize_role()` 对平台成员接口仍可用。
+    - `core/storage.py`：`upsert_members()` 改成**不拿空身份/unknown 覆盖已知身份**
+      （`CASE WHEN excluded.role NOT IN ('', 'unknown')`），昵称同理不拿空串覆盖；
+      新增 `member_role_rows()` 读历史报文。
+    - **历史数据可补齐**（不联网）：新增 `core/member_roles.py` 的 `backfill_from_history()`
+      —— 老版本丢弃了 `member_role`，但原始报文一直存在 `messages.raw_event` 里，解析即可补齐；
+      `members()` 首次用到某个群时自动跑一次（`GroupManager._roles_backfilled` 防重复扫描）。
+  - **怎么验证**：`tests/unit/test_member_role.py` **29 项**（用官方群消息报文样例喂 gateway →
+    解析出 owner/admin → 落库 → 空身份不降级 → 身份变化能更新 → 私聊不写 → 历史补齐 + 幂等）。
+    全套回归（576 项 + 契约 + 9 个单元 + 3 个 DOM）全绿。
+- 2026-10-11：**群成员「身份」不再一律显示「成员」+ 群管理页没变化就不重播动画**：
   - **身份全是「成员」的根因**：`role` 在多处兜底写成 `"member"` ——
     `_merge_known_members()` 把"从历史消息 / 禁言名单认出来的人"也填成 `member`，
     `refresh_members()` 用 `item.get("role") or ("owner" if is_owner else "member")`，
-    页面又按"不是 owner/admin 就是成员"渲染。你库里 `group_members` 表**是空的**、
-    平台成员接口也没成功返回过（日志里没有 `group_members` 调用），所以表里这些人**全是历史消息
-    识别出来的**，平台压根没给身份 → 全部落到默认值「成员」。
-  - 改法：`core/group_manager.py` 新增 `_normalize_role()`（`role`/`member_role`/`is_owner`/
-    `is_admin`/中文写法都认，**先判 is_owner 再判 role**，认不出来 → `ROLE_UNKNOWN`），
+    页面又按"不是 owner/admin 就是成员"渲染。于是**平台没有给出身份的成员**（从历史消息识别出来的
+    那批）全部落到默认值「成员」，看起来像"整个群都是普通成员"。
+  - **改了什么**：`core/group_manager.py` 新增 `_normalize_role()`（`role`/`member_role`/
+    `is_owner`/`is_admin`/中文写法都认，**先判 is_owner 再判 role**，认不出来 → `ROLE_UNKNOWN`），
     两处默认值从 `"member"` 改成 `ROLE_UNKNOWN`；`groups.js` 新增 `roleLabel()`，
     显示「未知」，并在整列都是未知时给一句说明（平台没给身份 / 点「🔄 拉取成员」再试）。
-  - **动画重播的根因**：`openGroup()` 每 20 秒（`DETAIL_POLL_MS`）都把整个详情 `innerHTML`
-    重写一遍，卡片入场动画（`anim.css` 的 `.page.active .card` → fadeInUp）跟着重播一遍。
-    改法：新增 `detailSignature()` 内容指纹（成员/禁言/群级配置/群名/错误…），**没变就不重绘**；
+  - **动画重播的根因与改法**：`openGroup()` 每 20 秒（`DETAIL_POLL_MS`）都把整个详情 `innerHTML`
+    重写一遍，卡片入场动画（`anim.css` 的 `.page.active .card` → fadeInUp）跟着重播。
+    改为按 `detailSignature()` 内容指纹（成员/禁言/群级配置/群名/错误…）判断，**没变就不重绘**；
     倒计时文字（`remaining_text`/`remaining_seconds`）**故意不进指纹**（否则每次都"变"），
-    改用"最多每 `DETAIL_POLL_MS` 让文案刷新一次"（`Groups.detailShownAt`）来保证剩余时长不过期。
-  - 测试：新增 `tests/unit/test_member_role.py`（20 项；写这条测试时发现"is_owner=True + role=admin"
-    会被判成管理员，已一并修正）；`tests/check_frontend.py` 新增一组规则（不许再有 `"role": "member"`
-    兜底、必须有 roleLabel、详情必须用指纹判断是否重绘）—— **两条都回退验证过会红**。
+    改用"最多每 `DETAIL_POLL_MS` 让文案刷新一次"（`Groups.detailShownAt`）保证剩余时长不过期。
+  - **怎么验证**：新增 `tests/unit/test_member_role.py`（20 项；写这条测试时发现
+    "is_owner=True + role=admin"会被判成管理员，已一并修正）；`tests/check_frontend.py`
+    新增一组规则（不许再有 `"role": "member"` 兜底、必须有 roleLabel、详情必须用指纹判断重绘），
+    **两条规则均回退验证过会变红**。
 
-- 2026-10-11：**修「选了官方禁言，点禁言却还是本地禁言」**（用户报的 bug）：
+- 2026-10-11：**修「选了官方禁言，点禁言却还是本地禁言」**：
   - **根因**：`groups.js` 的群列表刷新里写着 `Groups.muteMode = data.mute_mode || Groups.muteMode`，
     而 `/api/groups` 返回的 `mute_mode` 是**后端默认值 local**（`GroupManager.mute_mode()`
-    没传参时就是 local）。用户在下拉框里选了「官方接口」并把 `Groups.muteMode` 设对了，
+    没传参时就是 local）。页面选过「官方接口」并把 `Groups.muteMode` 设对了，
     **15 秒后群列表自动刷新（LIST_POLL_MS）又把它覆盖回 local** —— 于是点禁言发出去的
     `mode=local`，自然只做本地禁言。详情面板每 20 秒重绘也会用被污染的 `Groups.muteMode` 回填下拉框。
-  - **改法**：加 `Groups.muteModeReady` 标记 —— 服务端的 `mute_mode` 只在"用户还没表过态"时
-    作为初始值采用；用户一改下拉框就置位，之后再也不被自动刷新覆盖。切换方式时给一条明确
-    toast（很多人以为是页面没反应）。
-  - **顺带修「官方禁言失败看不见」**：官方模式失败过去只弹 6 秒 toast，滚动条一走用户就以为
-    "选了官方却没生效"。现在 `Groups.lastMuteNotice` 把平台原话 + `hint`（例如"机器人在该群不是
-    管理员，官方禁言接口会被拒绝"）常驻显示在「禁言方式」栏下面，直到下一次操作。
-  - 契约测试：`tests/check_frontend.py` 新增一组规则（禁言方式不能被自动刷新覆盖、
-    请求带 mode 且透传到群管理）；**已用"把修复回退成旧写法"验证过这条规则真的会红**，不是空跑。
-  - 提醒：就算方式选对了，**官方禁言还要求机器人是该群管理员**（且账号在群成员管理白名单内，
-    否则平台返回 11253）。失败原因现在会常驻显示在页面上。
+  - **改法**：加 `Groups.muteModeReady` 标记 —— 服务端的 `mute_mode` 只在"页面还没表过态"时
+    作为初始值采用；一旦改过下拉框就置位，之后不再被自动刷新覆盖。切换方式时给一条明确
+    toast（避免"选了没反应"的错觉）。
+  - **顺带修「官方禁言失败看不见」**：官方模式失败过去只弹 6 秒 toast，超过时长就看不到原因。
+    现在 `Groups.lastMuteNotice` 把平台原话 + `hint`（例如"机器人在该群不是管理员，
+    官方禁言接口会被拒绝"）常驻显示在「禁言方式」栏下面，直到下一次操作。
+  - **怎么验证**：契约测试 `tests/check_frontend.py` 新增一组规则（禁言方式不能被自动刷新覆盖、
+    请求带 mode 且透传到群管理），**已用"把修复回退成旧写法"验证过这条规则真会变红**。
+  - 注意：方式选对后**官方禁言仍要求机器人是该群管理员**（且账号在群成员管理白名单内，
+    否则平台返回 11253）；失败原因现在会常驻显示在页面上。
 
-- 2026-10-11：**运行状态页「内置 AI」改成跟随当前机器人 + 去掉「版本」项**（用户要求）：
+- 2026-10-11：**运行状态页「内置 AI」改成跟随当前机器人 + 去掉「版本」项**：
   - **切机器人不变的原因**：`/api/admin/status` 调的是 `rt.status()` → `ai_status()` **不带 bot_id**，
     给的是"整体结论"（全局可用就报全局、否则报第一个可用的机器人），跟左侧选的机器人无关；
     而且 `app.js` 的 `switchBot()` 只刷新了会话/设置/群管理，**没刷新运行状态页**。
-  - 改法：`ai_status(bot_id="")` 新增可选参数（非空 → 返回该机器人解析后的有效 AI 状态，
+  - **改了什么**：`ai_status(bot_id="")` 新增可选参数（非空 → 返回该机器人解析后的有效 AI 状态，
     带 `scope="bot"` / `bot_id` / `bot_name`；为空 → 保持原来的整体结论，启动提示仍用它）；
     `Runtime.status(bot_id="")` 透传给 `ai_status`；`/api/admin/status` 改成
     `rt.status(current_bot_id())`；`switchBot()` 在运行状态页时补一次 `Admin.loadStatus()`；
-    状态页那一格显示成 `模型 · 机器人名`（例如 `qwen3.7-flash · 锋跃_AI`）。
+    状态页那一格显示成 `模型 · 机器人名`。
   - **去掉「版本」项**：`admin.js` 里删掉 `kv('版本', data.version)`（页面上不再显示；
     `/api/admin/status` 的 `version` 字段保留，不影响其它用途）。
-  - 测试：`tests/unit/test_ai_scope.py` 新增 [1b] 一组（指名的机器人 → 不同结果、取不到客户端时
+  - **怎么验证**：`tests/unit/test_ai_scope.py` 新增 [1b] 一组（指名的机器人 → 不同结果、取不到客户端时
     回退不抛异常，共 25 项）；`tests/check_frontend.py` 新增「运行状态页」契约规则（不许再出现
     版本项、不许用整体状态显示 AI、`/api/admin/status` 必须传当前机器人、切换后必须重拉）——
     **已把修复回退验证过这条规则会红**。全套回归全绿。
 
-- 2026-10-11：**修「群管理 → 群级配置」里标签和勾选框不在同一行**（用户报的排版问题）：
-  - 根因：那一组用的是设置页的 `.field`，而 `.field` 是**纵向 flex**（标签压控件上面，
+- 2026-10-11：**修「群管理 → 群级配置」里标签和勾选框不在同一行**：
+  - **根因**：那一组用的是设置页的 `.field`，而 `.field` 是**纵向 flex**（标签压控件上面，
     设置页那样一段一项没问题），塞进群管理的三列 `.settings-grid` 里就成了"文字一行、
     勾选框另起一行"；数字框也因为要被 `justify-content: space-between` 推到右边而贴边。
-  - 改法：`app.css` 新增 `.field.inline`（横向 flex + 控件右对齐 + 数字框固定宽度），
+  - **改了什么**：`app.css` 新增 `.field.inline`（横向 flex + 控件右对齐 + 数字框固定宽度），
     `.settings-grid .field.inline` 里标签 `white-space: nowrap`；
     `groups.js` 的 `settingRow()` 给 `<label>` 加 `inline` 类，并把
     `.settings-grid` 的列宽下限从 180px 提到 230px（"回复限速（秒）"不再换行、数字框不贴边）。
-  - 只影响群级配置这一处；设置页的 `.field` 保持原来的竖向排版。
-  - 验证：headless Edge 离线截图核对过浅色/深色两种主题（六个字段全部标签+控件同行）；
+    只影响群级配置这一处；设置页的 `.field` 保持原来的竖向排版。
+  - **怎么验证**：离线渲染浅色/深色两套主题核对（六个字段全部标签+控件同行）；
     `test_offline.py` / `check_frontend.py` / 三个 DOM 测试全绿。
 
-- 2026-10-11：**浅色模式也改成 QQ（NT）桌面端的实测配色**（用户给了 QQ 浅色截图；只动
+- 2026-10-11：**浅色模式改成 QQ（NT）桌面端配色**（只动
   `web/static/css/app.css` 的变量块 + 几处写死的颜色，没有改逻辑）：
-  - 取色（从截图实测）：底色 `#F5F5F5` / 会话列表 `#EBEBEB` / 选中项 `#E2E2E2` /
+  - 取色（从 QQ 客户端界面取值）：底色 `#F5F5F5` / 会话列表 `#EBEBEB` / 选中项 `#E2E2E2` /
     主蓝 `#0099FF`（按钮、选中导航项、发送键）/ 深蓝 `#0085FF`（链接、@）/ 工具栏 `#5AB6F4` /
     **自己发的气泡 `#CCEBFF` 浅蓝底 + 深色字**（原来是自己调色板里的靛蓝渐变白字）/
     分隔线 `#E6E6E6` / 主文字 `#000000` / 次文字 `#666666` / 在线绿 `#12B7F5`（原来是绿）/
@@ -377,18 +423,18 @@
     纯灰 `#E2E2E2`）、`--glow: none` + `--brand-bg: #F5F5F5`（QQ 两种模式都没有背景光晕，
     品牌条也从深蓝渐变改成 QQ 那种"顶栏跟底色一样"）；`--ok` 语义色在浅色下是蓝（QQ 用蓝表示
     正常/在线），`.mention` / `.cmd-tag` 改用 `--primary-dark` 保证浅底上可读；
-  - 顺手把**浅色的绿色 tint 改成蓝色**的家庭作业补齐（`--ok-rgb`）；
-  - **深色模式逐字未变**（所有深色变量值与上一版一致，并用截图核对过）；
-  - 验证：headless Edge 离线截图核对过浅色（使用说明页：白卡片 + 浅灰底 + 蓝选中项）与
-    深色（聊天页）两套主题，临时文件已删除。
+  - 浅色的绿色 tint 一并改为蓝（`--ok-rgb`）；
+  - **深色模式逐字未变**（所有深色变量值与上一版一致）；
+  - **怎么验证**：离线渲染浅色（使用说明页：白卡片 + 浅灰底 + 蓝选中项）与深色（聊天页）
+    两套主题核对，临时文件已清理。
 
-- 2026-10-11：**修「AI 明明配好了，刷新网页却提示内置 AI 未配置完整」**（用户报的问题）：
+- 2026-10-11：**修「内置 AI 已配好，刷新网页却提示未配置完整」**：
   - **根因**：`ai` 是**按机器人**的配置段（`config_schema.PER_BOT_SECTIONS`，设置页里也写着
-    "以下设置只作用于当前选中的机器人"），用户在「设置 → AI 服务」里填的密钥/接口/模型落在
-    `bots[].overrides.ai`，**全局 `ai.api_key` 是空的**；而判断"内置 AI 可用吗"的地方
+    "以下设置只作用于当前选中的机器人"），「设置 → AI 服务」里填的密钥/接口/模型落在
+    `bots[].overrides.ai`，**全局 `ai.api_key` 往往是空的**；而判断"内置 AI 可用吗"的地方
     （`Runtime.status()` 的 `ai` 字段 → 网页启动提示 + 运行状态页、`/health` 的 `ai_usable`、
     插件侧的 `_ProviderShim.usable`）全都只读**全局**客户端，于是误报。
-    真实发送走的是 `bot_ai_client(bot_id)`（读按机器人的有效配置），所以 AI 其实是好的。
+    真实发送走的是 `bot_ai_client(bot_id)`（读按机器人的有效配置），所以 AI 本身是好的。
   - **改法**：新增 `Runtime.ai_status()` —— 全局可用就返回全局（`scope="global"`），
     否则挨个看**启用的机器人**解析出来的有效配置，谁配全了就返回谁的状态并标
     `scope="bot"` / `bot_id` / `bot_name`；都没有才是 `scope="none"`（前端据此提示）。
@@ -398,15 +444,14 @@
     这样本地 Ollama 插件的"内置 AI 可用就让给核心"才不会再误判。
   - 前端：启动提示文案改成说明"AI 服务这一组只作用于当前选中的机器人"，
     并区分"已关闭"与"未配置完整"；运行状态页在内置 AI 是按机器人配置时显示 `· 按机器人`。
-  - 用用户真实 `config.json` 核对过：全局 `ai.api_key` 空、bot1/bot2/bot3 各自都有完整
-    密钥+接口+模型 → 修复前误报，修复后 `ai_status()` 为可用（`scope="bot"`）。
-  - 测试：`tests/unit/test_ai_scope.py`（20 项：全局/按机器人/都没有/停用机器人/取客户端抛异常/
-    provider 按机器人/线程不串号/Context 带 bot_id）；`test_offline.py` 575 项、
+  - **怎么验证**：`tests/unit/test_ai_scope.py`（20 项：全局/按机器人/都没有/停用机器人/
+    取客户端抛异常/provider 按机器人/线程不串号/Context 带 bot_id）；修复后
+    `/api/admin/status` 返回的 AI 状态为可用（`scope="bot"`）；`test_offline.py` 575 项、
     `check_frontend.py`、三个 DOM 测试全绿。
   - 注意：**全局 `ai` 段仍然是"兜底"用的**（没有单独配 AI 的机器人会沿用它）；
-    想让所有机器人共用一份配置，就到「设置 → 机器人账号」不选具体机器人时改全局段。
+    想让所有机器人共用一份配置，就在「设置 → 机器人账号」不选具体机器人时改全局段。
 
-- 2026-10-11：**修「几个机器人同在一个群时，群里的一张图被重复保存好几份」**（用户报的 bug）：
+- 2026-10-11：**修「几个机器人同在一个群时，群里的一张图被重复保存好几份」**：
   - **根因有两层**：① 群里发一张图，每个机器人都各自收到这条消息并各自下载，而**每份下载地址
     都带各自的 rkey 签名，URL 完全不同** —— 原来只按 `url_hash` 去重根本拦不住；
     ② `download()` 的「查重 → 落盘」之间没有锁，两条线程会同时查到"还没存过"然后各写一份
@@ -420,14 +465,13 @@
     "查重 → 落盘 → 登记"这一小段串行化（网络下载仍在锁外，不拖慢并发）。
   - **效果**：同群 N 个机器人收到同一张图 → 磁盘 1 个文件、媒体表 1 条记录、每个机器人的消息
     附件都指向同一份本地文件；同名不同内容仍按老规矩加 `_1`/`_2` 后缀，不会互相盖掉。
-  - 测试：`tests/unit/test_media_dedup.py`（22 项：双机器人 / 4 线程并发 / 不同内容 / 同 URL /
-    文件被删后不复用空记录 / 老库补列 / 失败登记）；`test_offline.py` 575 项、
+  - **怎么验证**：`tests/unit/test_media_dedup.py`（22 项：双机器人 / 4 线程并发 / 不同内容 /
+    同 URL / 文件被删后不复用空记录 / 老库补列 / 失败登记）；`test_offline.py` 575 项、
     `check_frontend.py`、三个 DOM 测试全绿。
-  - 未做：**已经存下来的历史重复文件不会自动清理**（怕误删真实数据）；需要时再写一次性去重脚本。
+  - 未做：**已经存下来的历史重复文件不会自动清理**（避免误删真实数据）；需要时再写一次性去重脚本。
 
-- 2026-10-10：**深色模式整体换成 QQ（NT）深色主题配色**（用户给了 QQ 深色截图，要求按图改后台
-  深色模式；只动样式，未改任何逻辑）：
-  - 取色（从截图实测）：底色 `#222222` / 面板 `#2F2F2F` / 抬升面（气泡·输入框·hover）`#3B3B3B` /
+- 2026-10-10：**深色模式整体换成 QQ（NT）深色主题配色**（只动样式，未改任何逻辑）：
+  - 取色（从 QQ 客户端界面取值）：底色 `#222222` / 面板 `#2F2F2F` / 抬升面（气泡·输入框·hover）`#3B3B3B` /
     主蓝 `#0066CC`（按钮、发送键）/ 亮蓝 `#5FB4FF`（强调字、描边、链接）/ 渐变次色 `#4D94DB` /
     主文字 `#EAEAEA` / 次文字 `#9C9C9C` / 分隔线 `#3B3B3B` / 在线绿 `#1EE288` / 数字胶囊 `#595959`；
   - 换肤方式：把「语义色的不同透明度」收进变量——`--accent-rgb / --ok-rgb / --err-rgb / --warn-rgb`
@@ -441,14 +485,14 @@
     规则文件 `web/static/css/app.css`（含变量块）+ `web/static/css/anim.css`（涟漪、聚焦底色）；
   - **浅色模式保持原样**（所有浅色变量值与原来逐字一致）；
   - 唯一顺带的小改动：`.cmd-tag` 底色由绿色 tint 改成跟正文一致的 accent tint（深色下才是蓝）；
-  - 验证：`python tests/check_frontend.py` 全绿；另外用 headless Edge 把后台首页渲染成静态页
-    离线截了三张深色截图（聊天/运行状态/使用说明）人工核对过层次与对比度，临时文件已删除；
+  - **怎么验证**：`python tests/check_frontend.py` 全绿；另外把后台首页渲染成静态页，
+    离线核对聊天/运行状态/使用说明三页的层次与对比度，临时文件已清理；
   - 未做：统计页柱状图仍是靛蓝/紫/绿的固定色（`web/static/js/admin.js` 内联渐变），
     要和 QQ 配色统一的话得把它也改成读 CSS 变量。
 
-- 2026-10-07：**带 @ / 指令标签的消息自动改用 Markdown + 新增指令标签支持**（用户反馈
-  「@ 某人需要 markdown，但我 @ 一个人时不会自动切格式」；官方事实见 `docs/QQ_MESSAGE_NOTES.md`
-  第七～九节）：
+- 2026-10-07：**带 @ / 指令标签的消息自动改用 Markdown + 新增指令标签支持**
+  （问题现象：正文含 @ 某人时不会自动切到 Markdown，导致标签不渲染；官方事实见
+  `docs/QQ_MESSAGE_NOTES.md` 第七～九节）：
   - **格式自动升级**：`core/message_text.py` 新增 `markdown_only_tags()`（识别 @某人 / 指令标签）；
     `Runtime.send_text()` 在请求为纯文本时自动改用 markdown，返回值加 `format` / `auto_format` /
     `_note`（原因文案 `AUTO_MARKDOWN_NOTE`），**只影响这一次发送、不写配置**；

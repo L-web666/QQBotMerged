@@ -194,6 +194,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "plugins": {
         "enabled": True,
         "dir": "plugins",
+        # 插件沙箱档位：off / loose / strict（进程内软限制，见 core/plugin_sandbox.py）
+        # 默认 loose：只拦"执行系统命令/起子进程"，不影响现有插件。
+        "sandbox": "loose",
         # 按机器人隔离插件（在「插件管理」页勾选，或在这里手写插件名）
         "enabled_names": [],        # 该机器人的插件白名单；空 = 不限制
         "disabled_names": [],       # 该机器人的插件黑名单（优先级高于白名单）
@@ -375,6 +378,14 @@ FIELDS: Dict[str, Dict[str, Any]] = {
     "plugins.enabled": _f("bool", "启用插件系统", "关闭后不加载任何插件（全局设置）"),
     "plugins.dir": _f("str", "插件目录",
                       "相对程序根目录；里面放 AstrBot 插件目录（metadata.yaml + main.py）（全局设置）"),
+    "plugins.sandbox": _f("enum", "插件沙箱档位",
+                          "off=不限制；loose=只拦执行系统命令/起子进程（默认）；"
+                          "strict=另加导入白名单 + 只允许写插件数据目录 + 联网域名白名单。"
+                          "注意这是**进程内软限制**，绕不过刻意为之的插件，"
+                          "真正的隔离需要独立进程（全局设置）",
+                          options=[["off", "不限制"],
+                                   ["loose", "只拦执行命令（默认）"],
+                                   ["strict", "导入白名单+写入+联网限制"]]),
     "plugins.enabled_names": _f("list", "本机器人启用的插件",
                                 "每行一个插件名（插件管理页的名字）；留空=该机器人启用所有已启用插件"),
     "plugins.disabled_names": _f("list", "本机器人停用的插件",
@@ -455,7 +466,7 @@ PER_BOT_SECTIONS = ("ai", "reply", "filters", "features", "send", "scheduler", "
 
 # 分组虽然按机器人隔离，但这两项是"整台程序"的开关/目录：按机器人覆盖它们没有意义
 # （插件只加载一次），所以在上面统一判定的基础上单独放行成全局项。
-GLOBAL_ONLY_PATHS = {"plugins.enabled", "plugins.dir"}
+GLOBAL_ONLY_PATHS = {"plugins.enabled", "plugins.dir", "plugins.sandbox"}
 
 # 各分组在「设置」页里的作用域说明
 SCOPE_HINTS: Dict[str, str] = {
@@ -559,8 +570,8 @@ SECTION_FIELDS: Dict[str, List[str]] = {
     "scheduler": ["scheduler.enabled", "scheduler.tasks"],
     "panels": ["panels.enabled", "panels.remark", "panels.commands", "panels.c2c_target_type",
                "panels.c2c_openids", "panels.group_target_type", "panels.group_openids"],
-    "plugins": ["plugins.enabled", "plugins.enabled_names", "plugins.disabled_names",
-                "plugins.dir"],
+    "plugins": ["plugins.enabled", "plugins.sandbox", "plugins.enabled_names",
+                "plugins.disabled_names", "plugins.dir"],
     "cloud": ["cloud_sync.enabled", "cloud_sync.account_id", "cloud_sync.database_id",
               "cloud_sync.api_token", "cloud_sync.interval_seconds", "cloud_sync.pull_on_start",
               "cloud_sync.upload_logs", "cloud_sync.skip_secret_files", "cloud_sync.max_file_mb",

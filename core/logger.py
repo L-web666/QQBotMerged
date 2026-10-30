@@ -37,8 +37,6 @@ def _tail_lines(handle, max_lines: int):
     大日志只读结尾一小段，内存占用与文件大小无关。
     行按"从头到尾"的顺序产出，调用方不用再反转。
     """
-    import io
-
     handle.seek(0, os.SEEK_END)
     position = handle.tell()
     buffer = b""
@@ -56,6 +54,34 @@ def _tail_lines(handle, max_lines: int):
     if len(lines) > max_lines:
         lines = lines[-max_lines:]
     return lines
+
+
+def _iter_lines(handle, chunk_size: int = _TAIL_CHUNK):
+    """按块**从头到尾**顺序读出文本行（生成器），整文件不进内存。
+
+    用于"带关键词/级别的检索"：需要扫到很早的日志，但又不能一次 readlines()。
+    注意块边界：只在块内按 `\\n` 切行，最后残留的半行留到下一块拼接，
+    因此不会把一行从中间劈开（UTF-8 也用增量解码器，避免多字节字符被截断）。
+    """
+    import codecs
+
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending = ""
+    while True:
+        block = handle.read(chunk_size)
+        if not block:
+            break
+        pending += decoder.decode(block)
+        if "\n" not in pending:
+            continue
+        parts = pending.split("\n")
+        pending = parts.pop()          # 最后一段可能是半行
+        for line in parts:
+            yield line
+    pending += decoder.decode(b"", final=True)
+    if pending:
+        # 文件末尾没有换行时，最后一行也要给出
+        yield pending
 
 
 def _supports_color() -> bool:
@@ -384,9 +410,12 @@ class Logger:
                   level: str = "", keyword: str = "") -> Dict[str, object]:
         """读取日志尾部若干行，可按级别与关键词过滤（默认读当前文件）。
 
-        审计 SEC-12：以前用 `handle.readlines()` **把整个日志文件读进内存**，
-        `limit` 只限制返回值行数、不限制读取量 —— 日志一大多并发查看就吃内存。
-        现在改成**从文件尾部按块倒着读**：够 `limit` 行就停，读多少由 limit 决定。
+        **两条路径，按是否需要过滤分别处理**：
+        - 不过滤（只要最近 N 行）：从文件尾部按块倒读，读多少由 `limit` 决定 ——
+          大日志也只读结尾一小段（审计 SEC-12 的内存收益）。
+        - 带 `level` / `keyword` 过滤：**流式顺序扫描整个文件**（逐块读、不整文件入内存），
+          因此很旧的条目也能搜到（审计 2.2：倒读窗口会把更早的日志排除在检索范围外）。
+          为防止匹配过多拖垮内存，只保留最近 `limit` 条匹配。
         """
         path = self._resolve(name)
         if not path:
@@ -397,14 +426,13 @@ class Logger:
         if level and level not in LEVEL_NAMES:
             level = ""
 
+        filtered = bool(level or keyword)
         lines: List[str] = []
         total = 0
-        # 过滤条件存在时，可能要从尾部往前读很多行才凑够 limit 条，所以给一个上限，
-        # 避免"关键词匹配不到"时把整文件读一遍。
-        max_lines = limit if not (level or keyword) else max(limit * 20, 2000)
         try:
             with open(path, "rb") as handle:
-                for raw in _tail_lines(handle, max_lines):
+                source = (_iter_lines(handle) if filtered else _tail_lines(handle, limit))
+                for raw in source:
                     total += 1
                     plain = _ANSI_RE.sub("", raw.rstrip("\n"))
                     if level and f"[{level}]" not in plain:
@@ -412,6 +440,9 @@ class Logger:
                     if keyword and keyword not in plain.lower():
                         continue
                     lines.append(plain)
+                    if len(lines) > limit:
+                        # 只留最近 limit 条：整文件扫描时内存也只与 limit 成正比
+                        del lines[0]
         except OSError:
             pass
 

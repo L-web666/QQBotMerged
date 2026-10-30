@@ -6,8 +6,31 @@
 (function (global) {
   'use strict';
 
-  var BOOT = global.__BOOT__ || {};
-  var TOKEN = global.__URL_TOKEN__ || '';
+  /* 启动数据来自模板里的 `#boot-data`（type="application/json"，不会被 CSP 当内联脚本拦住）。
+     访问令牌直接从 URL 读，不再需要模板里的内联赋值（CSP 的 script-src 会拒绝内联脚本）。
+     两者都做兼容：万一以后有人放回 window.__BOOT__ 也仍然能取到。 */
+  function readBoot() {
+    var node = global.document ? global.document.getElementById('boot-data') : null;
+    if (node && node.textContent) {
+      try {
+        var parsed = JSON.parse(node.textContent);
+        if (parsed && typeof parsed === 'object') return parsed;
+      } catch (e) { /* 解析失败就退回下面的兼容路径 */ }
+    }
+    return global.__BOOT__ || {};
+  }
+
+  function readToken() {
+    try {
+      var params = new URLSearchParams(global.location ? global.location.search : '');
+      var fromUrl = params.get('token') || '';
+      if (fromUrl) return fromUrl;
+    } catch (e) { /* 老浏览器没有 URLSearchParams */ }
+    return global.__URL_TOKEN__ || '';
+  }
+
+  var BOOT = readBoot();
+  var TOKEN = readToken();
 
   function apiUrl(path) {
     if (!TOKEN) return path;

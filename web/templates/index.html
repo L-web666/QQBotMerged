@@ -409,10 +409,12 @@
 </div>
 <div class="toast-wrap" id="toastWrap"></div>
 
-<script>
-  window.__BOOT__ = {{ boot | tojson }};
-  window.__URL_TOKEN__ = new URLSearchParams(location.search).get('token') || '';
-</script>
+<!-- 启动数据放在**非执行**的 JSON 块里：
+     CSP 的 script-src 不允许内联脚本执行，但 `type="application/json"` 的脚本块
+     永远不会被当作脚本执行，因此不受 script-src 约束（标准做法）。
+     以前这里是一段内联脚本直接给页面挂启动数据，加了 CSP 之后会被浏览器直接拦掉，
+     导致前端拿不到启动数据与访问令牌（后台空壳）。 -->
+<script type="application/json" id="boot-data">{{ boot | tojson }}</script>
 <script src="{{ url_for('static', filename='js/util.js') }}"></script>
 <script src="{{ url_for('static', filename='js/effects.js') }}"></script>
 <script src="{{ url_for('static', filename='js/chat.js') }}"></script>
