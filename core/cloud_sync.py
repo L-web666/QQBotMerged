@@ -140,13 +140,25 @@ def check_text_payload(rel: str, blob: bytes) -> str:
 
 # 上传前的"敏感字段"扫描：字段名像密钥的一律不往云端传（PROGRESS.md P1）。
 # 只认字段名，不猜值 —— 聊天记录里出现 "api_key" 这个词不会被误伤。
+#
+# 审计 SEC-06 的修正：**裸 `token` / 裸 `secret` 原来漏检**（只认 api_token、app_secret
+# 这类带前缀的写法），实测 `{"token": "..."}` / `{"secret": "..."}` 都返回空列表。
+# 现在把这两个单独成词的名字也纳入，同时用"按词边界匹配"避免误伤
+# `max_tokens` / `token_refresh_buffer_seconds` / `skip_secret_files` 这类普通配置项。
 SENSITIVE_KEY_RE = re.compile(
     r"(?i)(api[_-]?key|apikey|api[_-]?token|access[_-]?token|refresh[_-]?token|"
     r"client[_-]?secret|app[_-]?secret|secret[_-]?key|private[_-]?key|"
-    r"password|passwd|credential|authorization|bearer[_-]?token|session[_-]?key)")
-# 纯文本行："api_key = xxxxxxxx" / "\"token\": xxxxxxxx"（值要够长，避免把说明文字当成密钥）
+    r"password|passwd|credential|authorization|bearer[_-]?token|session[_-]?key|"
+    # 裸 token / 裸 secret 也要认（原来漏检），但只认"独立成词"的名字：
+    # 前后都必须是分隔符或字符串边界，这样 `token_refresh_buffer_seconds`、
+    # `skip_secret_files`、`max_tokens` 这类普通配置项不会被误伤。
+    r"(?<![A-Za-z0-9_\-])(token|secret)(?![A-Za-z0-9_\-]))")
+# 纯文本行："api_key = xxxxxxxx" / "\"token\": xxxxxxxx"
+# 值长度门槛从 12 降到 8（审计 NEW-07：短密钥整条漏检），但仍排除引号/逗号/括号这些
+# "分明是结构符号"的行，避免把 `"token": ""` 或说明文字当成密钥。
 SENSITIVE_LINE_RE = re.compile(
-    r"(?im)^\s*[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_\-]{0,40})[\"']?\s*[:=]\s*[\"']?(?P<value>\S{12,})")
+    r"(?im)^\s*[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_\-]{0,40})[\"']?\s*[:=]\s*"
+    r"[\"']?(?P<value>[^\s\"',;{}\[\]]{8,})")
 
 
 def find_sensitive_keys(rel: str, blob: bytes) -> List[str]:

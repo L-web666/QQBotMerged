@@ -31,7 +31,9 @@ MAX_FILES = 24
 MAX_BYTES = 512 * 1024
 MAX_STRINGS = 400
 
-LEVEL_ORDER = {"high": 0, "medium": 1, "info": 2, "ok": 3}
+# `unknown` 是"没扫成 / 结果不完整"，**不能**排在 ok 后面当成安全
+# （审计 SEC-07：扫描失败以前返回 ok，和"确认无风险"无法区分）。
+LEVEL_ORDER = {"high": 0, "medium": 1, "unknown": 2, "info": 3, "ok": 4}
 
 # 规则：命中任一 `imports` / `calls` / `attrs` / `names` / `strings` 即算命中
 RISK_RULES: Tuple[Dict[str, Any], ...] = (
@@ -184,8 +186,13 @@ def scan_source(source: str, filename: str = "") -> List[Dict[str, Any]]:
     """静态扫一段插件源码，返回命中的风险项（不执行代码）。"""
     try:
         tree = ast.parse(source)
-    except (SyntaxError, ValueError):
-        return []
+    except (SyntaxError, ValueError) as exc:
+        # 解析失败**必须显式标出来**：以前直接返回空列表，于是"没扫成"看起来
+        # 和"扫过且没问题"一模一样（审计 SEC-07 / NEW-04）。
+        # 用 info 级别挂一条，`scan_plugin_dir` 据此把整体标成 incomplete。
+        return [{"id": "parse", "level": "info", "label": "源码解析失败，未能扫描",
+                 "hint": "该文件的写法无法静态分析，安全性未确认", "evidence": [str(exc)[:160]],
+                 "parse_error": True, "file": filename or ""}]
     collector = _Collector()
     collector.visit(tree)
 
@@ -228,30 +235,55 @@ def scan_file(path: str) -> List[Dict[str, Any]]:
 
 
 def scan_plugin_dir(dir_path: str) -> Dict[str, Any]:
-    """扫一个插件目录：返回 `{findings, files, level, counts}`。"""
+    """扫一个插件目录（**递归子目录**）：返回 `{findings, files, level, counts}`。
+
+    审计 NEW-04：以前只用单层 `os.listdir` + `isfile()` 判断，**子目录被整体跳过** ——
+    插件把恶意逻辑放进 `helpers/evil.py` 或任意子包里，就完全不在扫描范围内。
+    现在递归遍历所有 `.py`（含子包与下划线辅助模块），并记录"是否扫全"：
+    超过文件数/大小上限、解析失败、目录不可读，都会标成 `incomplete`，
+    由上层显示成"扫描未完成"而不是"安全"。
+    """
     findings: List[Dict[str, Any]] = []
     files: List[str] = []
+    incomplete: List[str] = []
     if not os.path.isdir(dir_path):
-        return summarize(findings, files)
+        return summarize(findings, files, incomplete=["目录不存在"])
+    candidates: List[tuple] = []
     try:
-        entries = sorted(os.listdir(dir_path))
-    except OSError:
-        return summarize(findings, files)
+        for current, dirnames, filenames in os.walk(dir_path):
+            # 跳过明显的无关目录，避免把 .git / 虚拟环境扫进来
+            dirnames[:] = sorted(d for d in dirnames
+                                 if d not in (".git", "__pycache__", ".venv", "venv",
+                                              "node_modules"))
+            for name in sorted(filenames):
+                if not name.endswith(".py"):
+                    continue
+                full = os.path.join(current, name)
+                rel = os.path.relpath(full, dir_path).replace("\\", "/")
+                candidates.append((rel, full))
+    except OSError as exc:
+        return summarize(findings, files, incomplete=[f"目录不可读：{exc}"])
+    # main.py 优先扫，保证"入口文件"一定在扫描额度内
+    candidates.sort(key=lambda item: (item[0] != "main.py", item[0]))
     scanned = 0
-    for name in entries:
-        if not name.endswith(".py"):
-            continue
-        if name.startswith("_") and name not in SOURCES:
-            continue                     # 下划线开头的私有辅助文件跳过；main.py 必扫
+    for rel, full in candidates:
         if scanned >= MAX_FILES:
+            incomplete.append(f"文件数超过上限 {MAX_FILES}，其余未扫描")
             break
-        full = os.path.join(dir_path, name)
-        if not os.path.isfile(full):
+        try:
+            if os.path.getsize(full) > MAX_BYTES:
+                incomplete.append(f"{rel} 超过 {MAX_BYTES // 1024}KB，未扫描")
+                continue
+        except OSError:
+            incomplete.append(f"{rel} 无法读取")
             continue
         scanned += 1
-        files.append(name)
-        findings.extend(scan_file(full))
-    return summarize(findings, files)
+        files.append(rel)
+        file_findings = scan_file(full)
+        findings.extend(file_findings)
+        if any(item.get("parse_error") for item in file_findings):
+            incomplete.append(f"{rel} 解析失败，结果不完整")
+    return summarize(findings, files, incomplete=incomplete)
 
 
 def scan_container(root: str) -> Dict[str, Any]:
@@ -280,8 +312,14 @@ def scan_container(root: str) -> Dict[str, Any]:
     return summarize(findings, files)
 
 
-def summarize(findings: List[Dict[str, Any]], files: Optional[List[str]] = None) -> Dict[str, Any]:
-    """把命中的风险项压成给网页看的一行摘要。"""
+def summarize(findings: List[Dict[str, Any]], files: Optional[List[str]] = None,
+              incomplete: Optional[List[str]] = None) -> Dict[str, Any]:
+    """把命中的风险项压成给网页看的一行摘要。
+
+    `incomplete` 非空表示"没扫全"（超上限/解析失败/目录不可读）：
+    这时即使没有高风险项也**不能**报 `ok`，而是报 `unknown`，
+    并在 summary 里写清原因（审计 SEC-07 / NEW-04）。
+    """
     counts: Dict[str, int] = {}
     for item in findings:
         counts[item["level"]] = counts.get(item["level"], 0) + 1
@@ -290,16 +328,26 @@ def summarize(findings: List[Dict[str, Any]], files: Optional[List[str]] = None)
         if counts.get(candidate):
             level = candidate
             break
+    notes = [str(item) for item in (incomplete or []) if item]
+    if notes and level in ("ok", "info"):
+        # 没有高风险项、但没扫全 → 结论必须是"未确认"
+        level = "unknown"
+    summary = _summary_text(level, counts)
+    if notes:
+        summary += "；未扫全：" + "、".join(notes[:4]) + ("…" if len(notes) > 4 else "")
     return {
-        "level": level,                     # high / medium / info / ok
+        "level": level,                     # high / medium / unknown / info / ok
         "counts": counts,
         "findings": findings,
         "files": list(files or []),
-        "summary": _summary_text(level, counts),
+        "summary": summary,
+        "incomplete": bool(notes),
     }
 
 
 def _summary_text(level: str, counts: Dict[str, int]) -> str:
+    if level == "unknown":
+        return "安全扫描未完成（安全性未确认）"
     if level == "ok":
         return "没扫到需要留意的写法"
     parts = []

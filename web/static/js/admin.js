@@ -286,6 +286,10 @@
     } else if (safetyAll.level === 'medium') {
       parts.push('<span class="warn-text">安全提示：' + U.esc(safetyAll.summary || '') +
         '（插件是任意 Python 代码，见下方说明）</span>');
+    } else if (safetyAll.level === 'unknown' || safetyAll.incomplete) {
+      // 没扫成 ≠ 安全：必须让用户看到"安全性未确认"
+      parts.push('<span class="warn-text">⚠️ 安全扫描未完成：' + U.esc(safetyAll.summary || '') +
+        '（不代表插件安全，请自行核对源码）</span>');
     }
     if (diag.discovered && diag.discovered.length) {
       parts.push('扫描到 ' + diag.discovered.length + ' 个候选文件');
@@ -378,6 +382,10 @@
         }).join('\n');
         safetyBadge = '<span class="badge ' + (safety.level === 'high' ? 'err' : 'warn') +
           '" title="' + U.esc(detail) + '">⚠️ 安全提示 ' + (safety.summary || '') + '</span>';
+      } else if (safety.level === 'unknown' || safety.incomplete) {
+        // 扫描失败/不完整：不能显示成"安全通过"
+        safetyBadge = '<span class="badge warn" title="' + U.esc(safety.summary || '') +
+          '">❓ 安全扫描未完成</span>';
       }
       var riskBadge = safetyBadge;
       var metaBits = [];

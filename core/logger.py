@@ -26,6 +26,37 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 LEVEL_NAMES = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
+# 从文件尾部倒着读的块大小（审计 SEC-12：不要整文件 readlines()）
+_TAIL_CHUNK = 64 * 1024
+
+
+def _tail_lines(handle, max_lines: int):
+    """从已打开的文件句柄**从尾部往前**读，最多产出 max_lines 行（按原顺序返回）。
+
+    实现：从文件末尾按块回读，直到攒够 max_lines 行或读到文件头。
+    大日志只读结尾一小段，内存占用与文件大小无关。
+    行按"从头到尾"的顺序产出，调用方不用再反转。
+    """
+    import io
+
+    handle.seek(0, os.SEEK_END)
+    position = handle.tell()
+    buffer = b""
+    collected = 0
+    while position > 0 and collected <= max_lines:
+        read_size = min(_TAIL_CHUNK, position)
+        position -= read_size
+        handle.seek(position)
+        buffer = handle.read(read_size) + buffer
+        collected = buffer.count(b"\n")
+    if not buffer:
+        return []
+    text = buffer.decode("utf-8", "replace")
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return lines
+
 
 def _supports_color() -> bool:
     """是否给控制台上色（重定向到文件/管道或非 TTY 时不上色）。"""
@@ -351,31 +382,38 @@ class Logger:
 
     def read_tail(self, name: str = "", limit: int = 500,
                   level: str = "", keyword: str = "") -> Dict[str, object]:
-        """读取日志尾部若干行，可按级别与关键词过滤（默认读当前文件）。"""
+        """读取日志尾部若干行，可按级别与关键词过滤（默认读当前文件）。
+
+        审计 SEC-12：以前用 `handle.readlines()` **把整个日志文件读进内存**，
+        `limit` 只限制返回值行数、不限制读取量 —— 日志一大多并发查看就吃内存。
+        现在改成**从文件尾部按块倒着读**：够 `limit` 行就停，读多少由 limit 决定。
+        """
         path = self._resolve(name)
         if not path:
             return {"lines": [], "file": "", "total": 0, "matched": 0}
         limit = max(1, min(int(limit or 500), 5000))
         level = (level or "").upper().strip()
         keyword = (keyword or "").strip().lower()
+        if level and level not in LEVEL_NAMES:
+            level = ""
 
         lines: List[str] = []
+        total = 0
+        # 过滤条件存在时，可能要从尾部往前读很多行才凑够 limit 条，所以给一个上限，
+        # 避免"关键词匹配不到"时把整文件读一遍。
+        max_lines = limit if not (level or keyword) else max(limit * 20, 2000)
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                raw_lines = handle.readlines()
+            with open(path, "rb") as handle:
+                for raw in _tail_lines(handle, max_lines):
+                    total += 1
+                    plain = _ANSI_RE.sub("", raw.rstrip("\n"))
+                    if level and f"[{level}]" not in plain:
+                        continue
+                    if keyword and keyword not in plain.lower():
+                        continue
+                    lines.append(plain)
         except OSError:
-            raw_lines = []
-
-        total = len(raw_lines)
-        for line in raw_lines:
-            plain = _ANSI_RE.sub("", line.rstrip("\n"))
-            if level and level not in LEVEL_NAMES:
-                level = ""
-            if level and f"[{level}]" not in plain:
-                continue
-            if keyword and keyword not in plain.lower():
-                continue
-            lines.append(plain)
+            pass
 
         matched = len(lines)
         return {

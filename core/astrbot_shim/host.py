@@ -701,20 +701,27 @@ class AstrBotHost:
             steps.extend(self._result_sequence(component))
         if not steps:
             return False
+        # 用**当前正在处理的那条消息的机器人**发出去。
+        # 以前这里写死 bot_id=""，多机器人时 runtime 只能"挑第一个可用的"，
+        # 结果 A 收到消息、回复却由 B 发出（审计 SEC-05）。
+        # `current_bot_id` 是 dispatch 时按线程放好的（见 dispatch()），线程内有效。
+        bot_id = self.current_bot_id
         target = {"type": "group" if is_group else "private",
                   "group_openid": openid if is_group else "",
                   "user_openid": "" if is_group else openid,
-                  "bot_id": ""}
+                  "bot_id": bot_id}
         if self.manager is not None:
             self.manager.send_steps(runtime, target, steps)
             return True
         for step in steps:
             if step["type"] == "text":
-                runtime.send_text("group" if is_group else "private", openid, step["text"])
+                runtime.send_text("group" if is_group else "private", openid, step["text"],
+                                  bot_id=bot_id)
             else:
                 runtime.send_image("group" if is_group else "private", openid,
                                    image_url=step.get("url", ""), blob=step.get("blob"),
-                                   file_name=step.get("file_name") or "image.png")
+                                   file_name=step.get("file_name") or "image.png",
+                                   bot_id=bot_id)
         return True
 
     def emit(self, components: List[Any]):

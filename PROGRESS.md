@@ -26,7 +26,7 @@
   - 端到端：`python tests/test_offline.py`（575 项）
   - 单元：`python tests/unit/test_markdown_send.py`、`test_at_mentions.py`、`test_cmd_tags.py`、
     `test_plugin_safety.py`、`test_cloud_secrets.py`、`test_media_dedup.py`、`test_ai_scope.py`、
-    `test_member_role.py`（含身份解析 / gateway 解析 / 历史补齐）
+    `test_member_role.py`（含身份解析 / gateway 解析 / 历史补齐）、`test_security_fixes.py`（审计回归）
   - 单实例锁：`python tests/test_instance_lock.py`
   - 前端契约：`python tests/check_frontend.py`
   - DOM 会话列表：`node tests/dom_test_conversations.js`
@@ -233,6 +233,53 @@
 ---
 
 ## 最近变更（新会话从这里接着看）
+
+- 2026-10-29：**「关闭程序」按钮从「使用说明」页移到「运行状态」页右上角**（用户要求）：
+  - `index.html`：`#shutdownBtn` 从 `page-about` 的 `page-head` 挪到 `page-status` 的
+    `page-head`，和「刷新」并排（`head-actions` 自带 `margin-left:auto`，自然靠右）；
+    使用说明页保留一段说明文字，告诉用户按钮现在在运行状态页，并去掉了那里的红色警告边框。
+  - `app.js`：按钮事件从"启动时绑定 `#shutdownBtn`"改成**事件委托**（`document` 上监听 +
+    `closest('#shutdownBtn')`）—— 以后按钮再换页面/位置都不用改 JS，也不会因为
+    "绑定发生在 DOM 变化之前"而失效。
+  - 验证：headless Edge 离线截图核对过两页（运行状态右上角有「⏻ 关闭程序」，使用说明页没有按钮）；
+    `check_frontend` / `test_offline` 576 项 / 9 个单元 / 3 个 DOM 全绿。
+
+- 2026-10-29：**按《安全审计报告》修完全部问题**（用户要求一次性修完；本轮起不再读取 `config.json`）：
+  - **P0 SEC-03/NEW-01 密钥脱敏**：`ConfigManager.mask_secrets()` 现在会**递归打码 `bots[].overrides`**
+    （新增 `_mask_sensitive_fields()` + `_is_secret_key()`，按字段名判断），
+    `payload()` 里的 `bot_overrides` 也过一遍。实测 `/api/admin/config` 不再出现明文 AI 密钥。
+  - **P0 SEC-02/SEC-04/SEC-13**：`/media/<file>` 加 `check_token()`（前端本来就用 `U.apiUrl()` 拼图，
+    自动带 `?token=`）；**SVG 一律 `as_attachment` + octet-stream**（不内联，杜绝同源 XSS）；
+    `after_request` 补 **CSP**（含 `frame-ancestors 'none'`）与 **X-Frame-Options: DENY**。
+  - **P0 SEC-01/NEW-02**：`config.example.json` 的 `web.host` 改回 `127.0.0.1`；
+    `run.py` 在「非本机监听 + 无令牌」时**拒绝启动**（退出码 2，给出三条指引），
+    要裸跑必须显式加 `--allow-open-web`。
+  - **P1 SEC-05**：`send_to_umo()` 不再硬编码 `bot_id=""`，改用宿主线程内的
+    `current_bot_id`，插件主动发消息不会再串到别的机器人。
+  - **P1 SEC-06/NEW-07**：云同步敏感正则会话补 `token` / `secret`（用词边界匹配，
+    `max_tokens`/`token_refresh_buffer_seconds`/`skip_secret_files` 不误伤），纯文本值门槛 12 → 8。
+  - **P1 SEC-07**：插件扫描失败返回 `level="unknown"`（不再是 `"ok"`），
+    `LEVEL_ORDER` 里 `unknown` 排在 `ok` 前面；插件页显示「安全扫描未完成」徽章。
+  - **P1 SEC-08**：上传改为分块读取 + 业务上限（`_read_upload_capped`），超限直接 413，
+    不再先把整个请求体读进内存。
+  - **P1 SEC-09/NEW-03**：`fetch()` 改 `allow_redirects=False` **逐跳校验**（最多 5 跳）；
+    `host_allowed(allowlist_only=True)` 把**腾讯系域名白名单下沉到 fetch 内部**；
+    新增 `ipaddress` 判私有/回环/链路本地 + `resolve_public()` 做 **DNS 解析校验**。
+  - **P1 SEC-10**：启动日志不再输出 `?token=...`，只提示"已设置访问令牌"。
+  - **P1 SEC-11/NEW-06**：`ai_client.redact_text()` 脱敏错误正文（Bearer/sk-*/key=）；
+    `/api/admin/status` 的日志尾巴也过同一套脱敏。
+  - **P1 SEC-16/NEW-04**：`scan_plugin_dir()` **递归子目录**（跳过 `.git`/`__pycache__`/venv），
+    `main.py` 优先、超限/解析失败/读不到都记进 `incomplete`，结论变 `unknown`。
+  - **P2 SEC-12**：`read_tail()` 改**从尾部按块倒读**（`_tail_lines`），不再整文件 `readlines()`；
+    日志下载改 `send_file` 流式。
+  - **P2 SEC-14**：413 文案改为跟随 `MAX_CONTENT_LENGTH` 动态生成（不再写死 64MB）。
+  - 测试：新增 `tests/unit/test_security_fixes.py`（**56 项**，每节对应一个审计编号）；
+    **更新了 3 处旧断言**（它们断言的正是被审计判为缺陷的行为：扫描失败返回 ok / 语法错误返回空列表）。
+    全套回归：`test_offline` **576 项**、`check_frontend`、9 个单元测试、3 个 DOM、单实例锁全绿；
+    另用临时沙箱配置**实测**了启动拒绝、`/media` 401/200、SVG 强制下载、CSP 头、
+    `mask_secrets` 不返回明文。
+  - **未做（说明理由）**：SEC-15 插件沙箱是架构性风险，需要独立进程/独立账户才能真解决，本轮只保留
+    "扫描 + 提示"；README 的 DOC-01/DOC-02 数字漂移另行处理。
 
 - 2026-10-25：**群成员身份改为从群消息里取（官方 `author.member_role`）**
   （用户实测发现：群里每条消息的 `author` 都带 `member_role`，取值

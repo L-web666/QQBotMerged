@@ -21,6 +21,27 @@ logger = logging.getLogger(__name__)
 THINK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.IGNORECASE | re.DOTALL)
 CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n?(.*?)```", re.DOTALL)
 
+# 错误信息/日志里必须抹掉的密钥形态（审计 SEC-11 / NEW-06）。
+# 目的：`last_error` 会经 /api/admin/status 返回网页，日志尾巴也一起返回，
+# 服务商在错误正文里回显 api_key 或 Authorization 头时不能让它们原样流出去。
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._\-]{8,})"),
+    re.compile(r"(?i)((?:api[_-]?key|access[_-]?token|authorization|token|secret)"
+               r"[\"']?\s*[:=]\s*[\"']?)([A-Za-z0-9._\-]{6,})"),
+    re.compile(r"(sk-[A-Za-z0-9]{6})[A-Za-z0-9._\-]+"),
+)
+
+
+def redact_text(text: str, *secrets: str) -> str:
+    """把文本里的密钥抹成 `****`（已知密钥直接替换，再按常见形态兜底）。"""
+    out = str(text or "")
+    for secret in secrets:
+        if secret and len(str(secret)) >= 6:
+            out = out.replace(str(secret), "****")
+    for pattern in _SECRET_PATTERNS:
+        out = pattern.sub(lambda match: match.group(1) + "****", out)
+    return out
+
 
 class AIClient:
     """一个 OpenAI 兼容的对话客户端（全局共用一份配置）。"""
@@ -114,17 +135,22 @@ class AIClient:
             response = self.session.post(self._endpoint(), headers=headers, json=payload,
                                          timeout=self.timeout)
         except Exception as exc:
-            self.last_error = f"请求异常: {exc}"
-            self.log.error("AI 请求异常: %s", exc)
+            # 异常串里常常带完整 URL（含 api_key 查询参数）或本机地址，先脱敏再留存
+            self.last_error = f"请求异常: {redact_text(str(exc), self.api_key)}"
+            self.log.error("AI 请求异常: %s", self.last_error)
             return None
         if response.status_code != 200:
-            self.last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+            # 审计 SEC-11 / NEW-06：错误正文会经 /api/admin/status 的 last_error
+            # 与"最近 60 行日志"回给网页。服务商回显请求内容时，这里就是外泄点。
+            self.last_error = (f"HTTP {response.status_code}: "
+                               f"{redact_text(response.text[:300], self.api_key)}")
             self.log.error("AI 请求失败: %s", self.last_error)
             return None
         try:
             result = response.json()
         except ValueError:
-            self.last_error = f"响应不是合法 JSON: {response.text[:200]}"
+            self.last_error = ("响应不是合法 JSON: "
+                               f"{redact_text(response.text[:200], self.api_key)}")
             self.log.error("AI 响应解析失败: %s", self.last_error)
             return None
         self.last_error = ""

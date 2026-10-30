@@ -28,6 +28,7 @@ from flask import (Flask, Blueprint, Response, jsonify, render_template, request
 
 from core import config_schema as schema
 from core import media_store as media_module
+from core.ai_client import redact_text as _ai_redact_text
 from core import paths
 from core.cloud_sync import SYNC_PATHS
 from core.storage import conversation_key, conv_key_for
@@ -64,6 +65,30 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         """返回 401 或 None，供每个接口调用。"""
         blocked = check_token()
         return blocked
+
+    def _upload_limit_bytes(rt) -> int:
+        """单次上传允许读入内存的上限（业务上限，比 HTTP 层的 256MiB 小得多）。"""
+        try:
+            image_mb = float(rt.config.float_of("send", "max_image_mb", default=6) or 6)
+            file_mb = float(rt.config.float_of("send", "max_file_mb", default=8) or 8)
+        except Exception:
+            image_mb, file_mb = 6.0, 8.0
+        # 留 1MB 余量给 multipart 头与 base64 膨胀
+        return int(max(image_mb, file_mb, 1.0) * 1024 * 1024) + 1024 * 1024
+
+    def _read_upload_capped(upload, limit: int, chunk: int = 256 * 1024):
+        """分块读取上传内容，超过 limit 立刻返回 None（不要先整块读进内存）。"""
+        if limit <= 0:
+            return upload.read()
+        buffer = bytearray()
+        while True:
+            block = upload.stream.read(chunk)
+            if not block:
+                break
+            buffer.extend(block)
+            if len(buffer) > limit:
+                return None
+        return bytes(buffer)
 
     def current_bot_id() -> str:
         """当前选中的机器人：显式传 bot 优先，否则用后台选中的那个。
@@ -104,7 +129,11 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
 
     @app.errorhandler(413)
     def too_large(_exc):
-        return jsonify({"success": False, "message": "上传内容过大（服务端上限 64MB）"}), 413
+        # 文案必须跟着真实上限走：以前写死 64MB，而 MAX_CONTENT_LENGTH 是 256MiB，
+        # 用户看到提示会以为上传没到限（审计 SEC-14）。
+        limit = int(app.config.get("MAX_CONTENT_LENGTH") or 0)
+        size_text = f"{limit // 1048576}MB" if limit else "服务端上限"
+        return jsonify({"success": False, "message": f"上传内容过大（服务端上限 {size_text}）"}), 413
 
     @app.errorhandler(404)
     def not_found(_exc):
@@ -116,6 +145,20 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
     def security_headers(response):
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
+        # 点了什么链接就把令牌带去了哪：这是最常见的"令牌外泄"路径之一，
+        # 配合 CSP 一起把能外发请求的口子收紧（审计 SEC-13）。
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "img-src 'self' data: blob: https:; "
+            "media-src 'self' data: blob: https:; "
+            "style-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; "
+            "connect-src 'self'; "            "font-src 'self' data:; "
+            "frame-ancestors 'none'; "
+            "base-uri 'none'; "
+            "form-action 'self'")
+        response.headers.setdefault("X-Frame-Options", "DENY")
         return response
 
     def boot_payload() -> Dict[str, Any]:
@@ -170,7 +213,20 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
     # ---------------- 静态媒体 ----------------
     @app.route("/media/<path:filename>")
     def media_file(filename: str):
-        """返回本地留存的媒体文件（QQ 链接会过期，本地副本不受影响）。"""
+        """返回本地留存的媒体文件（QQ 链接会过期，本地副本不受影响）。
+
+        安全要点（原审计 SEC-02 / SEC-04 / NEW-05）：
+        - **必须过令牌校验**：媒体目录里是聊天里的图片和文件，属隐私数据；
+          以前这里没有 check_token()，且文件名常常就是原文件名（可预测）。
+          注意前端用 `<img src="/media/...">` 直接引用，带不了自定义请求头，
+          所以这里允许 `?token=`（页面本身也是这么拿令牌的）。
+        - **SVG 一律强制下载**：SVG 能被浏览器当 HTML 解析执行脚本，
+          同源下就是 XSS（后台能发消息、改配置）。SVG 不是聊天里常见的图片格式，
+          强制 as_attachment 对正常使用无影响。
+        """
+        blocked = check_token()
+        if blocked:
+            return blocked
         rt = runtime()
         base = paths.MEDIA_DIR
         if rt is not None:
@@ -180,6 +236,12 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         if not os.path.isfile(full):
             return jsonify({"success": False, "message": "文件不存在"}), 404
         mime, _ = mimetypes.guess_type(full)
+        ext = os.path.splitext(safe)[1].lower()
+        is_svg = ext == ".svg" or (mime or "").lower() == "image/svg+xml"
+        if is_svg:
+            # 不内联：避免同源脚本执行。统一按二进制下载出去。
+            return send_file(full, mimetype="application/octet-stream",
+                             download_name=safe, as_attachment=True, conditional=True)
         return send_file(full, mimetype=mime or "application/octet-stream",
                          download_name=safe, conditional=True)
 
@@ -351,7 +413,14 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         file_name = ""
         if upload is not None and upload.filename:
             file_name = media_module.safe_name(upload.filename)
-            blob = upload.read()
+            # 审计 SEC-08：`MAX_CONTENT_LENGTH` 是 HTTP 层上限（256MiB），
+            # 这里再按业务上限（send.max_file_mb / max_image_mb）限制**读入内存的量**，
+            # 超限直接拒绝，而不是先整个读进来再判断。
+            blob = _read_upload_capped(upload, _upload_limit_bytes(rt))
+            if blob is None:
+                return jsonify({"success": False,
+                                "message": f"文件过大：超过上限 "
+                                           f"{_upload_limit_bytes(rt) // 1048576}MB"}), 413
         else:
             data_b64 = field("file_data") or field("image_data")
             if data_b64:
@@ -695,14 +764,43 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         return jsonify(status)
 
     def _log_tail(lines: int = 60) -> str:
+        """最近若干行日志（跟着 /api/admin/status 一起返回网页）。
+
+        **必须脱敏**（审计 SEC-11 / NEW-06）：AI 错误正文会被写进日志，
+        服务商回显请求内容时日志里就可能有密钥；这个字段和 `ai.last_error`
+        是同一个响应里的两条外泄路径。
+        """
         holder = state.get("log_manager")
         if holder is None:
             return ""
         try:
             data = holder.read_tail(limit=lines)
-            return "\n".join(data.get("lines") or [])
+            raw = "\n".join(data.get("lines") or [])
+            return _redact(raw)
         except Exception:
             return ""
+
+    def _redact(text: str) -> str:
+        """把日志文本里的密钥/令牌抹掉（尽量覆盖配置中已知的密钥值）。"""
+        secrets = []
+        try:
+            rt = runtime()
+            cfg = config_manager.config
+            secrets.append(cfg.str_of("ai", "api_key", default=""))
+            secrets.append(cfg.str_of("web", "token", default=""))
+            secrets.append(cfg.str_of("cloud_sync", "api_token", default=""))
+            for bot in (cfg.get("bots") or []):
+                if isinstance(bot, dict):
+                    secrets.append(str(bot.get("app_secret") or ""))
+            if rt is not None:
+                for bot_id in list(getattr(rt, "bots", {}) or {}):
+                    try:
+                        secrets.append(rt.bot_config(bot_id).str_of("ai", "api_key", default=""))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return _ai_redact_text(text, *[s for s in secrets if s])
 
     @app.route("/api/admin/stats")
     def admin_stats():
@@ -1021,11 +1119,14 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         if holder is None:
             return jsonify({"success": False, "message": "日志不可用"}), 503
         name = media_module.safe_name(request.args.get("name") or "")
-        content = holder.read_file(name)
-        if content is None:
+        # 审计 SEC-12：以前 `read_file()` 把整个日志读进内存再整体返回。
+        # 现在只取路径、交给 Flask 流式发送（send_file 带 conditional/流式），
+        # 大日志不会一次性占满内存。
+        path = holder._resolve(name) if hasattr(holder, "_resolve") else None
+        if not path or not os.path.isfile(path):
             return jsonify({"success": False, "message": "日志文件不存在"}), 404
-        return Response(content, mimetype="text/plain; charset=utf-8",
-                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+        return send_file(path, mimetype="text/plain; charset=utf-8",
+                         as_attachment=True, download_name=name, conditional=True)
 
     @app.route("/api/admin/context")
     def admin_context():

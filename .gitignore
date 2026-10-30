@@ -2,8 +2,12 @@
 # 运行时数据与本地配置（**绝不要提交到版本库**）
 # ============================================================
 # 里面是你的 AppSecret / API 密钥 / Cloudflare Token：
-# 首次运行后由程序自动生成，格式与 config.example.json 相同。
+# 首次运行后由程序自动生成。
 config.json
+# 示例配置同样是**生成物**：用 `python tools/make_example_config.py` 随时重新生成
+# （内容来自 core/config_schema.py 的默认值）。放进仓库只会和代码默认值漂移，
+# 安全审计 SEC-01/NEW-02 就是示例文件里写了 host=0.0.0.0 引起的。
+config.example.json
 # 旧版的「配置说明」文件（含个人环境信息）
 config配置说明文件.txt
 

@@ -434,8 +434,11 @@ class PluginManager:
             return plugin_safety.scan_plugin_dir(path)
         except Exception as exc:                       # 扫描只是提示，不能拖垮加载
             self.log.debug("插件 %s 的安全扫描失败：%s", info.get("name"), exc)
-            return {"level": "ok", "counts": {}, "findings": [], "files": [],
-                    "summary": "扫描失败（不影响使用）"}
+            # 扫描失败 ≠ 插件安全（审计 SEC-07）：以前这里返回 level="ok"，
+            # 那是风险最低的一级，和"确认无风险"在界面上完全区分不出来。
+            # 现在返回 unknown 并写清原因，让插件页明确显示"没扫成"。
+            return {"level": "unknown", "counts": {}, "findings": [], "files": [],
+                    "summary": f"扫描失败（未能确认安全性）：{exc}", "incomplete": True}
 
     def _astrbot_host(self) -> Optional[AstrBotHost]:
         if self.host is None:

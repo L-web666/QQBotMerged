@@ -4405,10 +4405,15 @@ class GroupPlugin(Star):
           bool(_api42.get("success"))
           and all("safety" in item for item in (_api42.get("plugins") or [])),
           str([sorted(item.keys())[:6] for item in (_api42.get("plugins") or [])[:1]]))
-    check("安全扫描不会因为插件源码读不了就崩（失败也返回一个 ok 结构）",
-          _pm42._scan_safety({"name": "不存在的插件_x42", "module": "no_such_plugin_x42"}
-                             ).get("level") in ("high", "medium", "info", "ok"),
-          "")
+    # 审计 SEC-07：扫描失败不能报成 ok（那是"确认无风险"，和"没扫成"必须区分）
+    _fail_scope42 = _pm42._scan_safety({"name": "不存在的插件_x42",
+                                        "module": "no_such_plugin_x42"})
+    check("安全扫描不会因为插件源码读不了就崩（仍返回完整结构）",
+          isinstance(_fail_scope42, dict) and "level" in _fail_scope42,
+          str(_fail_scope42)[:120])
+    check("读不到源码时结论不是 ok（不能把「没扫成」当成「安全」）",
+          _fail_scope42.get("level") != "ok",
+          str(_fail_scope42.get("level")))
 
     # ------------------------------------------------------------------ 43. 云同步敏感字段
     print("\n[43] 云同步上传前的敏感字段扫描（含密钥的文件不上传，本地文件不动）")

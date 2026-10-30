@@ -523,6 +523,8 @@ def main() -> int:
     parser.add_argument("--host", default="", help="覆盖网页后台监听地址")
     parser.add_argument("--no-bots", action="store_true", help="只启动网页后台，不连接 QQ（调试用）")
     parser.add_argument("--config", default="", help="指定配置文件路径（默认 config.json）")
+    parser.add_argument("--allow-open-web", action="store_true",
+                        help="允许「非本机监听 + 无令牌」这种全开放组合（默认拒绝启动，不推荐）")
     args = parser.parse_args()
 
     if args.check:
@@ -583,16 +585,35 @@ def main() -> int:
         app = create_app(config_manager, logger.get_logger())
         app.attach_state(runtime, logger)
 
+        # 非本机监听 + 没有令牌 = 后台全开放（能发消息、改配置、禁言、关程序）。
+        # 以前只打一句 warning 就继续跑，用户很容易忽略；审计 SEC-01 建议直接拒绝启动。
+        # 想强行这么跑，显式加 `--allow-open-web`（自己的责任）。
         if host not in ("127.0.0.1", "localhost", "::1") and not token:
-            log.warning("⚠️  当前监听 %s 且未设置访问令牌，任何能访问该端口的人都能操作后台！"
-                        "请在「设置 → 网页后台」里设置 token。", host)
+            if not getattr(args, "allow_open_web", False):
+                log.error("拒绝启动：当前监听 %s（非本机）却没有设置访问令牌，"
+                          "任何能访问该端口的人都能操作后台！\n"
+                          "请任选其一：\n"
+                          "  1) 运行 `python run.py --host 127.0.0.1`（只本机访问）；\n"
+                          "  2) 在「设置 → 网页后台」里设置 token 后再重启；\n"
+                          "  3) 确实要裸跑，加参数 --allow-open-web（不推荐）。", host)
+                try:
+                    if runtime is not None:
+                        runtime.stop()
+                finally:
+                    lock.release()
+                return 2
+            log.warning("⚠️  已按 --allow-open-web 启动：监听 %s 且没有令牌，"
+                        "任何人都能操作后台！", host)
         if host in ("0.0.0.0", "::"):
             shown_host = "127.0.0.1"
         else:
             shown_host = host
 
-        log.info("网页后台已就绪：http://%s:%s/%s", shown_host, port,
-                 f"?token={token}" if token else "")
+        # 启动日志里**不再输出令牌**：URL 里的令牌会留在浏览器历史、终端回滚、
+        # 截图和反向代理日志里（审计 SEC-10）。
+        log.info("网页后台已就绪：http://%s:%s/", shown_host, port)
+        if token:
+            log.info("（已设置访问令牌：请在网页提示处输入，或加 ?token=你的令牌）")
         if not token and host in ("127.0.0.1", "localhost", "::1"):
             log.info("（仅本机可访问，未设置令牌）")
 

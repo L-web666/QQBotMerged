@@ -168,7 +168,13 @@
 
     <!-- ---------------- 运行状态 ---------------- -->
     <section class="page" id="page-status" data-page="status">
-      <div class="page-head"><h2>📊 运行状态</h2><button class="btn" id="statusRefresh">刷新</button></div>
+      <div class="page-head">
+        <h2>📊 运行状态</h2>
+        <div class="head-actions">
+          <button class="btn" id="statusRefresh">刷新</button>
+          <button class="btn danger" id="shutdownBtn">⏻ 关闭程序</button>
+        </div>
+      </div>
       <div class="grid" id="statusGrid"></div>
       <div class="card"><h3>机器人连接</h3><div id="botCards" class="grid"></div></div>
       <div class="card">
@@ -327,16 +333,12 @@
 
     <!-- ---------------- 使用说明 ---------------- -->
     <section class="page" id="page-about" data-page="about">
-      <div class="page-head"><h2>❓ 使用说明</h2>
-        <div class="head-actions">
-          <button class="btn danger" id="shutdownBtn">⏻ 关闭程序</button>
-        </div>
-      </div>
-      <div class="card" style="border-color:rgba(220,38,38,.35)">
+      <div class="page-head"><h2>❓ 使用说明</h2></div>
+      <div class="card">
         <h3>⏻ 关闭程序</h3>
-        <div class="field-tip">点右上角「关闭程序」会停止所有机器人连接与网页服务并退出进程。
-          程序不会自动重启（若用 <code>start.bat</code> 启动，退出后会被脚本重新拉起，
-          需要停掉脚本窗口）。</div>
+        <div class="field-tip">「关闭程序」按钮在<b>运行状态</b>页右上角。点它会在确认后
+          停止所有机器人连接与网页服务并退出进程。程序不会自动重启（若用 <code>start.bat</code>
+          启动，退出后会被脚本重新拉起，需要停掉脚本窗口）。</div>
       </div>
       <div class="grid two">
         <div class="card">

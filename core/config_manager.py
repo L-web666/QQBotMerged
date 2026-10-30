@@ -633,6 +633,16 @@ class ConfigManager:
 
     # ---------------------------------------------------------------- 网页支持
     def mask_secrets(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """把密钥字段打码后再给页面/接口。
+
+        **必须覆盖 `bots[].overrides`**：`ai` 属于 `PER_BOT_SECTIONS`，
+        用户在「设置 → AI 服务」里填的密钥通常落在 `bots[].overrides.ai.api_key`，
+        全局 `ai.api_key` 往往是空的。以前这里只按固定路径 `MASKED_FIELDS` 打码、
+        外加掩掉 `bots[].app_secret`，**不会进入 overrides 子树** ——
+        结果 `/api/admin/config` 一边返回打码的 `bot_config`、一边返回明文的
+        `bot_overrides` 与 `config.bots[].overrides`，脱敏形同虚设。
+        现在按字段名递归处理，新增的 per-bot 分组也会自动被打码。
+        """
         out = copy.deepcopy(data)
         for path in schema.MASKED_FIELDS:
             node = out
@@ -644,9 +654,44 @@ class ConfigManager:
             if isinstance(node, dict) and node.get(parts[-1]):
                 node[parts[-1]] = schema.SECRET_MASK
         for bot in out.get("bots", []) or []:
-            if isinstance(bot, dict) and bot.get("app_secret"):
+            if not isinstance(bot, dict):
+                continue
+            if bot.get("app_secret"):
                 bot["app_secret"] = schema.SECRET_MASK
+            # 按机器人的覆盖配置（ai / web / cloud_sync …）一次性递归打码
+            overrides = bot.get("overrides")
+            if isinstance(overrides, dict):
+                bot["overrides"] = self._mask_sensitive_fields(overrides)
         return out
+
+    def _mask_sensitive_fields(self, node: Any) -> Any:
+        """递归按**字段名**给密钥打码（用于 per-bot 覆盖这种没有固定路径的子树）。
+
+        判定规则与 `schema.FIELDS` 里的 `secret` 类型保持一致：字段名去掉下划线/连字符
+        后等于 `api_key` / `app_secret` / `token` / `secret` / `password` 等，就把值换成掩码。
+        只看字段名不看值：值本身就可能是空串（表示"没配置"），那不该显示成已打码。
+        """
+        if isinstance(node, dict):
+            out = {}
+            for key, value in node.items():
+                if isinstance(value, (dict, list)):
+                    out[key] = self._mask_sensitive_fields(value)
+                elif self._is_secret_key(key) and value not in (None, ""):
+                    out[key] = schema.SECRET_MASK
+                else:
+                    out[key] = value
+            return out
+        if isinstance(node, list):
+            return [self._mask_sensitive_fields(item) for item in node]
+        return node
+
+    @staticmethod
+    def _is_secret_key(key: str) -> bool:
+        name = str(key or "").lower().replace("_", "").replace("-", "")
+        if not name:
+            return False
+        return name in ("apikey", "appsecret", "token", "secret", "password", "passwd",
+                        "accesskey", "secretkey", "credential", "authorization")
 
     def payload(self) -> Dict[str, Any]:
         """给设置页的完整数据：当前值（密钥打码）、默认值、元信息与分组结构。
@@ -672,7 +717,9 @@ class ConfigManager:
             effective = self.resolve_for_bot(bot_id)
             payload["active_bot"] = bot_id
             payload["bot_config"] = self.mask_secrets(effective.data)
-            payload["bot_overrides"] = self.bot_overrides(bot_id)
+            # bot_overrides 以前直接返回原始覆盖配置：它里面有 overrides.ai.api_key，
+            # 会让打码白打。这里同样走一次脱敏。
+            payload["bot_overrides"] = self._mask_sensitive_fields(self.bot_overrides(bot_id))
         return payload
 
     # ---------------------------------------------------------------- 当前选中的机器人

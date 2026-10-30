@@ -102,14 +102,19 @@ def main():
           f"{clean_result['level']} {[item['id'] for item in clean_result['findings']]}")
     check("ok 时摘要文案不为空", bool(clean_result["summary"]), clean_result["summary"])
 
-    # ---------- 3. 解析失败不抛异常 ----------
-    print("\n[3] 源码有语法错误时不抛异常（插件本来就加载不了）")
-    check("语法错误 → 返回空列表",
-          plugin_safety.scan_source("def broken(:\n  pass", "main.py") == [], "")
+    # ---------- 3. 解析失败不抛异常，但必须标成"未扫成" ----------
+    print("\n[3] 源码有语法错误时不抛异常，且明确标为「未能扫描」")
+    _broken = plugin_safety.scan_source("def broken(:\n  pass", "main.py")
+    check("语法错误 → 不抛异常", isinstance(_broken, list), str(_broken)[:120])
+    # 审计 SEC-07：以前直接返回空列表，"没扫成"和"扫过且干净"看起来一模一样
+    check("语法错误 → 返回一条 parse_error 标记", any(
+        item.get("parse_error") for item in _broken), str(_broken)[:200])
     check("空源码 → 返回空列表", plugin_safety.scan_source("", "main.py") == [], "")
-    check("目录不存在 → 不抛异常且结论是 ok",
-          plugin_safety.scan_plugin_dir(os.path.join("data", "_selftest", "no_such_dir_9f3"))
-          ["level"] == "ok", "")
+    _missing = plugin_safety.scan_plugin_dir(
+        os.path.join("data", "_selftest", "no_such_dir_9f3"))
+    check("目录不存在 → 不抛异常", isinstance(_missing, dict), str(_missing)[:120])
+    check("目录不存在 → 结论不是 ok（安全性未确认）", _missing["level"] != "ok",
+          str(_missing.get("level")))
 
     # ---------- 4. 只解析、不执行 ----------
     print("\n[4] 扫描只做 AST 解析，绝不执行插件代码")

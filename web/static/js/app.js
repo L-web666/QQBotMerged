@@ -45,27 +45,27 @@
       botPicker.addEventListener('change', function () { switchBot(this.value); });
     }
 
-    // 网页上的「关闭程序」按钮（在"使用说明"页）
-    var shutdownBtn = U.el('shutdownBtn');
-    if (shutdownBtn) {
-      shutdownBtn.addEventListener('click', function () {
-        U.confirm({
-          title: '关闭程序',
-          html: '将停止所有机器人连接与网页服务，并退出程序。<br>' +
-            '<span class="tiny">关闭后需要重新启动才能继续使用；' +
-            '如果你是用 start.bat 启动的，脚本会自动把它再拉起来。</span>',
-          okText: '确认关闭'
-        }).then(function (ok) {
-          if (!ok) return;
-          U.postJSON('/api/admin/shutdown', { reason: '网页按钮' })
-            .then(function (data) { U.toast(data.message || '正在关闭…', 'warn', 10000); })
-            .catch(function (error) {
-              // 进程正在退出时请求可能被中断，这属于正常现象
-              U.toast('程序正在关闭：' + error.message, 'warn', 8000);
-            });
-        });
+    // 网页上的「关闭程序」按钮（在"运行状态"页右上角）
+    // 用事件委托：按钮以后挪到别的页面/位置也不用改这里。
+    document.addEventListener('click', function (event) {
+      var btn = event.target && event.target.closest ? event.target.closest('#shutdownBtn') : null;
+      if (!btn) return;
+      U.confirm({
+        title: '关闭程序',
+        html: '将停止所有机器人连接与网页服务，并退出程序。<br>' +
+          '<span class="tiny">关闭后需要重新启动才能继续使用；' +
+          '如果你是用 start.bat 启动的，脚本会自动把它再拉起来。</span>',
+        okText: '确认关闭'
+      }).then(function (ok) {
+        if (!ok) return;
+        U.postJSON('/api/admin/shutdown', { reason: '网页按钮' })
+          .then(function (data) { U.toast(data.message || '正在关闭…', 'warn', 10000); })
+          .catch(function (error) {
+            // 进程正在退出时请求可能被中断，这属于正常现象
+            U.toast('程序正在关闭：' + error.message, 'warn', 8000);
+          });
       });
-    }
+    });
 
     // 恢复界面偏好
     FX.restoreTheme();

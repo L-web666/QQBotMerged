@@ -17,15 +17,17 @@
 
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import mimetypes
 import os
+import socket
 import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urljoin
 
 import requests
 
@@ -123,8 +125,73 @@ def looks_like_image(blob: bytes) -> bool:
     return bool(sniff_image_type(blob)[0])
 
 
-def host_allowed(url: str) -> bool:
-    """只允许腾讯系媒体域名与公网 https 资源，避免被当成内网探测工具。"""
+def _is_private_ip(text: str) -> bool:
+    """借助标准库 `ipaddress` 判断地址是否属于"不该访问"的网段。
+
+    覆盖回环、私有、链路本地、保留、组播、未指定地址（IPv4 + IPv6）。
+    解析不出来的（不是 IP）一律当"不是内网"交给调用方继续判断。
+    """
+    try:
+        address = ipaddress.ip_address(str(text or "").strip().strip("[]"))
+    except ValueError:
+        return False
+    return bool(address.is_private or address.is_loopback or address.is_link_local
+                or address.is_reserved or address.is_multicast or address.is_unspecified)
+
+
+def resolve_public(url: str) -> bool:
+    """把域名解析成 IP 后再判一次：公网域名解析到内网地址也要拒绝。
+
+    审计 SEC-09：`host_allowed()` 原来只做纯字符串前缀判断，一个公网域名
+    解析到 127.0.0.1 或 192.168.x.x 就能绕过。这里补上真正的 DNS 解析校验。
+    解析失败（网络问题/域名不存在）时**保守放行**——真正的请求随后会自己失败，
+    拦截它没有意义，反而会把正常抓取拖垮。
+    """
+    try:
+        parsed = urlparse(url or "")
+        host = (parsed.hostname or "").strip()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    # 已经是 IP 字面量：上面 host_allowed 已经判过，这里再确认一次
+    try:
+        ipaddress.ip_address(host)
+        return not _is_private_ip(host)
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError, UnicodeError):
+        return True
+    for info in infos:
+        address = info[4][0] if info and info[4] else ""
+        if address and _is_private_ip(address):
+            return False
+    return True
+
+
+def host_in_allowlist(url: str) -> bool:
+    """域名是否属于腾讯系媒体白名单（`ALLOWED_HOST_SUFFIX`）。"""
+    try:
+        parsed = urlparse(url or "")
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    return any(host == suffix or host.endswith("." + suffix) for suffix in ALLOWED_HOST_SUFFIX)
+
+
+def host_allowed(url: str, allowlist_only: bool = False) -> bool:
+    """只允许 http/https 公网资源；`allowlist_only=True` 时还必须命中腾讯系域名白名单。
+
+    审计 SEC-09 / NEW-03：
+    - 以前**只做字符串判断**，不解析 DNS，也不校验 IP 归属 → 公网域名指向内网可绕过；
+    - 域名白名单原本只在 `web/server.py` 的代理路由里检查，`fetch()` 自己不查，
+      任何其它调用 `fetch()` 的路径（收到图片就下载）完全不受白名单约束。
+      现在把白名单下沉到这里，由 `fetch()` 统一把关。
+    """
     try:
         parsed = urlparse(url or "")
     except ValueError:
@@ -136,7 +203,9 @@ def host_allowed(url: str) -> bool:
         return False
     if host in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
         return False
-    # 内网网段一律拒绝
+    # 内网网段一律拒绝（字符串层，先挡掉最明显的）
+    if _is_private_ip(host):
+        return False
     if host.startswith(("10.", "192.168.", "169.254.")) or host.startswith("172."):
         parts = host.split(".")
         if len(parts) == 4 and parts[0] == "172":
@@ -145,7 +214,10 @@ def host_allowed(url: str) -> bool:
                     return False
             except ValueError:
                 pass
-    return True
+    if allowlist_only and not host_in_allowlist(url):
+        return False
+    # DNS 层校验：解析结果里有内网地址就拒绝
+    return resolve_public(url)
 
 
 def safe_name(name: str) -> str:
@@ -281,31 +353,57 @@ class MediaStore:
         item["reused"] = True
         return item
 
+    # 手动跟随重定向的最大跳数（requests 默认 30 跳且每跳不复验目标）
+    MAX_REDIRECTS = 5
+
     def fetch(self, url: str) -> Tuple[bytes, str]:
-        """下载 URL 内容，返回 (字节, Content-Type)。"""
-        if not host_allowed(url):
-            raise ValueError("链接不被允许（仅支持公网 http/https 资源）")
-        headers = {
-            "User-Agent": DEFAULT_UA,
-            "Accept": "image/*,video/*,application/octet-stream,*/*;q=0.8",
-        }
-        response = self.session.get(url, timeout=self.timeout, headers=headers, stream=True)
-        if response.status_code != 200:
-            raise ValueError(f"下载失败：HTTP {response.status_code}")
-        chunks, total = [], 0
-        limit = int(float(self.config.float_of("send", "max_file_mb", default=8) or 8) * 1024 * 1024)
-        for chunk in response.iter_content(65536):
-            if not chunk:
+        """下载 URL 内容，返回 (字节, Content-Type)。
+
+        安全要点（审计 SEC-09 / NEW-03）：
+        - **重定向自己跟**：`allow_redirects=False` 后逐跳重新校验协议/域名/IP。
+          以前用 requests 默认行为，第一跳校验过了，后续跳到内网就不再管。
+        - **域名白名单在 fetch 内部生效**：不再依赖调用方（`web/server.py` 的代理路由）
+          事前检查，自己就把关。
+        - **DNS 解析校验**：公网域名解析到内网地址一样拒绝（见 `resolve_public`）。
+        """
+        current = url
+        for _hop in range(self.MAX_REDIRECTS + 1):
+            if not host_allowed(current, allowlist_only=True):
+                raise ValueError("链接不被允许（仅支持腾讯系公网媒体地址）")
+            headers = {
+                "User-Agent": DEFAULT_UA,
+                "Accept": "image/*,video/*,application/octet-stream,*/*;q=0.8",
+            }
+            response = self.session.get(current, timeout=self.timeout, headers=headers,
+                                        stream=True, allow_redirects=False)
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location") or ""
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                if not location:
+                    raise ValueError("重定向缺少 Location")
+                current = urljoin(current, location)
                 continue
-            total += len(chunk)
-            if total > limit:
-                response.close()
-                raise ValueError(f"文件超过上限（{limit / 1048576:.1f} MB）")
-            chunks.append(chunk)
-        blob = b"".join(chunks)
-        if not blob:
-            raise ValueError("下载内容为空")
-        return blob, response.headers.get("Content-Type", "")
+            if response.status_code != 200:
+                raise ValueError(f"下载失败：HTTP {response.status_code}")
+            chunks, total = [], 0
+            limit = int(float(self.config.float_of("send", "max_file_mb", default=8) or 8)
+                        * 1024 * 1024)
+            for chunk in response.iter_content(65536):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > limit:
+                    response.close()
+                    raise ValueError(f"文件超过上限（{limit / 1048576:.1f} MB）")
+                chunks.append(chunk)
+            blob = b"".join(chunks)
+            if not blob:
+                raise ValueError("下载内容为空")
+            return blob, response.headers.get("Content-Type", "")
+        raise ValueError("重定向次数过多，已中止下载")
 
     def _key_lock(self, key: str) -> threading.Lock:
         """按去重键取一把锁（同一个 URL 同时被两条线程要下载时只下一次）。"""
