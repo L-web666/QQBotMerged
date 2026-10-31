@@ -34,6 +34,7 @@
   - DOM 会话列表：`node tests/dom_test_conversations.js`
   - DOM 消息渲染：`node tests/dom_test_messages.js`（40 项）
   - DOM 全局保护：`node tests/dom_test_globals.js`
+  - DOM 设置页：`node tests/dom_test_settings.js`（重复插入 / 事件只绑一次）
   - 测试分层说明：`tests/README.md`
   - 模拟注入：`python tests/simulate_message.py`
   - 插件安全自查：`python -m core.plugin_safety plugins`
@@ -242,6 +243,20 @@
 > 真实数据规模（群数/成员数/消息条数等）、实例环境的操作过程、截图来源。
 > 修复类问题用中性描述写"问题现象"（例如「正文含 @ 某人时不会自动切到 Markdown」），
 > 不引用任何人的原话。只保留"修复后行为正确"这类可验证的结论。
+
+- 2026-10-31：**修「设置页点一次『添加机器人』会插入多个编辑框」**：
+  - **问题现象**：在设置页点一次「＋ 添加机器人」，会出现 2 个甚至更多个机器人编辑框。
+  - **根因**：`bindFormEvents()` 在**每次 `render()` 时都会被调用**，而 `#settingsForm`
+    这个元素本身不会被替换（`render()` 只改它的 `innerHTML`）。在同一个元素上反复
+    `addEventListener('click', ...)` 会**累积监听器**：渲染 N 次后点一次就插入 N 个编辑框。
+    （`settings.js` 里 `render()` 至少被调用 3 处：初次加载、重新加载、搜索框输入防抖。）
+  - **改法**：`bindFormEvents()` 用 `data-events-bound` 标记做成"只绑定一次"，
+    重绘只换内容、不再重复挂事件。同一个函数里的 `change` 监听器一并受这个判断保护。
+  - **怎么验证**：新增 `tests/dom_test_settings.js`（5 项），用能记录监听器的 DOM 桩断言
+    "渲染 5 次后 click 监听器仍为 1 个""点一次只插入 1 个编辑框""反复渲染后仍只插 1 个"。
+    **回退修复后该测试会红**（实测：监听器 5 个、点一次插入 5 个、反复渲染后插入 8 个），
+    与线上现象一致。全套回归：`test_offline` 576 项、`check_frontend`、12 个单元测试、
+    4 个 DOM、单实例锁全绿。
 
 - 2026-10-31：**移除程序版本号 + 修复分发状态跨线程串扰 + 沙箱补丁加线程作用域**：
   - **移除版本号**：`core/__init__.py` 的 `__version__` 已删除（程序不再维护版本号）；

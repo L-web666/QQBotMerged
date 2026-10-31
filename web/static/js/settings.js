@@ -290,6 +290,13 @@
 
   function bindFormEvents() {
     var form = U.el('settingsForm');
+    /* **只绑定一次**（审计修复）：
+       render() 每次都会调用本函数，而 #settingsForm 这个元素本身不会被替换
+       （只改它的 innerHTML），所以在它上面反复 addEventListener 会**累积监听器**：
+       渲染 N 次后点一次"添加机器人"就会插入 N 个编辑框，真正的根因不是按钮坏了。
+       用 data 标记判断"已绑定"，重绘只换内容、不再重复挂事件。 */
+    if (form.getAttribute('data-events-bound') === '1') return;
+    form.setAttribute('data-events-bound', '1');
     form.addEventListener('click', function (event) {
       var target = event.target;
       if (target.matches('[data-copyall]')) {
