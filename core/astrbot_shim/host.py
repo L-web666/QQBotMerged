@@ -86,15 +86,23 @@ class AstrBotHost:
         self.runtime = None
         self.bot = None
         self.loaded_hooks: List[Tuple[AstrBotPlugin, Callable]] = []
-        self._emit_sink: Optional[Callable[[List[Any]], None]] = None
-        self.stop = False
         # 当前正在处理哪条消息的机器人（线程内有效）。
         # 插件里 `context.get_using_provider()` 拿不到 bot_id 参数，只能靠宿主在
         # dispatch 时把"正在处理哪个机器人"放好，否则插件只能看到全局 AI 配置，
         # 而本程序的 AI 是**按机器人**配置的（密钥通常落在 bots[].overrides.ai）。
+        #
+        # **与本次分发相关的全部状态都必须放线程局部**：
+        # 每个机器人一条工作线程（`message_processor._worker_loop`），handler 又是异步的，
+        # 另一个机器人的线程完全可能在 A 的 handler 还没返回时就进入 dispatch()。
+        # 以前 `_emit_sink` / `_emit_used` / `stop` 是实例属性，会被并发 dispatch 覆盖，
+        # 于是 A 里的 `await event.send()` 可能按 B 的会话与账号发出（审计 NEW3-01）。
         self._current = threading.local()
         # 最近一次 dispatch 用的机器人（send_message 延迟执行时用它兜底，见 send_to_umo）
         self._last_dispatch_bot = ""
+        # 按目标记 (会话类型, openid) → bot_id：延迟发送时按目标回查，比"最近一次"可靠
+        # （审计 NEW3-03）。用普通 dict + 锁保护，因为要看得到别的线程 dispatche 过的记录。
+        self._target_bots: Dict[Tuple[str, str], str] = {}
+        self._target_lock = threading.Lock()
         self.astrbot_version = ASTRBOT_VERSION
         # 插件的 StarTools 数据目录跟随本程序的插件数据目录
         StarTools.set_resolver(self.data_dir_for)
@@ -103,6 +111,52 @@ class AstrBotHost:
     def current_bot_id(self) -> str:
         """正在处理的机器人 id（不在 dispatch 线程里时返回空串）。"""
         return str(getattr(self._current, "bot_id", "") or "")
+
+    # ------------------------------------------------------------------ 线程内的分发状态
+    # 下面三份状态原本是实例属性，会被并发 dispatch 互相覆盖（审计 NEW3-01）。
+    # 现在统一放在 `self._current`（threading.local）里，每个工作线程一份。
+    @property
+    def _emit_sink(self):
+        return getattr(self._current, "emit_sink", None)
+
+    @_emit_sink.setter
+    def _emit_sink(self, value):
+        self._current.emit_sink = value
+
+    @property
+    def _emit_used(self) -> bool:
+        return bool(getattr(self._current, "emit_used", False))
+
+    @_emit_used.setter
+    def _emit_used(self, value: bool):
+        self._current.emit_used = bool(value)
+
+    @property
+    def stop(self) -> bool:
+        """插件主动叫停本次分发（也必须是线程内的，否则一个机器人能停掉另一个）。"""
+        return bool(getattr(self._current, "stop", False))
+
+    @stop.setter
+    def stop(self, value: bool):
+        self._current.stop = bool(value)
+
+    def remember_target_bot(self, target_type: str, openid: str, bot_id: str) -> None:
+        """记住 `(会话类型, 目标 openid) → bot_id`，供延迟发送按目标回查。"""
+        if not openid or not bot_id:
+            return
+        key = (str(target_type or ""), str(openid))
+        with self._target_lock:
+            self._target_bots[key] = bot_id
+            # 简单上限，避免长期运行无限增长
+            if len(self._target_bots) > 2000:
+                for old in list(self._target_bots.keys())[:1000]:
+                    self._target_bots.pop(old, None)
+
+    def target_bot_id(self, target_type: str, openid: str) -> str:
+        """按目标查机器人（没有记录时返回空串）。"""
+        key = (str(target_type or ""), str(openid or ""))
+        with self._target_lock:
+            return str(self._target_bots.get(key) or "")
 
     # ------------------------------------------------------------------ 工具
     def _note(self, name: str, reason: str, level: str = "error"):
@@ -563,6 +617,12 @@ class AstrBotHost:
         # dispatch 返回之后才执行（线程局部已被清空），用它兜底。
         if self._current.bot_id:
             self._last_dispatch_bot = self._current.bot_id
+            # 按**目标**登记，供延迟发送回查（比"最近一次"可靠，见 NEW3-03）
+            is_group = (msg or {}).get("type") == "group"
+            target_openid = ((msg or {}).get("group_openid") if is_group
+                             else (msg or {}).get("user_openid")) or ""
+            self.remember_target_bot("group" if is_group else "private",
+                                     str(target_openid or ""), self._current.bot_id)
         if not self.plugins:
             return None
         self._emit_sink = sink
@@ -744,18 +804,19 @@ class AstrBotHost:
         # `current_bot_id` 是 dispatch 时按线程放好的，但**不总是可用**：
         # 插件把 `context.send_message` 的调用推迟到 dispatch 返回之后（例如存起来、
         # 在定时器/协程里再发），线程局部已经被清掉或被下一条消息覆盖。
-        # 这时先回退到"本次 dispatch 记录过的机器人"（_last_dispatch_bot），
-        # 只有**确实只有一个机器人**时才允许它兜底；有多个且无法确定时按
-        # "宁可失败也不发错号"处理（审计 2.1）。
+        # 回退顺序（审计 NEW3-03：原来无条件用"最近一次分发"，多机器人时会发错号）：
+        #   ① 线程局部（正在处理这条消息）
+        #   ② **按目标回查**：`(会话类型, openid)` 之前是哪个机器人处理的 —— 最可靠
+        #   ③ 只有一个启用的机器人时用它（不存在发错号的可能）
+        #   ④ 都不行 → 拒绝发送并告警（宁可失败也不发错号）
         bot_id = self.current_bot_id
         if not bot_id:
-            fallback = str(getattr(self, "_last_dispatch_bot", "") or "")
+            target_type = "group" if is_group else "private"
+            bot_id = self.target_bot_id(target_type, openid) or ""
+        if not bot_id:
             enabled = [bid for bid, bot in (getattr(runtime, "bots", {}) or {}).items()
                        if getattr(bot, "enabled", True)]
-            if fallback:
-                bot_id = fallback
-            elif len(enabled) == 1:
-                # 只有一个启用的机器人：不存在"发错号"的可能
+            if len(enabled) == 1:
                 bot_id = enabled[0]
             else:
                 self.log.warning(

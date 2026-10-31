@@ -1773,11 +1773,12 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         return jsonify({"success": False, "message": "action 需要是 test/sync/resume"}), 400
 
     def _version() -> str:
-        try:
-            from core import __version__
-            return __version__
-        except Exception:
-            return "1.0.0"
+        """程序版本（已不维护：`core/__init__.py` 里的 `__version__` 已移除）。
+
+        网页上不再显示版本；`/api/admin/status` 仍保留一个 `version` 字段只是为了
+        不破坏可能依赖它的外部脚本，值固定为占位符。
+        """
+        return ""
 
     # 把运行时与日志管理器注入（由 run.py 调用）
     def attach(rt, log_manager=None):

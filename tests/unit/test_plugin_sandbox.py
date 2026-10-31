@@ -178,6 +178,45 @@ def main():
             check("拦不在白名单的第三方包", blocked(lambda: __import__("numpy")), "")
             check("本地模块名在白名单里被识别",
                   "helpers" in box._local_modules(), str(box._local_modules()))
+
+        # ---------- 10. 线程作用域（审计 NEW3-02） ----------
+        print("\n[10] 沙箱只约束安装它的线程，宿主其它线程不受影响")
+        import threading
+        sibling = os.path.join(root, "sibling_dir")     # 与 plugin_dir 同前缀的兄弟目录
+        os.makedirs(sibling, exist_ok=True)
+        host_target = os.path.join(sibling, "host_own.txt")
+        cross = {}
+        with PluginSandbox("strict", plugin_dir, data_dir, "demo"):
+            # 安装线程：写目录外必须被拦
+            check("安装线程（插件）写目录外被拦",
+                  blocked(lambda: builtins.open(host_target, "w").write("x")), host_target)
+
+            # 无关线程：写宿主自己的文件必须放行
+            def other_thread():
+                try:
+                    handle = builtins.open(host_target, "w")
+                    handle.write("host")
+                    handle.close()
+                    cross["ok"] = True
+                except SandboxViolation as exc:
+                    cross["blocked"] = str(exc)
+
+            worker = threading.Thread(target=other_thread)
+            worker.start()
+            worker.join(timeout=10)
+            check("无关线程写宿主文件不受沙箱影响", cross.get("ok") is True,
+                  str(cross.get("blocked", ""))[:100])
+
+        # ---------- 11. 目录边界判断（不能靠字符串前缀） ----------
+        print("\n[11] 路径判断按目录边界，不能被同前缀的兄弟目录骗过")
+        box = PluginSandbox("strict", plugin_dir, data_dir, "demo")
+        check("插件目录内放行", box._path_allowed(os.path.join(plugin_dir, "a.txt")) is True, "")
+        check("数据目录内放行", box._path_allowed(os.path.join(data_dir, "b.txt")) is True, "")
+        check("同前缀兄弟目录不被误判为插件目录",
+              box._path_allowed(os.path.join(sibling, "c.txt")) is False, sibling)
+        check("prefix 伪造（plugin 后面接别的名字）被拒",
+              box._path_allowed(plugin_dir + "_evil/x.txt") is False, "")
+        check("目录本身放行", box._path_allowed(plugin_dir) is True, "")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

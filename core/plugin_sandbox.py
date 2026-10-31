@@ -24,6 +24,7 @@ import builtins
 import logging
 import os
 import sys
+import threading
 from typing import Any, Dict, Iterable, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -116,7 +117,18 @@ class SandboxViolation(PermissionError):
 
 
 class PluginSandbox:
-    """按插件目录生效的软限制（只影响该插件，不会污染其它插件的导入）。
+    """按插件目录生效的软限制。
+
+    **作用域（重要）**：补丁装在进程全局的 `builtins` / `os` / `socket` 上，但
+    **只对安装它的那条线程生效** —— 每个 guarded 入口先判 `_in_scope()`，
+    非本线程直接调用原函数。因此：
+      · 插件自己的执行线程受约束；
+      · 宿主的其它线程（网页请求、日志落盘、云同步、群名刷新…）**不受影响**。
+    （早期版本没有线程作用域，strict 档会把宿主自己的后台线程一起拦住、
+    还把违规记到插件名下；这是审计 NEW3-02 指出的问题，现已修复。）
+
+    仍未覆盖的边界：**非 LIFO 的嵌套退出**（后装者先退会把全局函数恢复成原始值，
+    此时先装者虽然"仍在沙箱内"却已无约束）。多机器人并发 + strict 下请谨慎。
 
     用法（`AstrBotHost.load()` 内）::
 
@@ -138,6 +150,7 @@ class PluginSandbox:
         self.violations: list = []
         self._saved: Dict[str, Any] = {}
         self._active = False
+        self._thread_id: Optional[int] = None
 
     # ------------------------------------------------------------------ 上下文管理
     def __enter__(self):
@@ -153,6 +166,11 @@ class PluginSandbox:
     # ------------------------------------------------------------------ 安装/卸载
     def _install(self):
         self._active = True
+        # **线程作用域**：补丁装在进程全局的 builtins / os / socket 上，但只对
+        # "安装它的这条线程"生效。否则插件执行期间，宿主自己的其它线程
+        # （网页请求、日志落盘、云同步、群名刷新…）也会被拦，甚至把违规记到插件名下
+        # （审计 NEW3-02，已实测复现）。
+        self._thread_id = threading.get_ident()
         try:
             if self.mode == "strict":
                 self._save("__import__", builtins.__import__)
@@ -164,6 +182,14 @@ class PluginSandbox:
         except Exception as exc:      # 打补丁失败不能把插件加载搞崩
             self._active = False
             self.log.warning("[沙箱] 安装失败（按不限制处理）：%s", exc)
+
+    def _in_scope(self) -> bool:
+        """当前线程是不是"安装这个沙箱"的那条线程。
+
+        非本线程 → 沙箱不生效（直接走原函数），这样宿主其它后台线程不受影响。
+        """
+        return (self._active
+                and getattr(self._thread_id, "real", self._thread_id) == threading.get_ident())
 
     def _save(self, key: str, value: Any):
         self._saved.setdefault(key, value)
@@ -260,27 +286,47 @@ class PluginSandbox:
         return names
 
     def _guarded_import(self, name, globals=None, locals=None, fromlist=(), level=0):
+        original = self._saved["__import__"]
+        # 非安装线程一律走原函数（沙箱只约束插件自己那条线程）
+        if not self._in_scope():
+            return original(name, globals, locals, fromlist, level)
         # level > 0 是**相对导入**（如 json 包内部 `from . import decoder`），
         # 模块名不带包前缀，无法按白名单判断；这类导入来自已被允许的包内部，
         # 其顶层包已经过检查，因此直接放行（否则几乎所有标准库包都会被打断）。
         if level and level > 0:
-            return self._saved["__import__"](name, globals, locals, fromlist, level)
+            return original(name, globals, locals, fromlist, level)
         if not self._module_allowed(name):
             self._violate("导入模块", name)
-        return self._saved["__import__"](name, globals, locals, fromlist, level)
+        return original(name, globals, locals, fromlist, level)
 
     # ------------------------------------------------------------------ 文件限制
+    @staticmethod
+    def _inside(path: str, root: str) -> bool:
+        """`path` 是否真的位于目录 `root` 之内（按目录边界判断）。
+
+        **不能用 `path.startswith(root)`**：那是字符串前缀比较，
+        `/a/plugin_evil/x` 会命中 `/a/plugin`，兄弟目录因此被误判为"在插件目录内"，
+        写文件限制形同虚设（这个问题在本轮自测时才发现）。
+        """
+        if not root:
+            return False
+        try:
+            path_real = os.path.normcase(os.path.realpath(path))
+            root_real = os.path.normcase(os.path.realpath(root))
+        except (OSError, ValueError):
+            return False
+        if path_real == root_real:
+            return True
+        return path_real.startswith(root_real.rstrip(os.sep) + os.sep)
+
     def _path_allowed(self, path: Any) -> bool:
         try:
             text = os.path.abspath(os.fspath(path))
         except (TypeError, ValueError):
             return True          # 文件对象/描述符之类，交给原生逻辑
-        text_parts = (text, os.path.realpath(text))
-        for candidate in text_parts:
-            if candidate.startswith(self.data_dir):
+        for root in (self.data_dir, self.plugin_dir):
+            if self._inside(text, root):
                 return True
-            if candidate.startswith(self.plugin_dir):
-                return True      # 读自己插件目录（配置、资源）是正常需求
         return False
 
     def _patch_builtin_open(self):
@@ -290,6 +336,9 @@ class PluginSandbox:
         sandbox = self
 
         def guarded_open(file, mode="r", *args, **kwargs):
+            # 非安装线程直接走原函数：宿主的日志落盘/云同步/群名刷新等不能被插件沙箱影响
+            if not sandbox._in_scope():
+                return original_open(file, mode, *args, **kwargs)
             writing = any(flag in str(mode) for flag in ("w", "a", "x", "+"))
             if not sandbox._path_allowed(file) and writing:
                 sandbox._violate("写文件", str(file))
@@ -308,8 +357,11 @@ class PluginSandbox:
     def _patch_process(self):
         sandbox = self
 
-        def blocked(name):
+        def blocked(name, original):
             def _blocked(*args, **kwargs):
+                # 非安装线程：宿主自己调 os.system 不受插件沙箱约束
+                if not sandbox._in_scope():
+                    return original(*args, **kwargs)
                 sandbox._violate("执行系统命令/启动进程", f"{name}{args[:1]}")
             return _blocked
 
@@ -317,7 +369,7 @@ class PluginSandbox:
             func = getattr(os, attr, None)
             if callable(func):
                 self._save("os." + attr, func)
-                setattr(os, attr, blocked("os." + attr))
+                setattr(os, attr, blocked("os." + attr, func))
 
     # ------------------------------------------------------------------ 网络限制
     def _patch_network(self):
@@ -335,6 +387,8 @@ class PluginSandbox:
         original_connect_ex = getattr(_socket.socket, "connect_ex", None)
 
         def guarded_connect(self_sock, address, *args, **kwargs):
+            if not sandbox._in_scope():
+                return original_connect(self_sock, address, *args, **kwargs)
             host = host_of(address)
             if host and not host_allowed(host):
                 sandbox._violate("连接外部主机", host)
@@ -345,6 +399,8 @@ class PluginSandbox:
 
         if original_connect_ex is not None:
             def guarded_connect_ex(self_sock, address, *args, **kwargs):
+                if not sandbox._in_scope():
+                    return original_connect_ex(self_sock, address, *args, **kwargs)
                 host = host_of(address)
                 if host and not host_allowed(host):
                     sandbox._violate("连接外部主机", host)
@@ -358,6 +414,8 @@ class PluginSandbox:
         original_getaddrinfo = _socket.getaddrinfo
 
         def guarded_getaddrinfo(host, port, *args, **kwargs):
+            if not sandbox._in_scope():
+                return original_getaddrinfo(host, port, *args, **kwargs)
             if host and not host_allowed(str(host)):
                 sandbox._violate("解析外部域名", str(host))
             return original_getaddrinfo(host, port, *args, **kwargs)

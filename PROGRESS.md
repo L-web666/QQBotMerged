@@ -16,7 +16,7 @@
 
 ## 当前状态
 
-- 程序版本：1.0.0（见 `core/__init__.py`）
+- 程序版本：**不维护版本号**（`core/__init__.py` 里的 `__version__` 已移除；网页也不显示版本）
 - 启动命令：
   - 正常：`python run.py`
   - 自检：`python run.py --check`
@@ -27,7 +27,8 @@
   - 单元：`python tests/unit/test_markdown_send.py`、`test_at_mentions.py`、`test_cmd_tags.py`、
     `test_plugin_safety.py`、`test_cloud_secrets.py`、`test_media_dedup.py`、`test_ai_scope.py`、
     `test_member_role.py`（含身份解析 / gateway 解析 / 历史补齐）、`test_security_fixes.py`（审计回归）、
-    `test_csp_boot.py`（CSP 与前端启动数据）、`test_plugin_sandbox.py`（插件软限制）
+    `test_csp_boot.py`（CSP 与前端启动数据）、`test_plugin_sandbox.py`（插件软限制）、
+    `test_dispatch_isolation.py`（插件分发状态线程隔离）
   - 单实例锁：`python tests/test_instance_lock.py`
   - 前端契约：`python tests/check_frontend.py`
   - DOM 会话列表：`node tests/dom_test_conversations.js`
@@ -241,6 +242,34 @@
 > 真实数据规模（群数/成员数/消息条数等）、实例环境的操作过程、截图来源。
 > 修复类问题用中性描述写"问题现象"（例如「正文含 @ 某人时不会自动切到 Markdown」），
 > 不引用任何人的原话。只保留"修复后行为正确"这类可验证的结论。
+
+- 2026-10-31：**移除程序版本号 + 修复分发状态跨线程串扰 + 沙箱补丁加线程作用域**：
+  - **移除版本号**：`core/__init__.py` 的 `__version__` 已删除（程序不再维护版本号）；
+    `web/server.py` 的 `_version()` 改为返回空串，`/api/admin/status` 仍保留 `version` 字段
+    以兼容外部脚本。网页此前已不再显示版本。
+  - **NEW3-01 分发状态跨线程串扰**：`_emit_sink` / `_emit_used` / `stop` 原为实例属性，
+    而每个机器人一条工作线程、handler 又是异步的，两个机器人并发 `dispatch()` 会互相覆盖，
+    导致 A 的 `await event.send()` 按 B 的会话与账号发出。
+    改法：三者全部迁入已有的 `self._current`（`threading.local()`），改用属性读写器代理，
+    调用点无需改动。
+  - **NEW3-02 沙箱补丁是进程级的**：补丁装在全局 `builtins` / `os` / `socket` 上且无锁、
+    无线程作用域，插件执行期间宿主自己的其它线程（网页请求、日志落盘、云同步、群名刷新）
+    也会被拦，违规还会记到插件名下。改法：安装时记录 `threading.get_ident()`，
+    每个 guarded 入口先判 `_in_scope()`，非本线程直接调用原函数。
+    同步修正了与实现不符的 docstring，并在配置项提示里写明"补丁只对插件自己的线程生效"。
+  - **NEW3-03 兜底顺序与注释不一致**：`send_to_umo` 原来无条件采用"最近一次分发"的机器人，
+    多机器人时会发错号。改为按目标回查：新增 `(会话类型, openid) → bot_id` 映射
+    （`remember_target_bot` / `target_bot_id`，带回滚上限），回退顺序为
+    线程局部 → 按目标回查 → 只有一个启用机器人时用它 → 否则拒绝发送并告警。
+  - **自测中发现并修复的沙箱真实漏洞**：`_path_allowed` 用 `path.startswith(root)` 做字符串
+    前缀比较，`.../plugin` 会把 `.../plugin_evil/x` 误判为"在插件目录内"，
+    写文件限制形同虚设。改为按**目录边界**判断（`_inside()`，比较规范化后的
+    realpath，要求以 `根 + 分隔符` 开头），并补了兄弟目录、前缀伪造两类断言。
+  - **怎么验证**：新增 `tests/unit/test_dispatch_isolation.py`（14 项：状态在线程局部、
+    双线程 sink 不串、按目标回查、目标表上限）；`tests/unit/test_plugin_sandbox.py` 扩到
+    **48 项**（新增线程作用域与目录边界两组）。**两条新测试都回退验证过会红**。
+    全套回归：`test_offline` 576 项、`check_frontend`、12 个单元测试、3 个 DOM、
+    单实例锁全绿。
 
 - 2026-10-31：**修复 CSP 拦死自身启动脚本（P0 回归）+ 脱敏规则统一 + 插件进程内软限制**：
   - **P0 CSP 回归**：上一轮为防 XSS 加的 `script-src 'self'`（无 `'unsafe-inline'`、无 nonce）
