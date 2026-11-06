@@ -119,13 +119,24 @@ class SandboxViolation(PermissionError):
 class PluginSandbox:
     """按插件目录生效的软限制。
 
-    **作用域（重要）**：补丁装在进程全局的 `builtins` / `os` / `socket` 上，但
+    **作用域（必读）**：补丁装在进程全局的 `builtins` / `os` / `socket` 上，但
     **只对安装它的那条线程生效** —— 每个 guarded 入口先判 `_in_scope()`，
     非本线程直接调用原函数。因此：
-      · 插件自己的执行线程受约束；
+      · 插件在**宿主调用线程内**的执行受约束；
       · 宿主的其它线程（网页请求、日志落盘、云同步、群名刷新…）**不受影响**。
-    （早期版本没有线程作用域，strict 档会把宿主自己的后台线程一起拦住、
-    还把违规记到插件名下；这是审计 NEW3-02 指出的问题，现已修复。）
+
+    **两个必须知道的边界（审计 NEW4-01 / NEW4-02）**：
+
+    1. **插件自建线程不受约束**。插件自己 `threading.Thread(...)` 起的线程不属于
+       "安装线程"，所有 guarded 入口对它直接放行。也就是说默认 `loose` 档下，
+       一行 `threading.Thread` 就能绕开"拦执行系统命令"这道唯一的防线。
+       这不是 bug 而是线程作用域的必然代价（没有它，宿主自己的后台线程会被误伤，
+       那是更严重的问题）。因此：**不要把这层软限制当成安全边界**；
+       真要跑不可信插件，只能用独立进程 + 低权限账户。
+    2. **安装失败会明说，且已回滚**。早期版本安装中途失败时 `_active=False`，
+       `__exit__` 便不再还原，导致补丁永久残留；而且界面上看不出"防护没生效"。
+       现在安装是**原子**的（失败即回滚已打补丁），并提供 `effective` /
+       `status_note()` 供界面显示"沙箱未生效"。
 
     仍未覆盖的边界：**非 LIFO 的嵌套退出**（后装者先退会把全局函数恢复成原始值，
     此时先装者虽然"仍在沙箱内"却已无约束）。多机器人并发 + strict 下请谨慎。
@@ -151,6 +162,10 @@ class PluginSandbox:
         self._saved: Dict[str, Any] = {}
         self._active = False
         self._thread_id: Optional[int] = None
+        # 安装是否成功：`_active` 表示"当前是否在沙箱内"，`installed` 表示"补丁是否装上了"。
+        # 两者分开是为了让"装了但后来退出"与"根本没装上"能被区分开（见 status_note）。
+        self.installed = False
+        self.install_error = ""
 
     # ------------------------------------------------------------------ 上下文管理
     def __enter__(self):
@@ -159,13 +174,19 @@ class PluginSandbox:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self._active:
-            self._uninstall()
+        # **无论安装成功与否都尝试还原**：以前是 `if self._active: self._uninstall()`，
+        # 安装中途失败时 `_active` 已经是 False，于是已打上的补丁**永久残留**在进程里
+        # （后续沙箱会把包装函数当成 original 保存，嵌套层数越积越多）。
+        self._active = False
+        self._uninstall()
         return False    # 不吞异常
 
     # ------------------------------------------------------------------ 安装/卸载
     def _install(self):
+        """安装补丁。**原子**：任一步失败就回滚已打的补丁，不留半装状态。"""
         self._active = True
+        self.installed = False
+        self.install_error = ""
         # **线程作用域**：补丁装在进程全局的 builtins / os / socket 上，但只对
         # "安装它的这条线程"生效。否则插件执行期间，宿主自己的其它线程
         # （网页请求、日志落盘、云同步、群名刷新…）也会被拦，甚至把违规记到插件名下
@@ -179,9 +200,32 @@ class PluginSandbox:
                 self._patch_network()
             # loose / strict 都拦：执行系统命令、起子进程
             self._patch_process()
+            self.installed = True
         except Exception as exc:      # 打补丁失败不能把插件加载搞崩
             self._active = False
-            self.log.warning("[沙箱] 安装失败（按不限制处理）：%s", exc)
+            self.installed = False
+            self.install_error = f"{type(exc).__name__}: {exc}"
+            # 回滚：把已经打上的补丁还原，避免半装状态污染进程
+            try:
+                self._uninstall()
+            except Exception as rollback_exc:
+                self.log.warning("[沙箱] 安装失败后回滚也失败：%s", rollback_exc)
+            # 失败必须是**可见状态**：防护没生效却看起来一切正常，是最危险的失效模式
+            self.log.error("[沙箱][%s] 安装失败，当前**不受限制**运行（%s）：%s",
+                           self.plugin_name, self.mode, self.install_error)
+
+    @property
+    def effective(self) -> bool:
+        """沙箱是否真的在起作用（用于插件页/诊断展示）。"""
+        return self.installed and self.mode != "off"
+
+    def status_note(self) -> str:
+        """给界面看的一句话状态说明。"""
+        if self.mode == "off":
+            return "沙箱已关闭（off）"
+        if self.installed:
+            return f"沙箱生效（{self.mode}）"
+        return f"沙箱**未生效**（安装失败：{self.install_error or '未知原因'}）"
 
     def _in_scope(self) -> bool:
         """当前线程是不是"安装这个沙箱"的那条线程。
@@ -208,22 +252,37 @@ class PluginSandbox:
 
         用「模块名.属性名」登记，恢复逻辑统一按 key 解析，避免每加一个补丁点
         就要记得在这里补一条 elif（漏一条就会把包装函数留在宿主里，污染其它插件）。
+
+        **安全点**：如果 `_saved` 里记的值本身是"我们的包装函数"（说明上一次安装失败时
+        没还原干净、把包装当成了 original），那就不能把它装回去，否则会把残留固化下来。
+        这种情况直接跳过并告警，宁可留一次告警也不要污染进程。
         """
         self._active = False
-        import io as _io
-        import socket as _socket
+        try:
+            import io as _io
+            import socket as _socket
+        except Exception:      # 极端情况下标准库不可用，跳过还原（下面的 finally 仍会清空）
+            _io = _socket = None
 
         targets = {
             "__import__": (builtins, "__import__"),
             "open": (builtins, "open"),
-            "io.open": (_io, "open"),
-            "socket.socket.connect": (_socket.socket, "connect"),
-            "socket.socket.connect_ex": (_socket.socket, "connect_ex"),
+            "socket.socket.connect": (_socket.socket if _socket else None, "connect"),
+            "socket.socket.connect_ex": (_socket.socket if _socket else None, "connect_ex"),
             "socket.getaddrinfo": (_socket, "getaddrinfo"),
         }
+        if _io is not None:
+            targets["io.open"] = (_io, "open")
+
         for key, value in list(self._saved.items()):
+            if self._looks_wrapped(value):
+                self.log.warning("[沙箱][%s] 还原跳过 %s：保存的 original 本身是沙箱包装函数，"
+                                 "可能是上次安装失败残留", self.plugin_name, key)
+                continue
             if key in targets:
                 target, attr = targets[key]
+                if target is None:
+                    continue
                 try:
                     setattr(target, attr, value)
                 except Exception:
@@ -234,6 +293,13 @@ class PluginSandbox:
                 except Exception:
                     pass
         self._saved.clear()
+
+    @staticmethod
+    def _looks_wrapped(func: Any) -> bool:
+        """判断保存的"原函数"是不是我们自己的包装函数（用于避免把残留固化）。"""
+        name = getattr(func, "__name__", "")
+        return name in ("guarded_open", "_guarded_import", "_blocked",
+                        "guarded_connect", "guarded_connect_ex", "guarded_getaddrinfo")
 
     # ------------------------------------------------------------------ 记录
     def _violate(self, what: str, detail: str = ""):

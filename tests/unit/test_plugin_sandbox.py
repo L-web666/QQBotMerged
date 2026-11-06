@@ -217,6 +217,48 @@ def main():
         check("prefix 伪造（plugin 后面接别的名字）被拒",
               box._path_allowed(plugin_dir + "_evil/x.txt") is False, "")
         check("目录本身放行", box._path_allowed(plugin_dir) is True, "")
+
+        # ---------- 12. 安装失败必须原子回滚（审计 NEW4-02） ----------
+        print("\n[12] 安装中途失败：回滚已打补丁 + 状态可见")
+        before_open = builtins.open
+        broken = PluginSandbox("strict", plugin_dir, data_dir, "demo")
+
+        def _boom():
+            raise RuntimeError("模拟补丁失败")
+
+        broken._patch_network = _boom      # 让第二个补丁失败
+        broken.__enter__()
+        check("安装失败时 _active=False", broken._active is False, str(broken._active))
+        check("安装失败时 installed=False", broken.installed is False, str(broken.installed))
+        check("记录了下失败原因", bool(broken.install_error), broken.install_error)
+        check("失败后已打的补丁被回滚（open 仍是内置）",
+              builtins.open is before_open, builtins.open.__name__)
+        broken.__exit__(None, None, None)
+        check("退出后仍然是内置 open", builtins.open is before_open, builtins.open.__name__)
+        note = broken.status_note()
+        check("status_note 明确说未生效", "未生效" in note, note)
+
+        # ---------- 13. 正常安装：状态可见且能还原 ----------
+        print("\n[13] 正常安装：effective=True，退出后还原")
+        good = PluginSandbox("strict", plugin_dir, data_dir, "demo")
+        before_good = builtins.open
+        good.__enter__()
+        check("installed=True", good.installed is True, "")
+        check("effective=True", good.effective is True, "")
+        check("status_note 说已生效", "生效" in good.status_note(), good.status_note())
+        inside_name = builtins.open.__name__
+        good.__exit__(None, None, None)
+        check("安装期 open 被包装", inside_name == "guarded_open", inside_name)
+        check("退出后已还原", builtins.open is before_good, builtins.open.__name__)
+
+        # ---------- 14. off 档不谎报生效 ----------
+        print("\n[14] off 档：不安装、也不谎报生效")
+        off_box = PluginSandbox("off", plugin_dir, data_dir, "demo")
+        off_box.__enter__()
+        check("off 档 effective=False", off_box.effective is False, "")
+        check("off 档 status_note 说明已关闭",
+              "关闭" in off_box.status_note(), off_box.status_note())
+        off_box.__exit__(None, None, None)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

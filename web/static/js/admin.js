@@ -294,6 +294,22 @@
     if (diag.discovered && diag.discovered.length) {
       parts.push('扫描到 ' + diag.discovered.length + ' 个候选文件');
     }
+    // 沙箱状态：档位 + 边界说明。安装失败或关闭时必须显式提示，
+    // 避免"防护没生效但界面看起来一切正常"。
+    var sandbox = diag.sandbox || {};
+    if (sandbox.mode) {
+      var sandboxText = U.esc(sandbox.note || ('沙箱档位：' + sandbox.mode));
+      if (sandbox.mode === 'off') {
+        parts.push('<span class="warn-text">🔓 ' + sandboxText + '</span>');
+      } else if (sandbox.effective) {
+        parts.push('<span class="ok-text">🛡️ ' + sandboxText + '</span>');
+      } else {
+        parts.push('<span class="warn-text">⚠️ ' + sandboxText + '</span>');
+      }
+      if (sandbox.boundary) {
+        parts.push('<span class="tiny">' + U.esc(sandbox.boundary) + '</span>');
+      }
+    }
     U.el('pluginsDir').innerHTML = parts.join(' · ') +
       '<div class="tiny" style="margin-top:4px">本程序只支持 <b>AstrBot 官方插件格式</b>：' +
       '把插件目录放进 <code>plugins/</code>（目录里要有 <code>metadata.yaml</code> 与 ' +

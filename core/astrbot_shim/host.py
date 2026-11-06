@@ -97,8 +97,6 @@ class AstrBotHost:
         # 以前 `_emit_sink` / `_emit_used` / `stop` 是实例属性，会被并发 dispatch 覆盖，
         # 于是 A 里的 `await event.send()` 可能按 B 的会话与账号发出（审计 NEW3-01）。
         self._current = threading.local()
-        # 最近一次 dispatch 用的机器人（send_message 延迟执行时用它兜底，见 send_to_umo）
-        self._last_dispatch_bot = ""
         # 按目标记 (会话类型, openid) → bot_id：延迟发送时按目标回查，比"最近一次"可靠
         # （审计 NEW3-03）。用普通 dict + 锁保护，因为要看得到别的线程 dispatche 过的记录。
         self._target_bots: Dict[Tuple[str, str], str] = {}
@@ -613,11 +611,8 @@ class AstrBotHost:
         # 供插件侧 `context.get_using_provider()` 取到"当前机器人"的 AI 配置；
         # 用线程局部而不是实例属性：多个机器人各自一条线程在跑，实例属性会串。
         self._current.bot_id = str((msg or {}).get("bot_id") or "")
-        # 同时留一份"最近一次分发用的机器人"：插件的 send_message 可能在
-        # dispatch 返回之后才执行（线程局部已被清空），用它兜底。
+        # 按**目标**登记，供延迟发送回查（比"最近一次"可靠，见 NEW3-03）
         if self._current.bot_id:
-            self._last_dispatch_bot = self._current.bot_id
-            # 按**目标**登记，供延迟发送回查（比"最近一次"可靠，见 NEW3-03）
             is_group = (msg or {}).get("type") == "group"
             target_openid = ((msg or {}).get("group_openid") if is_group
                              else (msg or {}).get("user_openid")) or ""

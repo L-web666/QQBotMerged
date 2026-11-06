@@ -244,6 +244,33 @@
 > 修复类问题用中性描述写"问题现象"（例如「正文含 @ 某人时不会自动切到 Markdown」），
 > 不引用任何人的原话。只保留"修复后行为正确"这类可验证的结论。
 
+- 2026-11-07：**沙箱安装失败改为原子回滚 + 显式状态；补齐"自建线程不受约束"的说明**：
+  - **NEW4-02 安装失败不再留残留**：`_install()` 原为"边装边设 `_active`"，
+    任一步失败即 `_active=False`，而 `__exit__` 是 `if self._active: self._uninstall()` ——
+    于是**已打上的补丁永久残留**在进程里（后续沙箱会把包装函数当成 original 保存，
+    嵌套层数越积越多），且界面上看不出"防护没生效"。
+    改法：`_install()` 变成**原子操作**（失败即回滚已打补丁），`__exit__` **无条件**尝试还原；
+    新增 `installed` / `install_error` / `effective` / `status_note()`，安装失败用 `log.error`
+    明确报出；`_uninstall()` 增加 `_looks_wrapped()` 防御，若保存的 original 本身是沙箱包装函数
+    则跳过还原并告警，避免把历史残留固化。
+  - **安装失败在插件页可见**：`PluginManager.diagnostics()` 新增 `sandbox` 字段
+    （档位、是否生效、边界说明），插件页顶部按 `off` / 生效 / 未生效三种状态显示。
+  - **NEW4-01 边界写进文档**：沙箱的线程作用域意味着**插件自建线程不受任何约束**
+    （默认 `loose` 档的唯一防线"拦执行系统命令"可被一行 `threading.Thread` 绕过）。
+    这不是 bug 而是取舍——没有线程作用域时宿主的后台线程会被误伤（NEW3-02）。
+    已在 `plugin_sandbox.py` 的类 docstring、`plugins.sandbox` 配置项提示、以及插件页
+    的沙箱状态说明里都写明"**不要把它当安全边界**"。
+  - **删除死代码**：`_last_dispatch_bot` 自改为按目标回查后只写不读，已移除。
+  - **核查结论（无需修改）**：报告推测 NEW4-02 的触发条件是"`_patch_network` 里的
+    `import socket` 连锁导入 `selectors` 被拦"。实测 `socket` 在白名单内，且
+    `import socket` **不会**导入 `selectors`（干净进程验证），三条路径（正常 / 清掉
+    socket 相关模块 / loose 档）安装均成功。但"安装失败不还原"这个缺陷本身是真的，
+    已按上面的原子化修复。
+  - **怎么验证**：`tests/unit/test_plugin_sandbox.py` 扩到 **61 项**（新增 [12] 安装失败
+    回滚、[13] 正常安装状态、[14] off 档不谎报）。**回退修复后该测试会红**
+    （实测 3 项失败，`open` 停留在 `guarded_open`）。全套回归：`test_offline` 576 项、
+    `check_frontend`、12 个单元测试、4 个 DOM、单实例锁全绿。
+
 - 2026-10-31：**修「设置页点一次『添加机器人』会插入多个编辑框」**：
   - **问题现象**：在设置页点一次「＋ 添加机器人」，会出现 2 个甚至更多个机器人编辑框。
   - **根因**：`bindFormEvents()` 在**每次 `render()` 时都会被调用**，而 `#settingsForm`

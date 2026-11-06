@@ -263,7 +263,28 @@ class PluginManager:
                                    for item in (info.get("unsupported") or [])}),
             # 插件安全扫描汇总（high/medium/info 各几条），插件页用来做整体提示
             "safety": self._safety_summary(),
+            # 沙箱状态：档位 + 是否真的生效（安装失败必须让用户看见，见审计 NEW4-02）
+            "sandbox": self._sandbox_status(),
         }
+
+    def _sandbox_status(self) -> Dict[str, Any]:
+        """当前插件沙箱状态（插件页用来显示"是否生效"与边界说明）。"""
+        try:
+            from core import plugin_sandbox
+            runtime = getattr(self.bot, "_runtime", None)
+            config = getattr(runtime, "config", None)
+            mode = (plugin_sandbox.sandbox_config(config) if config is not None
+                    else "loose")
+            note = {
+                "off": "沙箱已关闭（off）：插件以完整权限运行",
+                "loose": "沙箱生效（loose）：只拦执行系统命令/起子进程",
+                "strict": "沙箱生效（strict）：导入白名单 + 写入范围 + 联网域名限制",
+            }.get(mode, mode)
+            return {"mode": mode, "effective": mode != "off", "note": note,
+                    "boundary": "插件自行创建的线程不受任何约束，不要把它当安全边界"}
+        except Exception as exc:
+            self.log.debug("读取沙箱状态失败: %s", exc)
+            return {"mode": "", "effective": False, "note": "沙箱状态不可用", "boundary": ""}
 
     def _safety_summary(self) -> Dict[str, Any]:
         """把所有插件的安全扫描结果汇总成一份（给插件页顶部提示用）。"""
