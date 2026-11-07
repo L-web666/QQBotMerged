@@ -30,6 +30,8 @@ from core import config_schema as schema
 from core import media_store as media_module
 from core.ai_client import redact_text as _ai_redact_text
 from core import paths
+from core import updater as updater_module
+from core import version as version_module
 from core.cloud_sync import SYNC_PATHS
 from core.storage import conversation_key, conv_key_for
 
@@ -161,6 +163,23 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         response.headers.setdefault("X-Frame-Options", "DENY")
         return response
 
+    # ================================================================== 自动更新
+    updater_slot: Dict[str, Any] = {}
+
+    def _updater() -> "updater_module.Updater":
+        """整个 app 共用一个更新器（进度状态机在里面，不能每次新建）。"""
+        instance = updater_slot.get("instance")
+        if instance is None:
+            minutes = config_manager.config.int_of(
+                "update", "check_interval_minutes", default=30)
+            updater_module.CACHE_MINUTES = max(1, int(minutes or 30))
+            instance = updater_module.Updater(logger_obj=logger)
+            updater_slot["instance"] = instance
+        return instance
+
+    def _update_enabled() -> bool:
+        return bool(config_manager.config.bool_of("update", "enabled", default=True))
+
     def boot_payload() -> Dict[str, Any]:
         """注入页面的启动数据（主题、动画、轮询间隔等）。"""
         cfg = config_manager.config
@@ -181,6 +200,19 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
                 "page_size": cfg.int_of("web", "page_size", default=200),
             },
             "auth_required": bool(secret.get("token")),
+            # 版本号：页面顶栏/关于页/运行状态页都从这里取，避免各处写死
+            "version": version_module.__version__,
+            "version_display": "v" + version_module.__version__,
+            "repo": version_module.REPO_SLUG,
+            "repo_url": version_module.REPO_URL,
+            # 更新：这里**不联网**，只把缓存里的检查结果带给页面（首屏不能卡在网络）
+            "update": {
+                "enabled": cfg.bool_of("update", "enabled", default=True),
+                "check_on_start": cfg.bool_of("update", "check_on_start", default=True),
+                "auto_install": cfg.bool_of("update", "auto_install", default=False),
+                "pending_restart": bool(_updater().pending_restart()),
+                "last_install": _updater().last_install(),
+            },
         }
 
     # ================================================================== 页面
@@ -1402,6 +1434,76 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
                             "count": rt.store.group_name_suspects()})
         return jsonify({"success": False, "message": "未知的维护操作"}), 400
 
+    # ================================================================== 自动更新
+    @app.route("/api/admin/update/status")
+    def admin_update_status():
+        """当前版本 + 更新进度（前端轮询这个接口画进度条）。"""
+        blocked = check_token()
+        if blocked:
+            return blocked
+        info = _updater().status()
+        info["enabled"] = _update_enabled()
+        return jsonify({"success": True, **info})
+
+    @app.route("/api/admin/update/check")
+    def admin_update_check():
+        """检查 GitHub 上有没有新版本（`?force=1` 跳过缓存）。"""
+        blocked = check_token()
+        if blocked:
+            return blocked
+        if not _update_enabled():
+            return jsonify({"success": False,
+                            "message": "自动更新已在设置里关闭（update.enabled）"}), 403
+        force = str(request.args.get("force") or "").lower() in ("1", "true", "yes")
+        result = _updater().check(force=force)
+        result["enabled"] = True
+        # 网络问题不算"接口失败"，但要让前端能明确区分
+        return jsonify({"success": not result.get("error"), **result})
+
+    @app.route("/api/admin/update/install", methods=["POST"])
+    def admin_update_install():
+        """下载并安装更新（后台线程执行，前端轮询 status 看进度）。
+
+        安全约束（见 core/updater.py 顶部说明）：更新源固定为本项目仓库、
+        只允许 HTTPS、安装前自动备份、失败自动回滚、绝不覆盖 data/ 与 config.json。
+        """
+        blocked = check_token()
+        if blocked:
+            return blocked
+        if not _update_enabled():
+            return jsonify({"success": False,
+                            "message": "自动更新已在设置里关闭（update.enabled）"}), 403
+        engine = _updater()
+        if engine.state.snapshot().get("busy"):
+            return jsonify({"success": False, "message": "已经有一个更新在进行中"}), 409
+
+        body = request.get_json(silent=True) or {}
+        tag = str(body.get("tag") or "").strip()
+        if not tag:
+            # 没指定版本就现查一次，用最新版本
+            latest = engine.check(force=True)
+            if latest.get("error"):
+                return jsonify({"success": False,
+                                "message": "检查更新失败：%s" % latest["error"]}), 502
+            if not latest.get("has_update"):
+                return jsonify({"success": False, "message": "当前已是最新版本",
+                                "current": engine.current_version}), 409
+            tag = str(latest.get("tag") or latest.get("latest") or "")
+        if not tag:
+            return jsonify({"success": False, "message": "拿不到可安装的版本号"}), 400
+
+        def _worker():
+            try:
+                engine.install(tag=tag)
+            except Exception as exc:      # install 内部已处理可预期错误，这里兜底
+                logger.error("安装更新时出现未预期错误：%s", exc, exc_info=True)
+                engine.state.set("failed", "%s: %s" % (type(exc).__name__, exc))
+
+        thread = threading.Thread(target=_worker, name="update-install", daemon=True)
+        thread.start()
+        return jsonify({"success": True, "message": "已开始下载并安装 %s，请稍候…" % tag,
+                        "tag": tag})
+
     # ================================================================== 群管理
     @app.route("/api/groups")
     def groups_list():
@@ -1773,12 +1875,8 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         return jsonify({"success": False, "message": "action 需要是 test/sync/resume"}), 400
 
     def _version() -> str:
-        """程序版本（已不维护：`core/__init__.py` 里的 `__version__` 已移除）。
-
-        网页上不再显示版本；`/api/admin/status` 仍保留一个 `version` 字段只是为了
-        不破坏可能依赖它的外部脚本，值固定为占位符。
-        """
-        return ""
+        """程序版本（唯一来源：`core/version.py` 的 `__version__`）。"""
+        return version_module.__version__
 
     # 把运行时与日志管理器注入（由 run.py 调用）
     def attach(rt, log_manager=None):

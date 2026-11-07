@@ -16,7 +16,7 @@
 
 ## 当前状态
 
-- 程序版本：**不维护版本号**（`core/__init__.py` 里的 `__version__` 已移除；网页也不显示版本）
+- 程序版本：**v1.3.0**（唯一来源 `core/version.py` 的 `__version__`；网页侧栏/关于页/接口都从这里取）
 - 启动命令：
   - 正常：`python run.py`
   - 自检：`python run.py --check`
@@ -28,13 +28,15 @@
     `test_plugin_safety.py`、`test_cloud_secrets.py`、`test_media_dedup.py`、`test_ai_scope.py`、
     `test_member_role.py`（含身份解析 / gateway 解析 / 历史补齐）、`test_security_fixes.py`（审计回归）、
     `test_csp_boot.py`（CSP 与前端启动数据）、`test_plugin_sandbox.py`（插件软限制）、
-    `test_dispatch_isolation.py`（插件分发状态线程隔离）、`test_ssrf_guard.py`（媒体下载 SSRF）
+    `test_dispatch_isolation.py`（插件分发状态线程隔离）、`test_ssrf_guard.py`（媒体下载 SSRF）、
+    `test_updater.py`（版本比较 / 自动更新安全检查与回滚）
   - 单实例锁：`python tests/test_instance_lock.py`
   - 前端契约：`python tests/check_frontend.py`
   - DOM 会话列表：`node tests/dom_test_conversations.js`
   - DOM 消息渲染：`node tests/dom_test_messages.js`（40 项）
   - DOM 全局保护：`node tests/dom_test_globals.js`
   - DOM 设置页：`node tests/dom_test_settings.js`（重复插入 / 事件只绑一次）
+  - DOM 版本与更新：`node tests/dom_test_update.js`（版本显示 / 更新进度 / 待重启提示）
   - 测试分层说明：`tests/README.md`
   - 模拟注入：`python tests/simulate_message.py`
   - 插件安全自查：`python -m core.plugin_safety plugins`
@@ -243,6 +245,60 @@
 > 真实数据规模（群数/成员数/消息条数等）、实例环境的操作过程、截图来源。
 > 修复类问题用中性描述写"问题现象"（例如「正文含 @ 某人时不会自动切到 Markdown」），
 > 不引用任何人的原话。只保留"修复后行为正确"这类可验证的结论。
+
+- 2026-11-07：**修「点检查更新后最新版本仍显示未检查」**：
+  - **问题现象**：在运行状态页点「检查更新」，接口其实成功返回了最新版本，
+    但「最新版本」那一格仍然显示"未检查"。
+  - **根因**：后端 `Updater.check()` 返回的字段是 `latest` / `latest_display`，
+    前端却读 `updateLatest.version` —— 这个字段从来不存在，读出来是 `undefined`，
+    所以永远走"未检查"分支。
+  - **改法**：前端抽出 `latestVersion()` / `latestDisplay()` 两个取值函数
+    （`latest` → `version` 兜底、`latest_display` 优先），所有用到"最新版本"的地方
+    统一走它们，不再各处手写字段名；点完检查后先按检查结果立即刷新，再拉一次真实状态
+    （避免把"待重启"提示冲掉）。
+  - **顺带修**：检查结果原本只存在前端内存里，**刷新页面就退回"未检查"**。
+    现在 `Updater.status()` 会把上次检查结果（`last_check`，读本地缓存文件，不联网）
+    一起返回，前端内存为空时用它补回来。
+  - **怎么验证**：`tests/dom_test_update.js` 新增 [7] 点检查后必须显示最新版本、
+    [8] 刷新后仍能显示（共 24 项）。[7] 故意**只给 `latest` 不给 `latest_display`**，
+    强制走回退逻辑；**把 `latestVersion()` 改回读 `.version` 时该测试会红**
+    （实测「最新版本」变回"未检查"、提示变成"新版本"没具体版本号）。
+    全套回归：`test_offline` 576 项、`check_frontend`、14 个单元测试、5 个 DOM、单实例锁全绿。
+
+- 2026-11-07：**加回版本号 + 从 GitHub 检查/下载/安装更新（发布 v1.3.0）**：
+  - **版本号统一到 `core/version.py`**：`__version__` 是唯一来源，
+    网页侧栏、关于页、`/api/admin/status`、启动日志全部从它取（以前那一处删掉后
+    各处都没有版本可显示）。另含版本比较工具（`normalize_version` / `compare_versions`
+    / `pick_latest`），支持 `v1.2.7` / `release-1.2.7` / `version_2.0` 等写法，
+    并能正确判断 `1.10.0 > 1.9.9`（按段比，不是字符串比）。
+  - **新增 `core/updater.py`**：检查 GitHub release/tag → 下载 tarball → 安全解压 →
+    备份当前代码 → 覆盖安装 → 失败回滚。**更新源写死在 `core/version.py`**，
+    不放 `config.json`：能改配置就能改下载源，等于远程代码执行。
+  - **安全防线（每条都有对应测试）**：只允许 HTTPS + 固定域名白名单，重定向逐跳校验；
+    下载体积上限 64MB；解压拒绝绝对路径 / `..` / 符号链接 / 硬链接，限制成员数与
+    解压总量（防 tar 穿越与 zip bomb）；安装前自动备份到 `data/update/backup/`，
+    任一步失败自动回滚；**绝不覆盖** `config.json` / `data/` / `plugins/` / `.git/`；
+    安装完只写标记 + 提示重启，不静默重启进程。
+  - **网页**：「运行状态 → 版本与更新」卡片显示当前版本 / 最新版本 / 状态，
+    「检查更新」查 GitHub，「立即更新」二次确认后后台安装并轮询进度（1 秒一次），
+    装好后明确提示需要重启并指出备份位置；侧栏与关于页显示版本号。
+    版本号一律来自启动数据，前端不写死。
+  - **启动时检查**：`run.py` 新增 `startup_update_check()`，异步查一次（默认开启），
+    有新版本在日志里提示；若开了 `update.auto_install` 则自动下载安装。
+    另会提示"已装好新版本但还在跑旧代码，请重启"。
+  - **配置**：新增 `update.enabled` / `update.check_on_start` / `update.auto_install` /
+    `update.check_interval_minutes`（默认 开/开/关/30）。
+  - **怎么验证**：新增 `tests/unit/test_updater.py`（77 项：版本比较、更新源校验、
+    解压防穿越/符号链接、受保护路径、安装保留用户数据、回滚、并发拒绝、状态机、
+    exe 拒绝自我更新）与 `tests/dom_test_update.js`（24 项：版本显示、状态渲染、
+    进度、待重启提示、检查后显示最新版本、刷新后从缓存恢复）；
+    `check_frontend.py` 增加"版本来自服务端不许写死""安装必须二次确认"两条断言。
+    两个测试都**不写死版本号**（从 `core/version.py` 读，实测临时改成 2.0.0 / 10.20.30 仍全绿），
+    避免发版后测试过期。
+    另做了一次**真实端到端实测**（在项目副本上）：从 GitHub 真实下载 v1.2.5、
+    解压、备份、写入 93 个文件，确认 `config.json` / `data/` / `plugins/` 未被覆盖，
+    用备份回滚后文件逐字节回到原样。全套回归：`test_offline` 576 项、
+    `check_frontend`、14 个单元测试、5 个 DOM、单实例锁全绿。
 
 - 2026-11-07：**修复插件域名白名单的子串匹配绕过 + DNS 校验改为 fail-closed**：
   - **域名白名单可被伪造域名绕过（高危，已实测）**：`plugin_sandbox.host_allowed()` 用

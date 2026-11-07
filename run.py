@@ -50,6 +50,8 @@ from core import paths                      # noqa: E402
 from core.config_manager import load_config  # noqa: E402
 from core.logger import Logger              # noqa: E402
 from core.runtime import Runtime            # noqa: E402
+from core import version as version_module  # noqa: E402
+from core import updater as updater_module  # noqa: E402
 
 
 # ======================================================================================
@@ -516,6 +518,66 @@ def self_check(config_path: str = "") -> int:
     return 0
 
 
+def startup_update_check(config, log) -> None:
+    """启动时**异步**检查更新（不阻塞启动，失败只记一行日志）。
+
+    做三件事：
+      1. 检查有没有"上次已装好、但还没重启"的情况（提示用户重启才生效）；
+      2. 查一次 GitHub（结果有缓存，`update.check_interval_minutes`）；
+      3. 若开了 `update.auto_install`，直接下载并安装（装完仍需重启才生效）。
+    """
+    try:
+        if not config.bool_of("update", "enabled", default=True):
+            return
+        engine = updater_module.Updater(logger_obj=log)
+    except Exception as exc:            # 更新模块出问题不能影响正常启动
+        log.warning("初始化更新检查失败（不影响使用）：%s", exc)
+        return
+
+    # 1) "装了但没重启"：文件已是新版，进程还在跑旧代码
+    try:
+        if engine.pending_restart():
+            marker = engine.last_install() or {}
+            log.warning("⚠️ 检测到已安装新版本 v%s，但当前运行的仍是 v%s —— 请重启程序让新版本生效",
+                        marker.get("to_version") or "?", engine.current_version)
+    except Exception:
+        pass
+
+    if not config.bool_of("update", "check_on_start", default=True):
+        return
+
+    auto_install = bool(config.bool_of("update", "auto_install", default=False))
+
+    def worker():
+        try:
+            result = engine.check()
+            if result.get("error"):
+                log.info("检查更新未完成（不影响使用）：%s", result["error"])
+                return
+            if not result.get("has_update"):
+                log.info("已是最新版本（%s）", result.get("current_display"))
+                return
+            log.warning("👉 发现新版本 %s（当前 %s），更新说明：%s",
+                        result.get("latest_display"), result.get("current_display"),
+                        result.get("url"))
+            if not auto_install:
+                log.info("可在「运行状态 → 版本与更新」里一键更新；"
+                         "或在设置里打开 update.auto_install 让启动时自动安装")
+                return
+            log.warning("已开启自动安装，开始下载 %s …", result.get("tag"))
+            outcome = engine.install(tag=str(result.get("tag") or ""))
+            if outcome.get("success"):
+                log.warning("✅ 更新已安装：v%s → v%s，**请重启程序生效**（备份：%s）",
+                            outcome.get("from_version"), outcome.get("to_version"),
+                            outcome.get("backup"))
+            else:
+                log.error("自动安装更新失败：%s", outcome.get("message"))
+        except Exception as exc:        # 更新永远不该把启动/运行搞崩
+            log.warning("检查更新时出错（不影响使用）：%s", exc)
+
+    threading.Thread(target=worker, name="update-check", daemon=True).start()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="QQ 机器人合并版")
     parser.add_argument("--check", action="store_true", help="只做自检，不启动服务")
@@ -537,8 +599,11 @@ def main() -> int:
     log = logger.get_logger()
 
     log.info("=" * 62)
-    log.info("QQ 机器人合并版 启动")
+    log.info("%s %s 启动", version_module.APP_TITLE, version_module.describe())
     log.info("=" * 62)
+
+    # 启动时检查更新（异步，不阻塞启动；失败只记日志）
+    startup_update_check(config, log)
 
     host = args.host or config.str_of("web", "host", default="127.0.0.1")
     port = args.port or config.int_of("web", "port", default=8666)

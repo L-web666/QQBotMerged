@@ -155,6 +155,37 @@ def main():
     else:
         print("✅ 面板列表 / 删除都带上了当前机器人，切换机器人后会重新加载")
 
+    # ---- 版本显示与更新按钮 ----
+    # 版本号必须来自启动数据（服务端 core/version.py），**不许在前端写死**：
+    # 写死就会出现"网页显示 v1.2.7、程序其实已经是别的版本"这种漂移。
+    html_source = read(TEMPLATE)
+    version_problems = []
+    for element_id in ("appVersion", "aboutVersion", "updateCheck",
+                       "updateInstall", "updateGrid", "updateHint"):
+        if f'id="{element_id}"' not in html_source:
+            version_problems.append(f"页面缺少 #{element_id}")
+    if "showVersion" not in admin_js:
+        version_problems.append("admin.js 没有 showVersion（版本号不会显示）")
+    if not re.search(r"version_display", admin_js):
+        version_problems.append("admin.js 没从启动数据取 version_display")
+    for endpoint in ("/api/admin/update/check", "/api/admin/update/install",
+                     "/api/admin/update/status"):
+        if endpoint not in admin_js:
+            version_problems.append(f"admin.js 没有调用 {endpoint}")
+    print("\n版本显示与更新入口：")
+    if version_problems:
+        print("❌ " + "；".join(version_problems))
+        FAILED.append(f"版本/更新前端缺失：{version_problems}")
+    else:
+        print("✅ 显示版本号、可检查更新并一键安装（版本来自服务端，不写死）")
+
+    # ---- 更新安装必须二次确认（防止误点直接把程序换掉）----
+    confirm_ok = bool(re.search(r"function installUpdate\(\)\s*\{.*?global\.confirm\(",
+                                admin_js, re.S))
+    print("更新安装二次确认：" + ("✅ 有确认框" if confirm_ok else "❌ 没有确认框"))
+    if not confirm_ok:
+        FAILED.append("安装更新没有二次确认")
+
     # ---- getJSON 的非 2xx 错误必须带出后端文案与响应体 ----
     util_js = read(os.path.join(JS_DIR, "util.js"))
     getjson_match = re.search(r"function getJSON\(path\)\s*\{(.*?)\n  \}", util_js, re.S)
@@ -464,12 +495,13 @@ def main():
                    if "function switchBot" in app_js else "")
     if "loadStatus" not in switch_body:
         status_problems.append("切换机器人后没有重新拉取运行状态（切完不刷新）")
-    print("\n运行状态页（内置 AI 跟机器人走 / 去掉版本项）：")
+    print("\n运行状态页（内置 AI 跟机器人走 / 版本项来自服务端）：")
     if status_problems:
         print("❌ " + "；".join(status_problems))
         FAILED.append(f"运行状态页不符合要求：{status_problems}")
     else:
-        print("✅ 内置 AI 按当前机器人显示（切换后重新拉取）；页面不再显示版本项")
+        print("✅ 内置 AI 按当前机器人显示（切换后重新拉取）；"
+              "版本号统一由服务端 core/version.py 下发")
 
     # ---- 群成员身份 + 群管理页"没更新就别播动画" ----
     detail_problems = []

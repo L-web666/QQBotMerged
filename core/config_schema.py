@@ -30,6 +30,7 @@ SECTION_LABELS: Dict[str, Dict[str, str]] = {
     "scheduler": {"label": "定时任务", "icon": "⏰", "desc": "按北京时间定时推送"},
     "panels": {"label": "指令面板", "icon": "🎯", "desc": "QQ 聊天界面里的指令列表"},
     "plugins": {"label": "插件系统", "icon": "🧩", "desc": "plugins/ 目录扩展功能"},
+    "update": {"label": "自动更新", "icon": "🔄", "desc": "从 GitHub 检查新版本（全局设置）"},
     "cloud": {"label": "云同步", "icon": "☁️", "desc": "数据同步到 Cloudflare D1"},
     "logging": {"label": "日志", "icon": "📜", "desc": "日志级别、分割大小与控制台着色"},
     "ui": {"label": "界面与动画", "icon": "✨", "desc": "主题、动画强度与刷新频率"},
@@ -200,6 +201,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # 按机器人隔离插件（在「插件管理」页勾选，或在这里手写插件名）
         "enabled_names": [],        # 该机器人的插件白名单；空 = 不限制
         "disabled_names": [],       # 该机器人的插件黑名单（优先级高于白名单）
+    },
+
+    # ---------------- 自动更新 ----------------
+    # 更新源固定写在 core/version.py，**不放进配置**：能改配置就能改下载源 = 远程代码执行
+    "update": {
+        "enabled": True,            # 允许联网检查更新（关掉后网页也不让装）
+        "check_on_start": True,     # 启动后异步查一次
+        "auto_install": False,      # 发现新版本直接装（装完需重启才生效）
+        "check_interval_minutes": 30,
     },
 
     # ---------------- 云同步 ----------------
@@ -393,6 +403,18 @@ FIELDS: Dict[str, Dict[str, Any]] = {
     "plugins.disabled_names": _f("list", "本机器人停用的插件",
                                  "每行一个插件名；该机器人不运行这些插件（优先级高于上面的白名单）"),
 
+    # ---------------- update ----------------
+    "update.enabled": _f("bool", "启用自动更新检查",
+                         "关闭后既不联网检查，也不允许从网页安装更新（全局设置）"),
+    "update.check_on_start": _f("bool", "启动时检查更新",
+                                "启动后异步查一次 GitHub，有新版本会在日志里提示（不阻塞启动）"),
+    "update.auto_install": _f("bool", "启动时自动下载并安装",
+                              "**谨慎开启**：发现新版本会直接下载并覆盖代码，装完需要重启才生效。"
+                              "更新源固定为本项目仓库，不会去别处下载（全局设置）"),
+    "update.check_interval_minutes": _f("int", "检查结果缓存时间",
+                                        "分钟；避免频繁请求 GitHub 触发限流",
+                                        min=1, max=1440),
+
     # ---------------- cloud_sync ----------------
     "cloud_sync.enabled": _f("bool", "启用云同步", "把 data/ 下的用户数据同步到 Cloudflare D1"),
     "cloud_sync.account_id": _f("str", "Cloudflare 账户 ID", ""),
@@ -574,6 +596,8 @@ SECTION_FIELDS: Dict[str, List[str]] = {
                "panels.c2c_openids", "panels.group_target_type", "panels.group_openids"],
     "plugins": ["plugins.enabled", "plugins.sandbox", "plugins.enabled_names",
                 "plugins.disabled_names", "plugins.dir"],
+    "update": ["update.enabled", "update.check_on_start", "update.auto_install",
+               "update.check_interval_minutes"],
     "cloud": ["cloud_sync.enabled", "cloud_sync.account_id", "cloud_sync.database_id",
               "cloud_sync.api_token", "cloud_sync.interval_seconds", "cloud_sync.pull_on_start",
               "cloud_sync.upload_logs", "cloud_sync.skip_secret_files", "cloud_sync.max_file_mb",
@@ -591,7 +615,7 @@ SECTION_FIELDS: Dict[str, List[str]] = {
 }
 
 SECTION_ORDER = ["bots", "web", "ai", "reply", "filters", "features", "send", "storage",
-                 "receiver", "scheduler", "panels", "plugins", "cloud", "security",
+                 "receiver", "scheduler", "panels", "plugins", "update", "cloud", "security",
                  "logging", "ui", "context"]
 
 

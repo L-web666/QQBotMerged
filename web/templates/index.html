@@ -49,6 +49,7 @@
         <span id="botSummary">机器人：--</span>
       </div>
       <div class="nav-foot-row small" id="footStat">--</div>
+      <div class="nav-foot-row small" id="appVersion" title="当前程序版本">v--</div>
       <button class="ghost-btn" id="themeBtn" title="切换深色/浅色">🌗 主题</button>
     </div>
   </aside>
@@ -177,6 +178,15 @@
       </div>
       <div class="grid" id="statusGrid"></div>
       <div class="card"><h3>机器人连接</h3><div id="botCards" class="grid"></div></div>
+      <div class="card">
+        <h3>🔄 版本与更新</h3>
+        <div class="head-actions" style="margin-bottom:8px">
+          <button class="btn tiny" id="updateCheck">检查更新</button>
+          <button class="btn tiny" id="updateInstall" style="display:none">立即更新</button>
+        </div>
+        <div class="grid" id="updateGrid"></div>
+        <div class="hint" id="updateHint"></div>
+      </div>
       <div class="card">
         <h3>☁️ 云同步（Cloudflare D1）</h3>
         <div class="head-actions" style="margin-bottom:8px">
@@ -334,6 +344,18 @@
     <!-- ---------------- 使用说明 ---------------- -->
     <section class="page" id="page-about" data-page="about">
       <div class="page-head"><h2>❓ 使用说明</h2></div>
+      <div class="card">
+        <h3>🏷️ 关于本程序</h3>
+        <div class="field-tip">
+          当前版本：<b id="aboutVersion">v--</b>
+          · 源码与更新：<a id="aboutRepo" href="#" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+        <div class="field-tip">
+          更新方式：到「运行状态 → 版本与更新」点“检查更新”，有新版本会显示并可一键下载安装。
+          安装完成后需要<b>重启程序</b>才生效；更新前会自动备份到 <code>data/update/backup/</code>，
+          失败会自动回滚，且<b>不会覆盖</b> <code>config.json</code>、<code>data/</code>、<code>plugins/</code>。
+        </div>
+      </div>
       <div class="card">
         <h3>⏻ 关闭程序</h3>
         <div class="field-tip">「关闭程序」按钮在<b>运行状态</b>页右上角。点它会在确认后

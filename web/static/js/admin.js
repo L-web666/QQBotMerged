@@ -15,7 +15,9 @@
     pluginBotAllowed: {},    // 当前机器人运行哪些插件 {插件名: true/false}
     pluginBotSaving: false,  // 「按机器人启用插件」请求进行中，防止重复点击
     logTimer: null,
-    statusTimer: null
+    statusTimer: null,
+    updateBusy: false,       // 更新进行中（防止重复点击）
+    updateLatest: null       // 最近一次检查到的可安装版本 {tag, version}
   };
 
   /* ============================ 运行状态 ============================ */
@@ -87,6 +89,9 @@
       U.el('statusLogs').textContent = data.logs || '（暂无日志）';
       bindBotActions();
       loadCloud();
+      bindUpdateButtons();
+      // 状态页每次刷新都同步一次更新状态（不联网，只读本地状态机）
+      loadUpdateStatus();
       return data;
     }).catch(function (error) {
       U.el('statusGrid').innerHTML = '<div class="err-text">加载失败：' + U.esc(error.message) + '</div>';
@@ -106,6 +111,190 @@
           })
           .catch(function (error) { U.toast(error.message, 'err'); });
       });
+    }
+  }
+
+  /* ============================ 版本与更新 ============================ */
+  var UPDATE_STAGE_TEXT = {
+    idle: '就绪',
+    checking: '正在检查',
+    downloading: '正在下载',
+    extracting: '正在解压',
+    backup: '正在备份',
+    installing: '正在安装',
+    done: '安装完成',
+    failed: '失败'
+  };
+
+  function showVersion() {
+    var boot = U.BOOT || {};
+    var display = boot.version_display || (boot.version ? 'v' + boot.version : 'v--');
+    var foot = U.el('appVersion');
+    if (foot) foot.textContent = display;
+    var about = U.el('aboutVersion');
+    if (about) about.textContent = display;
+    var repo = U.el('aboutRepo');
+    if (repo && boot.repo_url) {
+      repo.href = boot.repo_url;
+      repo.textContent = boot.repo || 'GitHub';
+    }
+    return display;
+  }
+
+  /* 检查结果里版本号的字段名是 `latest` / `latest_display`（后端 updater.check 的返回值）。
+     **别再直接读 `updateLatest.version`**：那个字段不存在，读出来永远是 undefined，
+     「最新版本」就会一直显示"未检查"（这就是之前点完检查仍显示未检查的原因）。
+     统一从这两个函数取值，避免各处再写错字段名。 */
+  function latestVersion() {
+    var info = Admin.updateLatest;
+    if (!info) return '';
+    return String(info.latest || info.version || '');
+  }
+
+  function latestDisplay() {
+    var info = Admin.updateLatest;
+    if (!info) return '';
+    if (info.latest_display) return String(info.latest_display);
+    var value = latestVersion();
+    return value ? 'v' + value : '';
+  }
+
+  function renderUpdate(data) {
+    var grid = U.el('updateGrid');
+    if (!grid) return;
+    var stage = data.stage || 'idle';
+    var current = data.current_display || showVersion();
+    var latest = latestDisplay();
+    var parts = [
+      kv('当前版本', current),
+      kv('最新版本', latest || '未检查'),
+      kv('状态', UPDATE_STAGE_TEXT[stage] || stage,
+         stage === 'failed' ? 'err-text' : (stage === 'done' ? 'ok-text' : '')),
+      kv('更新源', data.repo || '--')
+    ];
+    if (data.message && (data.busy || stage === 'done' || stage === 'failed')) {
+      parts.push(kv('进度', data.message, stage === 'failed' ? 'err-text' : ''));
+    }
+    if (data.pending_restart) {
+      var marker = data.last_install || {};
+      parts.push(kv('待重启', '已装好 ' + (marker.to_version ? 'v' + marker.to_version : '新版本') +
+        '，重启程序后生效', 'warn-text'));
+    }
+    grid.innerHTML = parts.join('');
+
+    var hint = U.el('updateHint');
+    if (hint) {
+      if (!data.enabled) {
+        hint.innerHTML = '自动更新已在「设置 → 自动更新」里关闭（<code>update.enabled</code>）。';
+      } else if (data.busy) {
+        hint.innerHTML = '⏳ ' + U.esc(data.message || '正在处理…') +
+          (data.progress ? '（' + data.progress + '%）' : '');
+      } else if (data.pending_restart) {
+        hint.innerHTML = '✅ 新版本文件已就位，但当前进程还在跑旧代码。<b>请关闭程序后重新启动</b>；' +
+          '若用 <code>start.bat</code> 启动，直接关掉窗口再开一次即可。旧版本备份在 ' +
+          '<code>data/update/backup/</code>。';
+      } else if (Admin.updateLatest && Admin.updateLatest.has_update) {
+        hint.innerHTML = '🎉 发现新版本 <b>' + U.esc(latestDisplay() || '新版本') + '</b>' +
+          (Admin.updateLatest.published_at
+            ? '（' + U.esc(String(Admin.updateLatest.published_at).slice(0, 10)) + '）' : '') +
+          '。点「立即更新」下载并安装；安装过程不会覆盖配置、聊天记录与插件。';
+      } else if (Admin.updateLatest && latestVersion()) {
+        hint.innerHTML = '✅ 已是最新版本（' + U.esc(current) + '）。';
+      } else {
+        hint.innerHTML = '点「检查更新」查询 GitHub 上是否有新版本。' +
+          '更新源固定为本项目仓库，安装前会自动备份、失败自动回滚。';
+      }
+    }
+
+    var installBtn = U.el('updateInstall');
+    if (installBtn) {
+      var canInstall = !!data.enabled && !data.busy &&
+        !!(Admin.updateLatest && Admin.updateLatest.has_update);
+      installBtn.style.display = canInstall ? '' : 'none';
+      installBtn.disabled = !!data.busy;
+    }
+  }
+
+  function loadUpdateStatus() {
+    return U.getJSON('/api/admin/update/status').then(function (data) {
+      // 刷新页面后前端内存里的检查结果没了，但服务端缓存还在：
+      // 用它把「最新版本」补回来，免得每次刷新都退回"未检查"。
+      if (!Admin.updateLatest && data && data.last_check && data.last_check.latest) {
+        Admin.updateLatest = data.last_check;
+      }
+      renderUpdate(data || {});
+      if (data && data.busy) {
+        Admin.updateBusy = true;
+        setTimeout(loadUpdateStatus, 1000);        // 更新中：每秒刷新进度
+      } else {
+        Admin.updateBusy = false;
+      }
+      return data;
+    }).catch(function (error) {
+      var hint = U.el('updateHint');
+      if (hint) hint.innerHTML = '<span class="err-text">读取更新状态失败：' +
+        U.esc(error.message) + '</span>';
+    });
+  }
+
+  function checkUpdate() {
+    if (Admin.updateBusy) return;
+    var btn = U.el('updateCheck');
+    if (btn) { btn.disabled = true; btn.textContent = '检查中…'; }
+    var hint = U.el('updateHint');
+    if (hint) hint.textContent = '正在向 GitHub 查询最新版本…';
+    U.getJSON('/api/admin/update/check?force=1').then(function (data) {
+      Admin.updateLatest = data;
+      // 先按检查结果立即刷新一次（有反馈），再拉一次真实状态：
+      // 后者带着 pending_restart 等字段，避免刚点完检查把"待重启"提示冲掉。
+      renderUpdate({ stage: 'idle', enabled: data.enabled,
+                     current_display: data.current_display, repo: data.repo });
+      loadUpdateStatus();
+    }).catch(function (error) {
+      Admin.updateLatest = null;
+      if (hint) {
+        hint.innerHTML = '<span class="err-text">检查更新失败：' + U.esc(error.message) +
+          '</span><br><span class="tiny">若程序在无外网的机器上运行，可关闭「设置 → 自动更新」。' +
+          '也可以直接到 GitHub 手动下载。</span>';
+      }
+      renderUpdate({ stage: 'idle' });
+    }).then(function () {
+      if (btn) { btn.disabled = false; btn.textContent = '检查更新'; }
+    });
+  }
+
+  function installUpdate() {
+    if (Admin.updateBusy) return;
+    var target = latestDisplay() || '最新版本';
+    if (!global.confirm('确定要更新到 ' + target + ' 吗？\n\n' +
+        '· 更新源：本项目 GitHub 仓库（仅 HTTPS）\n' +
+        '· 安装前会自动备份到 data/update/backup/\n' +
+        '· 不会覆盖 config.json、data/、plugins/\n' +
+        '· 安装完成后需要重启程序才生效')) {
+      return;
+    }
+    var tag = (Admin.updateLatest && (Admin.updateLatest.tag || Admin.updateLatest.latest)) || '';
+    Admin.updateBusy = true;
+    U.postJSON('/api/admin/update/install', { tag: tag }).then(function (data) {
+      U.toast(data.message || '已开始更新', 'ok');
+      setTimeout(loadUpdateStatus, 500);
+    }).catch(function (error) {
+      Admin.updateBusy = false;
+      U.toast(error.message, 'err');
+      loadUpdateStatus();
+    });
+  }
+
+  function bindUpdateButtons() {
+    var check = U.el('updateCheck');
+    if (check && !check.getAttribute('data-bound')) {
+      check.setAttribute('data-bound', '1');
+      check.addEventListener('click', checkUpdate);
+    }
+    var install = U.el('updateInstall');
+    if (install && !install.getAttribute('data-bound')) {
+      install.setAttribute('data-bound', '1');
+      install.addEventListener('click', installUpdate);
     }
   }
 
@@ -822,6 +1011,8 @@
   /* ============================ 初始化 ============================ */
   function init() {
     U.el('statusRefresh').addEventListener('click', loadStatus);
+    bindUpdateButtons();
+    showVersion();          // 侧栏与关于页的版本号（来自启动数据，不联网）
     U.el('statsRefresh').addEventListener('click', loadStats);
     U.el('cloudTest').addEventListener('click', function () { cloudAction('test', '测试完成'); });
     U.el('cloudSyncNow').addEventListener('click', function () { cloudAction('sync', '同步完成'); });
@@ -865,6 +1056,9 @@
   Admin.loadContext = loadContext;
   Admin.loadPanels = loadPanels;
   Admin.loadMedia = loadMedia;
+  Admin.showVersion = showVersion;
+  Admin.loadUpdateStatus = loadUpdateStatus;
+  Admin.checkUpdate = checkUpdate;
     // 防止整个对象被别人替换掉（对象内部字段照旧可改，见 util.js 的 protectGlobal）
   if (typeof global.__qbmProtect === 'function') global.__qbmProtect('Admin', Admin);
   else global.Admin = Admin;
