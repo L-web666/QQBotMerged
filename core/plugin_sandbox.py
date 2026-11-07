@@ -56,6 +56,9 @@ ALLOWED_MODULES: Set[str] = {
     "_json", "_socket", "_ssl", "_hashlib", "_struct", "_random", "_bisect", "_heapq",
     "_operator", "_contextvars", "_asyncio", "_signal", "encodings", "codecs", "builtins",
     "sysconfig", "posix", "nt", "_winapi", "errno", "stat",
+    # 标准库补充：`copyreg` 被 pickle/copy 间接依赖；`threading` 是插件常用
+    # （注意：插件自建线程**不受沙箱约束**，见类 docstring 的 NEW4-01 说明）
+    "copyreg", "threading", "_weakrefset", "selectors", "select", "signal",
     # 网络客户端（插件常见需求：调 AI 服务、调第三方 API）
     "requests", "http.client", "ssl",
     # 本程序的既有 API（插件通过它们与宿主交互）
@@ -75,9 +78,13 @@ DENIED_MODULES: tuple = (
 # 注意：`json`（含 `json.decoder` 之类）**不是**禁项。判断要按"顶层模块名"做，
 # 不能用 `name.startswith(denied)`——那样 `json.dumps` 里的 "code" 之类会误伤。
 
-# 允许联网的域名后缀（strict 模式）——QQ 官方接口与常见 AI 服务
+# 允许联网的域名后缀（strict 模式）——QQ 官方接口与常见 AI 服务。
+# 与 `core/media_store.py` 的 `ALLOWED_HOST_SUFFIX` 保持一致（那边有 `qq.com.cn`，
+# 官方富媒体域名 `multimedia.nt.qq.com.cn` 就靠它；以前沙箱白名单漏了这条，
+# 加上"子串匹配"的 bug 才碰巧没暴露）。
 ALLOWED_HOSTS: tuple = (
-    "qq.com", "qpic.cn", "gtimg.cn", "qqusercontent.com", "myqcloud.com",
+    "qq.com", "qq.com.cn", "qpic.cn", "gtimg.cn", "qqusercontent.com", "myqcloud.com",
+    "weixin.qq.com", "tencent.com",
     "deepseek.com", "openai.com", "anthropic.com", "aliyuncs.com", "qianwen", "dashscope",
     "bigmodel.cn", "moonshot.cn", "siliconflow.cn", "ollama.com", "127.0.0.1", "localhost",
 )
@@ -97,12 +104,26 @@ def normalize_mode(value: Any) -> str:
 
 
 def host_allowed(host: str) -> bool:
-    """strict 模式下是否允许连接该域名。"""
-    name = (host or "").strip().lower()
+    """strict 模式下是否允许连接该域名。
+
+    **只做精确匹配与合法子域匹配**，绝不能用"子串包含"判断：
+    `suffix in name` 会让 `qq.com.evil.com`、`evilqq.com`、`myqq.com` 全部通过
+    （审计 SEC-01 实测 5 个恶意域名全部绕过）。合法关系只有两种：
+      · `name == suffix`（精确命中）
+      · `name.endswith("." + suffix)`（`a.b.qq.com` 是 `qq.com` 的子域）
+    `.` 前缀保证 `evilqq.com` 不会命中 `qq.com`。
+    """
+    name = (host or "").strip().lower().rstrip(".")
     if not name:
         return False
+    # 去掉可能的 IPv6 方括号（socket 层可能带）
+    if name.startswith("[") and name.endswith("]"):
+        name = name[1:-1]
     for suffix in ALLOWED_HOSTS:
-        if name == suffix or name.endswith("." + suffix) or suffix in name:
+        rule = suffix.lower().rstrip(".")
+        if not rule:
+            continue
+        if name == rule or name.endswith("." + rule):
             return True
     return False
 

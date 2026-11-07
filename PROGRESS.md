@@ -28,7 +28,7 @@
     `test_plugin_safety.py`、`test_cloud_secrets.py`、`test_media_dedup.py`、`test_ai_scope.py`、
     `test_member_role.py`（含身份解析 / gateway 解析 / 历史补齐）、`test_security_fixes.py`（审计回归）、
     `test_csp_boot.py`（CSP 与前端启动数据）、`test_plugin_sandbox.py`（插件软限制）、
-    `test_dispatch_isolation.py`（插件分发状态线程隔离）
+    `test_dispatch_isolation.py`（插件分发状态线程隔离）、`test_ssrf_guard.py`（媒体下载 SSRF）
   - 单实例锁：`python tests/test_instance_lock.py`
   - 前端契约：`python tests/check_frontend.py`
   - DOM 会话列表：`node tests/dom_test_conversations.js`
@@ -243,6 +243,35 @@
 > 真实数据规模（群数/成员数/消息条数等）、实例环境的操作过程、截图来源。
 > 修复类问题用中性描述写"问题现象"（例如「正文含 @ 某人时不会自动切到 Markdown」），
 > 不引用任何人的原话。只保留"修复后行为正确"这类可验证的结论。
+
+- 2026-11-07：**修复插件域名白名单的子串匹配绕过 + DNS 校验改为 fail-closed**：
+  - **域名白名单可被伪造域名绕过（高危，已实测）**：`plugin_sandbox.host_allowed()` 用
+    `suffix in name`（子串包含）判断，实测 `qq.com.evil.com`、`evilqq.com`、`myqq.com`、
+    `notqq.com.cn`、`api.deepseek.com.evil.net` **5 个恶意域名全部被放行**。
+    改法：只保留"精确匹配"与"以 `.` 开头的合法子域匹配"（`. ` 前缀保证
+    `evilqq.com` 不命中 `qq.com`），并统一小写、去掉尾随点、剥掉 IPv6 方括号。
+  - **顺带修一个被掩盖的白名单遗漏**：沙箱的 `ALLOWED_HOSTS` 缺 `qq.com.cn`
+    （`media_store` 那边有），以前靠子串匹配才碰巧放行官方富媒体域名
+    `multimedia.nt.qq.com.cn`；改成精确匹配后会误拒，已补齐并与
+    `media_store.ALLOWED_HOST_SUFFIX` 对齐。
+  - **DNS 校验改为 fail-closed**：`media_store.resolve_public()` 原来在 DNS 解析失败时
+    返回 `True`（放行），属 fail-open —— 解析被干扰/投毒时内网校验形同虚设。
+    现在解析失败、结果为空、任一条落到内网/回环/链路本地，一律拒绝并记 warning；
+    IP 字面量不再触发 DNS 查询。DNS Rebinding 的时间差风险已在 docstring 说明
+    （彻底修法"用解析出的 IP 直连"会破坏腾讯媒体的 SNI/Host 签名校验，故保留
+    先校验再连接，另由 `fetch()` 的域名白名单作第一道闸门）。
+  - **标准库白名单补漏**：`copyreg`（被 pickle/copy 间接依赖）、`threading`、
+    `selectors`、`select`、`signal` 之前不在白名单，strict 档下会被误拦；
+    已放入白名单（`threading` 放行不改变"插件自建线程不受约束"这一事实）。
+  - **核查后不成立的两项**：报告称 `importlib.import_module()` 可绕过导入限制 ——
+    实测其内部仍走 `builtins.__import__`，`subprocess`/`ctypes`/`pickle`/`multiprocessing`
+    全部被拦住；报告称线程隔离是"设计缺陷" —— 这是 NEW4-01 已写明的取舍
+    （插件自建线程不受约束），不是可修复的 bug。
+  - **怎么验证**：`tests/unit/test_plugin_sandbox.py` 新增 [2b] 域名伪造 6 项、
+    [2c] 标准库白名单 18 项；新增 `tests/unit/test_ssrf_guard.py`（16 项，用猴子补丁
+    替换 DNS，不联网）。**两条新测试都回退验证过会红**（域名 6 项失败、DNS 1 项失败）。
+    全套回归：`test_offline` 576 项、`check_frontend`、13 个单元测试、4 个 DOM、
+    单实例锁全绿。
 
 - 2026-11-07：**沙箱安装失败改为原子回滚 + 显式状态；补齐"自建线程不受约束"的说明**：
   - **NEW4-02 安装失败不再留残留**：`_install()` 原为"边装边设 `_active`"，

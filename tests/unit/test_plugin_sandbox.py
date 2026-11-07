@@ -96,10 +96,26 @@ def main():
 
         # ---------- 2. 域名白名单 ----------
         print("\n[2] 联网白名单（strict 用）")
-        for host in ("multimedia.nt.qq.com.cn", "api.deepseek.com", "127.0.0.1"):
+        for host in ("multimedia.nt.qq.com.cn", "api.deepseek.com", "127.0.0.1",
+                     "qq.com.cn", "qq.com", "QQ.COM", "qq.com."):
             check(f"放行 {host}", plugin_sandbox.host_allowed(host) is True, "")
         for host in ("evil.example.com", "1.1.1.1", ""):
             check(f"拒绝 {host or '(空)'}", plugin_sandbox.host_allowed(host) is False, "")
+
+        # ---------- 2b. 域名匹配不能被子串骗过（审计 SEC-01） ----------
+        print("\n[2b] 域名白名单只做精确/子域匹配，不接受子串包含")
+        for host in ("qq.com.evil.com", "evilqq.com", "myqq.com", "notqq.com.cn",
+                     "api.deepseek.com.evil.net", "qq.com.tunnel.evil"):
+            check(f"拒绝子串伪造 {host}", plugin_sandbox.host_allowed(host) is False, host)
+
+        # ---------- 2c. 标准库白名单：该放的放、该拦的拦 ----------
+        print("\n[2c] 导入白名单：常见标准库不误伤，危险模块不放行")
+        box0 = PluginSandbox("strict", plugin_dir, data_dir, "demo")
+        for mod in ("json", "re", "os", "sys", "time", "datetime", "pathlib",
+                    "copyreg", "threading", "collections", "logging", "asyncio"):
+            check(f"放行标准库 {mod}", box0._module_allowed(mod) is True, mod)
+        for mod in ("subprocess", "ctypes", "pickle", "multiprocessing", "runpy", "marshal"):
+            check(f"拦危险模块 {mod}", box0._module_allowed(mod) is False, mod)
 
         # ---------- 3. loose：只拦执行命令 ----------
         print("\n[3] loose（默认）：拦执行命令/起子进程，其余放行")

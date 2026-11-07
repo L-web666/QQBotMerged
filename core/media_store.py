@@ -144,8 +144,15 @@ def resolve_public(url: str) -> bool:
 
     审计 SEC-09：`host_allowed()` 原来只做纯字符串前缀判断，一个公网域名
     解析到 127.0.0.1 或 192.168.x.x 就能绕过。这里补上真正的 DNS 解析校验。
-    解析失败（网络问题/域名不存在）时**保守放行**——真正的请求随后会自己失败，
-    拦截它没有意义，反而会把正常抓取拖垮。
+
+    **失败策略：fail-closed（解析不了就拒绝）**。早期版本在 DNS 解析失败时
+    返回 True（放行），那是 fail-open —— 解析一旦被干扰/被投毒，校验就形同虚设。
+    现在解析失败、解析结果为空、任一条落到内网地址，一律拒绝。
+
+    DNS Rebinding 说明：本函数与随后的 HTTP 连接之间存在时间差，理论上解析结果
+    可以被换掉。彻底的修法是"用解析出的 IP 直连"，但那会破坏腾讯媒体的签名
+    校验（SNI/Host 必须匹配原域名），所以这里保留"先校验再连接"，
+    并由 `fetch()` 里的 `ALLOWED_HOST_SUFFIX`（只允许腾讯系域名）作为第一道闸门。
     """
     try:
         parsed = urlparse(url or "")
@@ -156,17 +163,25 @@ def resolve_public(url: str) -> bool:
         return False
     # 已经是 IP 字面量：上面 host_allowed 已经判过，这里再确认一次
     try:
-        ipaddress.ip_address(host)
+        ipaddress.ip_address(host.strip("[]"))
         return not _is_private_ip(host)
     except ValueError:
         pass
     try:
         infos = socket.getaddrinfo(host, None)
-    except (socket.gaierror, OSError, UnicodeError):
-        return True
+    except (socket.gaierror, OSError, UnicodeError) as exc:
+        # 解析失败 = 无法证明它是公网地址 → 拒绝（fail-closed）
+        logger.warning("媒体下载被拒绝：域名解析失败（%s）：%s", host, exc)
+        return False
+    if not infos:
+        return False
+    # 检查**全部**解析结果：任何一条落在内网/回环就拒绝
     for info in infos:
         address = info[4][0] if info and info[4] else ""
-        if address and _is_private_ip(address):
+        if not address:
+            continue
+        if _is_private_ip(address):
+            logger.warning("媒体下载被拒绝：%s 解析到内网地址 %s", host, address)
             return False
     return True
 
