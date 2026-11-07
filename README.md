@@ -102,8 +102,6 @@ python run.py --config my.json     # 使用指定的配置文件
 python tests/simulate_message.py --type group --text "你好"    # 往运行中的程序注入一条模拟消息
 ```
 
----
-
 ### 3.1、版本与自动更新
 
 当前版本写在一个地方：`core/version.py` 的 `__version__`（网页侧栏、关于页、
