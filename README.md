@@ -104,7 +104,7 @@ python tests/simulate_message.py --type group --text "你好"    # 往运行中�
 
 ---
 
-## 三·五、版本与自动更新
+### 3.1、版本与自动更新
 
 当前版本写在一个地方：`core/version.py` 的 `__version__`（网页侧栏、关于页、
 `/api/admin/status` 都从这里取，不会各处漂移）。
