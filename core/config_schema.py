@@ -54,6 +54,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # 留空时自动取监听地址；监听 0.0.0.0 时自动换成局域网地址。
         "public_base_url": "",
         "debug": False,
+        # 只有确实放在反向代理后面才打开；直接对公网开放时不要开（X-Forwarded-For 可伪造）
+        "trust_proxy": False,
         "poll_interval_ms": 2000,
         "log_access_requests": False,
         "log_polling_requests": False,
@@ -288,6 +290,10 @@ FIELDS: Dict[str, Dict[str, Any]] = {
                               "发文件下载链接时用；例 http://1.2.3.4:8666 或 https://bot.example.com。"
                               "留空自动取监听地址（0.0.0.0 会换成局域网 IP）"),
     "web.debug": _f("bool", "调试模式", "仅本机调试用，不要对公网开启"),
+    "web.trust_proxy": _f("bool", "信任反向代理的来源头",
+                          "只有确实放在 Nginx/CDN 后面才打开：打开后按 X-Forwarded-For "
+                          "识别来源、用于令牌失败计数；直接对公网开放时**不要**打开"
+                          "（该头可被客户端伪造）"),
     "web.poll_interval_ms": _f("int", "网页刷新间隔", "毫秒", min=500, max=60000),
     "web.log_access_requests": _f("bool", "记录 HTTP 访问日志", "关闭可减少日志刷屏"),
     "web.log_polling_requests": _f("bool", "记录轮询请求日志", "默认关闭，避免刷屏"),
@@ -565,8 +571,8 @@ def field_paths() -> List[str]:
 SECTION_FIELDS: Dict[str, List[str]] = {
     "bots": ["bots"],
     "web": ["web.host", "web.port", "web.token", "web.public_base_url", "web.debug",
-            "web.poll_interval_ms", "web.page_size", "web.log_access_requests",
-            "web.log_polling_requests"],
+            "web.trust_proxy", "web.poll_interval_ms", "web.page_size",
+            "web.log_access_requests", "web.log_polling_requests"],
     "ai": ["ai.enabled", "ai.api_key", "ai.base_url", "ai.model", "ai.temperature", "ai.max_tokens",
            "ai.timeout_seconds", "ai.no_ai_reply", "ai.system_prompt",
            "ai.vision_enabled", "ai.vision_prompt"],

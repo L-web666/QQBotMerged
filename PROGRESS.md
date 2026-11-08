@@ -16,7 +16,7 @@
 
 ## 当前状态
 
-- 程序版本：**v1.3.1**（唯一来源 `core/version.py` 的 `__version__`；网页侧栏/关于页/接口都从这里取）
+- 程序版本：**v1.3.2**（唯一来源 `core/version.py` 的 `__version__`；网页侧栏/关于页/接口都从这里取）
 - 启动命令：
   - 正常：`python run.py`
   - 自检：`python run.py --check`
@@ -29,7 +29,9 @@
     `test_member_role.py`（含身份解析 / gateway 解析 / 历史补齐）、`test_security_fixes.py`（审计回归）、
     `test_csp_boot.py`（CSP 与前端启动数据）、`test_plugin_sandbox.py`（插件软限制）、
     `test_dispatch_isolation.py`（插件分发状态线程隔离）、`test_ssrf_guard.py`（媒体下载 SSRF）、
-    `test_updater.py`（版本比较 / 自动更新安全检查与回滚）
+    `test_updater.py`（版本比较 / 自动更新安全检查与回滚）、
+    `test_auth.py`（令牌常数时间比较 / 暴力破解防护 / 弱令牌告警）、
+    `test_security_audit.py`（配置安全体检 / 审计日志与脱敏）
   - 单实例锁：`python tests/test_instance_lock.py`
   - 前端契约：`python tests/check_frontend.py`
   - DOM 会话列表：`node tests/dom_test_conversations.js`
@@ -264,6 +266,57 @@
     强制走回退逻辑；**把 `latestVersion()` 改回读 `.version` 时该测试会红**
     （实测「最新版本」变回"未检查"、提示变成"新版本"没具体版本号）。
     全套回归：`test_offline` 576 项、`check_frontend`、14 个单元测试、5 个 DOM、单实例锁全绿。
+
+- 2026-11-09：**新增配置安全体检 + 敏感操作审计日志**：
+  - **配置安全体检（`core/security_audit.py`）**：启动时检查"单项看着正常、组合起来危险"
+    的配置，分级输出说明与修复建议（只报告不拦截；真正必须拦的「非本机 + 无令牌」
+    仍由原有逻辑拒绝启动）。覆盖：
+    · 弱令牌 + 对局域网开放 → **严重**（等于没有防护）；
+    · 令牌走明文 HTTP（未配 `web.public_base_url` 的 https）→ 风险；
+    · 看起来在反向代理后面但没开 `web.trust_proxy` → 提示（所有人共用一个来源 IP，
+      一个人猜错 10 次会把别人一起锁 5 分钟）；以及反过来"开了代理却没对外地址"；
+    · `ai.base_url` 是明文 HTTP（API Key 与对话可被镜像）→ 风险；
+    · 插件沙箱关闭 / 启动自动装更新 / 云同步开启 → 提示，并说明各自的风险边界。
+  - **审计日志（`core/audit_log.py` + `data/logs/audit.log`）**：记录"谁（来源 IP）
+    在什么时候做了什么改变状态的操作"，每行一条 JSON，便于排查。已接入：
+    修改配置（只记改了哪些**项名**，不记值）、关闭程序、安装更新、
+    清理媒体 / 裁剪消息库 / 归档禁言 / 修正群名。新增只读接口 `GET /api/admin/audit`。
+    **脱敏**：`token/secret/password/api_key` 等键名一律打码，长文本截断到 200 字符；
+    写日志失败不影响业务（已捕获 `OSError` 与 `ValueError`——后者是自测时发现的，
+    非法路径字符会抛 `ValueError` 而不只是 `OSError`）。
+  - **令牌强度判定抽成公共模块 `core/security_rules.py`**：启动告警与体检共用同一套规则。
+    不能从 `run.py` 反向导入（会形成 `run → core → run` 循环导入）。
+  - **新增配置** `web.trust_proxy`（默认关）：只有确实放在反向代理后面才打开，
+    打开后按 `X-Forwarded-For` 识别来源用于失败计数；直接对公网开放时不要开（该头可伪造）。
+  - **怎么验证**：新增 `tests/unit/test_security_audit.py`（38 项）：体检的七种危险组合
+    "该报的报、不该报的不误报"、空配置不崩、报告含图标说明建议；审计日志的格式、
+    **敏感字段打码**、长文本截断、按条读取、各动作名齐全、写入失败不抛异常。
+    另做了端到端实测：通过真实接口改一次配置，审计里出现
+    `config.update | client: 127.0.0.1 | detail: {"changed": ["web.page_size"]}`，
+    确认记了"改了什么"但**没有记值**。全套回归：`test_offline` 576 项、
+    `check_frontend`、16 个单元测试、5 个 DOM、单实例锁、`run.py --check` 全绿。
+
+- 2026-11-09：**后台令牌加固：常数时间比较 + 暴力破解防护 + 弱令牌告警；发布 v1.3.2**：
+  - **改了什么（三处）**：
+    1. **令牌比较改为常数时间**：原来 `provided == expected` 直接比字符串。
+       字符串比较会先比长度、再逐字节比，长度或前缀不同的输入耗时不同，
+       能通过响应时间做侧信道推断。改为两边各取 SHA-256 摘要（长度固定 32 字节）
+       再 `hmac.compare_digest`；**不能**直接 `compare_digest(str, str)`（非 ASCII 会抛
+       `TypeError`），所以先转摘要。
+    2. **暴力破解防护**：按来源 IP 统计连续失败，5 分钟窗口内失败达 10 次即返回
+       **429** 并锁定 5 分钟；成功一次立即清零，正常用户打错一两次不受影响。
+       不信任 `X-Forwarded-For`（可伪造），除非显式打开 `web.trust_proxy`。
+    3. **弱令牌告警**：启动时检查令牌强度（过短 / 纯数字 / 单字符 / 连续串 /
+       常见弱口令片段），**只告警不拦截** —— 拦截会让正在用的旧配置突然起不来。
+       并给出生成强令牌的命令。
+  - **为什么改**：令牌是这套后台唯一的防线（没有账号体系），而它原本既没有
+    抗暴力破解，也没有抗时序侧信道。
+  - **怎么验证**：新增 `tests/unit/test_auth.py`（31 项）：源码层断言不再用 `==`
+    且确实用了 `compare_digest` + SHA-256；比较函数的正确性与非 ASCII 安全性；
+    长度差异不足 3 倍耗时差；接口层 401 → 第 10 次起 429、封锁期间正确令牌也被拒、
+    新实例计数从零、未配置令牌不拦截；弱令牌检查的命中与不误报。
+    **把 `_token_equal` 改回 `==` 后测试会红**（已验证）。全套回归：
+    `test_offline` 576 项、`check_frontend`、15 个单元测试、5 个 DOM、单实例锁全绿。
 
 - 2026-11-08：**自动更新加上"双源校验"（commit 身份 + 本地 sha256 指纹）；发布 v1.3.1**：
   - **改了什么**：`Updater` 新增 `resolve_tag_commit()` / `verify_download()` /

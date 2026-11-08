@@ -52,6 +52,8 @@ from core.logger import Logger              # noqa: E402
 from core.runtime import Runtime            # noqa: E402
 from core import version as version_module  # noqa: E402
 from core import updater as updater_module  # noqa: E402
+from core import security_audit             # noqa: E402
+from core.security_rules import token_weakness  # noqa: E402
 
 
 # ======================================================================================
@@ -518,6 +520,15 @@ def self_check(config_path: str = "") -> int:
     return 0
 
 
+def _token_weakness(token: str) -> str:
+    """检查访问令牌强度（实现在 `core/security_rules.py`，这里保留薄封装）。
+
+    单独放模块是为了让 `core/security_audit.py` 也能复用同一套判定，
+    而不会形成 `run → core → run` 的循环导入。
+    """
+    return token_weakness(token)
+
+
 def startup_update_check(config, log) -> None:
     """启动时**异步**检查更新（不阻塞启动，失败只记一行日志）。
 
@@ -681,6 +692,19 @@ def main() -> int:
             log.info("（已设置访问令牌：请在网页提示处输入，或加 ?token=你的令牌）")
         if not token and host in ("127.0.0.1", "localhost", "::1"):
             log.info("（仅本机可访问，未设置令牌）")
+
+        # 配置安全体检：单项看着都正常，危险往往出在组合上
+        # （弱令牌 + 对局域网开放、令牌走明文 HTTP、反代后没开 trust_proxy…）。
+        # 只报告不拦截：真正必须拦的「非本机 + 无令牌」在下面单独判断并拒绝启动。
+        try:
+            report = security_audit.check_config(config)
+            for line in security_audit.format_report(report):
+                if line.lstrip().startswith("🔴") or line.startswith("配置安全体检：发现"):
+                    log.warning(line)
+                else:
+                    log.info(line)
+        except Exception as exc:        # 体检本身绝不能影响启动
+            log.debug("配置安全体检失败（不影响使用）：%s", exc)
 
         def shutdown(*_args):
             log.info("收到退出信号，正在停止…")

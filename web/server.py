@@ -12,6 +12,8 @@
 - 文件：本地上传，平台不支持文件消息时自动退化为发下载链接，并把原因回给页面。
 """
 
+import hashlib
+import hmac
 import json
 import logging
 import mimetypes
@@ -29,6 +31,7 @@ from flask import (Flask, Blueprint, Response, jsonify, render_template, request
 from core import config_schema as schema
 from core import media_store as media_module
 from core.ai_client import redact_text as _ai_redact_text
+from core import audit_log
 from core import paths
 from core import updater as updater_module
 from core import version as version_module
@@ -53,14 +56,86 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
     def runtime():
         return state.get("runtime")
 
+    def audit(action: str, target: str = "", result: str = "ok", detail=None):
+        """记录一条审计日志（谁从哪里做了什么）。
+
+        只记"改变状态或可能造成破坏"的操作；写日志失败不影响业务。
+        """
+        try:
+            audit_log.record(action, target=target, result=result, detail=detail,
+                             client=audit_log.client_of(request))
+        except Exception as exc:            # 审计绝不能让接口失败
+            logger.debug("写审计日志失败：%s", exc)
+
+    # ---- 令牌校验的失败计数（防暴力猜令牌）----
+    # 记录"来源 IP → (连续失败次数, 首次失败时间)"。超过阈值就短时间内直接拒绝，
+    # 让"本地/局域网里反复试令牌"这条路走不通；正常用户打错一两次不受影响。
+    auth_failures: Dict[str, Dict[str, float]] = {}
+    AUTH_MAX_FAILURES = 10          # 连续失败多少次开始封锁
+    AUTH_WINDOW_SECONDS = 300       # 统计窗口（5 分钟）
+    AUTH_BLOCK_SECONDS = 300        # 封锁时长（5 分钟）
+
+    def _client_key() -> str:
+        # 不信任 X-Forwarded-For（可由客户端伪造）；只有显式配置了代理才用
+        forwarded = ""
+        try:
+            if config_manager.config.bool_of("web", "trust_proxy", default=False):
+                forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        except Exception:
+            forwarded = ""
+        return forwarded or (request.remote_addr or "unknown")
+
+    def _auth_blocked(key: str) -> bool:
+        record = auth_failures.get(key)
+        if not record:
+            return False
+        now = time.time()
+        if now - record["first"] > AUTH_WINDOW_SECONDS:
+            auth_failures.pop(key, None)       # 窗口过期，重新计数
+            return False
+        return record["count"] >= AUTH_MAX_FAILURES
+
+    def _note_auth_failure(key: str):
+        now = time.time()
+        record = auth_failures.get(key)
+        if not record or now - record["first"] > AUTH_WINDOW_SECONDS:
+            auth_failures[key] = {"count": 1, "first": now}
+        else:
+            record["count"] += 1
+        # 简单上限，防止来源 IP 无限增长
+        if len(auth_failures) > 2000:
+            for old in list(auth_failures.keys())[:1000]:
+                auth_failures.pop(old, None)
+
+    def _token_equal(provided: str, expected: str) -> bool:
+        """常数时间比较：避免用 `==` 时通过响应耗时逐字节猜出令牌。
+
+        `hmac.compare_digest` 对**长度不同**的输入仍会提前返回，所以先各自
+        取 SHA-256 摘要（固定 32 字节）再比，长度差异也就被抹平了。
+        注意不能直接 `compare_digest(str, str)`：非 ASCII 字符会抛 TypeError。
+        """
+        left = hashlib.sha256(str(provided or "").encode("utf-8")).digest()
+        right = hashlib.sha256(str(expected or "").encode("utf-8")).digest()
+        return hmac.compare_digest(left, right)
+
     def check_token() -> Optional[Response]:
         """校验访问令牌：配置了 token 就必须带对（?token= 或 X-Auth-Token）。"""
         expected = secret.get("token") or config_manager.config.str_of("web", "token", default="")
         if not expected:
             return None
+        key = _client_key()
+        if _auth_blocked(key):
+            logger.warning("令牌尝试次数过多，暂时拒绝：%s", key)
+            return jsonify({"success": False, "auth_required": True,
+                            "message": "令牌错误次数过多，请 %d 分钟后再试"
+                                       % (AUTH_BLOCK_SECONDS // 60)}), 429
         provided = (request.args.get("token") or request.headers.get("X-Auth-Token") or "").strip()
-        if provided == expected:
+        if _token_equal(provided, expected):
+            auth_failures.pop(key, None)       # 成功即清零
             return None
+        _note_auth_failure(key)
+        logger.warning("令牌校验失败（来源 %s，累计 %d 次）", key,
+                       (auth_failures.get(key) or {}).get("count", 1))
         return jsonify({"success": False, "message": "token 无效或缺失", "auth_required": True}), 401
 
     def guard():
@@ -898,7 +973,14 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         try:
             applied, need_restart, changed = config_manager.apply_incoming(incoming, target_bot)
         except Exception as exc:
+            audit("config.update", target=target_bot or "global", result="failed",
+                  detail={"error": str(exc)})
             return jsonify({"success": False, "message": str(exc)}), 400
+        # 审计：只记"改了哪些配置项"，**不记具体值**（里面可能有令牌/密钥）
+        if changed:
+            audit("config.update", target=target_bot or "global",
+                  detail={"changed": list(changed)[:40],
+                          "need_restart": list(need_restart)[:20]})
         rt = runtime()
         hot = []
         if rt is not None and changed:
@@ -1417,17 +1499,24 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         body = request.get_json(silent=True) or {}
         action = str(body.get("action") or "")
         if action == "cleanup_media":
-            removed = rt.media.cleanup(int(body.get("days") or 0))
+            days = int(body.get("days") or 0)
+            removed = rt.media.cleanup(days)
+            audit("maintenance.cleanup_media", detail={"days": days, "removed": removed})
             return jsonify({"success": True, "message": f"已清理 {removed} 个媒体文件"})
         if action == "trim_db":
             rt.store.trim()
+            audit("maintenance.trim_db")
             return jsonify({"success": True, "message": "已按保留策略裁剪消息库"})
         if action == "expire_mutings":
             count = rt.store.expire_mutings()
+            audit("maintenance.expire_mutings", detail={"count": count})
             return jsonify({"success": True, "message": f"已归档 {count} 条到期禁言"})
         if action == "fix_group_names":
             # 手动修正：清理"群名被写成最后发言者昵称"的历史数据（默认不会自动做）
             result = rt.group_manager.repair_suspect_names()
+            audit("maintenance.fix_group_names",
+                  result="ok" if result.get("success") else "failed",
+                  detail={"summary": str(result.get("message") or "")[:120]})
             return jsonify(result), (200 if result.get("success") else 502)
         if action == "group_name_suspects":
             return jsonify({"success": True,
@@ -1491,6 +1580,10 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
             tag = str(latest.get("tag") or latest.get("latest") or "")
         if not tag:
             return jsonify({"success": False, "message": "拿不到可安装的版本号"}), 400
+
+        # 审计：安装更新会覆盖程序文件，必须留痕（记谁发起的、目标版本）
+        audit("update.install", target=tag,
+              detail={"from_version": engine.current_version})
 
         def _worker():
             try:
@@ -1708,6 +1801,20 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
                                    as_admin=bool(body.get("as_admin")))
         return jsonify(result), (200 if result.get("success") else 502)
 
+    @app.route("/api/admin/audit")
+    def admin_audit():
+        """最近的审计记录（谁在什么时候做了什么敏感操作）。"""
+        blocked = check_token()
+        if blocked:
+            return blocked
+        try:
+            limit = int(request.args.get("limit") or 200)
+        except (TypeError, ValueError):
+            limit = 200
+        entries = audit_log.read_tail(limit)
+        return jsonify({"success": True, "path": audit_log.audit_path(),
+                        "count": len(entries), "entries": entries})
+
     # ================================================================== 关闭程序
     @app.route("/api/admin/shutdown", methods=["GET", "POST"])
     def admin_shutdown():
@@ -1726,6 +1833,8 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
             return jsonify({"success": True, "shutdown": rt.is_shutdown_requested()})
         body = request.get_json(silent=True) or {}
         reason = str(body.get("reason") or "网页按钮")
+        # 审计：关闭是破坏性操作，必须留痕
+        audit("program.shutdown", target="runtime", detail={"reason": reason})
         rt.request_shutdown(reason)
         return jsonify({"success": True,
                         "message": "已请求关闭程序，正在停止机器人与网页服务…"})
