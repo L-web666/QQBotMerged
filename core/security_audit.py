@@ -62,6 +62,15 @@ def check_config(config) -> List[Dict[str, Any]]:
             "监听 %s:%s，任何能访问该端口的人都能发消息、改配置、禁言、关程序。" % (host, port),
             "设置 web.token，或改成 --host 127.0.0.1", "web.token")
 
+    if not token and local_only:
+        # **本机监听 + 空令牌也不是安全的**：你打开的任意网页都能用"跨站简单请求"
+        # 让本机浏览器替你发 POST（text/plain 不触发预检），从而关掉程序、驱动更新端点。
+        # CSRF 校验已经挡住了这条路，但"无鉴权"本身仍是不该保留的默认状态。
+        add("warning", "仅本机监听但没有设置访问令牌",
+            "未设置令牌时后台接口不做鉴权。虽然只监听 %s，但你在浏览器里打开的任意网页"
+            "都可能借本机发起请求（CSRF）。" % host,
+            "建议仍设置一个访问令牌（首次运行会自动生成一个）", "web.token")
+
     if token:
         from core.security_rules import token_generator_hint, token_weakness
         weak = token_weakness(token)

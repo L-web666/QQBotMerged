@@ -90,9 +90,25 @@ def main():
 
     try:
         # ================= A. 配置安全体检 =================
-        print("\n[A1] 默认配置（本机 + 无令牌）不应报警")
-        titles, _ = audit_with()
-        check("默认配置没有 critical/warning", not titles, str(titles))
+        print("\n[A1] 默认配置（本机 + 无令牌）应报出「无令牌」提示")
+        # 这条规则是补上的：本机 + 空令牌曾被当成安全，但实测跨站请求能借本机
+        # 浏览器关掉程序、驱动更新端点。现在会以 warning 级报出。
+        titles, issues = audit_with()
+        levels = {item["title"]: item["level"] for item in issues}
+        check("默认配置报出「仅本机监听但没有设置访问令牌」",
+              any("没有设置访问令牌" in t for t in titles), str(titles))
+        check("该项不低于 warning",
+              levels.get("仅本机监听但没有设置访问令牌") in ("warning", "critical"),
+              str(levels))
+
+        print("\n[A1b] 设置了强令牌后不再报告该问题")
+        titles, issues = audit_with(
+            web__token="Xk9mQ2pL7vR4nT8wZ1bYc3dE")
+        check("有令牌时不再报无令牌",
+              not any("没有设置访问令牌" in t for t in titles), str(titles))
+        check("本机 + 强令牌没有 critical/warning",
+              not [i for i in issues if i["level"] in ("critical", "warning")],
+              str([i["title"] for i in issues]))
 
         print("\n[A2] 弱令牌 + 对局域网开放 → 严重")
         titles, issues = audit_with(web__host="0.0.0.0", web__token="12345678")

@@ -16,7 +16,7 @@
 
 ## 当前状态
 
-- 程序版本：**v1.3.2**（唯一来源 `core/version.py` 的 `__version__`；网页侧栏/关于页/接口都从这里取）
+- 程序版本：**v1.3.3**（唯一来源 `core/version.py` 的 `__version__`；网页侧栏/关于页/接口都从这里取）
 - 启动命令：
   - 正常：`python run.py`
   - 自检：`python run.py --check`
@@ -31,7 +31,8 @@
     `test_dispatch_isolation.py`（插件分发状态线程隔离）、`test_ssrf_guard.py`（媒体下载 SSRF）、
     `test_updater.py`（版本比较 / 自动更新安全检查与回滚）、
     `test_auth.py`（令牌常数时间比较 / 暴力破解防护 / 弱令牌告警）、
-    `test_security_audit.py`（配置安全体检 / 审计日志与脱敏）
+    `test_security_audit.py`（配置安全体检 / 审计日志与脱敏）、
+    `test_csrf.py`（跨站请求防护 / 首次运行生成令牌）
   - 单实例锁：`python tests/test_instance_lock.py`
   - 前端契约：`python tests/check_frontend.py`
   - DOM 会话列表：`node tests/dom_test_conversations.js`
@@ -266,6 +267,40 @@
     强制走回退逻辑；**把 `latestVersion()` 改回读 `.version` 时该测试会红**
     （实测「最新版本」变回"未检查"、提示变成"新版本"没具体版本号）。
     全套回归：`test_offline` 576 项、`check_frontend`、14 个单元测试、5 个 DOM、单实例锁全绿。
+
+- 2026-11-09：**修 CSRF（跨站请求伪造）+ 首次运行自动生成令牌；发布 v1.3.3**：
+  - **问题（已实测复现）**：全仓没有任何 `Origin` / `Sec-Fetch-*` 校验，
+    而默认配置是「只监听 127.0.0.1 + 令牌为空」，`check_token()` 此时直接 `return None`。
+    于是任意网页都能用**跨站简单请求**（`Content-Type: text/plain`，不触发预检）
+    POST 到 `/api/admin/shutdown` 或 `/api/admin/update/install`，让本机浏览器替它发请求。
+    实测：`update/install` 返回 409「当前已是最新版本」（说明已进入完整更新逻辑，
+    只是恰好版本相同），`/api/admin/config` 更是直接返回 200 并写入了配置。
+  - **改法 1：全局 CSRF 拦截**。新增 `before_request` 钩子 `csrf_guard()`，对所有写方法
+    （POST/PUT/PATCH/DELETE）校验来源，只放行这几种：
+    · `Sec-Fetch-Site: same-origin / none / same-site`（浏览器自动带，脚本改不了）；
+    · `Origin` 与本次请求 Host 同源（含 127.0.0.1/localhost/::1 互认）；
+    · `Origin` 与 `web.public_base_url` 同源（反向代理：外部域名 ≠ 内部 Host）；
+    · 两者都没有（curl/脚本）：放行 —— 这类请求无法携带浏览器凭据，不属 CSRF 攻击面。
+    放在 `before_request` 而非逐个接口，是为了**新增端点自动获得防护**，不依赖有人记得调用。
+  - **改法 2：首次运行自动生成令牌**。令牌为空时用 `secrets.token_urlsafe(24)`
+    生成 32 位令牌写进 `config.json`；**配置落盘在 logger 初始化之前**，所以令牌不会
+    留下任何日志痕迹。完整令牌只打印到**控制台**（方便首次复制），日志里只有打码形式。
+    已有令牌永不覆盖。
+  - **补充体检规则**：原来 `if not token and not local_only` 把「本机 + 空令牌」当成安全，
+    而这正是本次被证实的利用组合。现在本机 + 空令牌也会报 warning
+    （说明可能被跨站请求利用）。实测启动日志从「✅ 没有发现明显问题」变为如实报告。
+  - **审计补全**：失败的敏感操作同样留痕（此前只记成功）。
+    新增 `security.csrf_blocked`（含来源 Origin 与目标路径）、`security.auth_failed`、
+    `security.auth_blocked`，以及被拒绝的 `update.install`（`result="denied"`）。
+    审计里**不记录请求带来的令牌原文**。
+  - **怎么验证**：新增 `tests/unit/test_csrf.py`（27 项）：跨站 POST 到
+    shutdown/update/install/maintenance/config 全部 403；同源、无来源头、same-site 放行；
+    GET 不受影响；拦截留痕；**带正确令牌的跨站请求也先被 403**（不泄漏令牌有效性）；
+    失败鉴权留痕且不含令牌原文；首次生成令牌的长度/强度/落盘/不覆盖。
+    **把 `check_csrf` 改成直接放行后测试会红（实测 9 项失败，其中跨站改配置直接返回 200）**。
+    `test_security_audit.py` 相应更新为"默认配置必须报出无令牌"（41 项）。
+    全套回归：`test_offline` 576 项、`check_frontend`、17 个单元测试、5 个 DOM、
+    单实例锁、`run.py --check` 全绿。
 
 - 2026-11-09：**新增配置安全体检 + 敏感操作审计日志**：
   - **配置安全体检（`core/security_audit.py`）**：启动时检查"单项看着正常、组合起来危险"

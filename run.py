@@ -16,6 +16,7 @@ import argparse
 import json
 import logging
 import os
+import secrets
 import signal
 import sys
 import threading
@@ -529,6 +530,49 @@ def _token_weakness(token: str) -> str:
     return token_weakness(token)
 
 
+def ensure_access_token(config_manager) -> str:
+    """首次运行时自动生成访问令牌并写进 config.json，返回生成的令牌（没生成则为空）。
+
+    **为什么**：空令牌时 `check_token()` 直接放行，本机浏览器就可能被跨站请求
+    当成载体去关程序、驱动更新端点。CSRF 校验已经挡了一层，但"默认无鉴权"
+    本身就是不安全的默认值，这里把它改成安全默认。
+
+    **可见性**：令牌以 `print` 输出到**控制台**（方便第一次复制），
+    **不写进日志文件**（日志会被云同步上传、会被发到群里截图）。
+    日志里只出现打码后的形式。
+
+    **不覆盖已有令牌**：只有原本为空时才生成；用户自己设过的永远不动。
+    """
+    try:
+        current = config_manager.config.str_of("web", "token", default="")
+    except Exception:
+        return ""
+    if current:
+        return ""
+    try:
+        new_token = secrets.token_urlsafe(24)      # 32 个字符，约 192 bit
+        config_manager.set_path("web.token", new_token)
+        config_manager.save()
+    except Exception as exc:
+        print("⚠️  自动生成访问令牌失败（不影响启动，可稍后在设置里手动设置）：%s" % exc)
+        return ""
+
+    port = 8666
+    try:
+        port = config_manager.config.int_of("web", "port", default=8666)
+    except Exception:
+        pass
+    masked = new_token[:4] + "…" + new_token[-4:]
+    print("=" * 66)
+    print("🔑 已为你生成后台访问令牌（写入了 config.json 的 web.token）")
+    print("   令牌：%s" % new_token)
+    print("   访问地址：http://127.0.0.1:%d/?token=%s" % (port, new_token))
+    print("   日志里只会显示为 %s，请把上面这行**保存好**（浏览器会记住这次的令牌）" % masked)
+    print("   想换掉它：设置 → 网页后台 → 访问令牌，填新的后重启")
+    print("=" * 66)
+    return new_token
+
+
 def startup_update_check(config, log) -> None:
     """启动时**异步**检查更新（不阻塞启动，失败只记一行日志）。
 
@@ -605,6 +649,8 @@ def main() -> int:
 
     paths.ensure_dirs()
     config_manager = load_config(args.config or None)
+    # 首次运行自动生成访问令牌（写在配置落盘之前，见函数说明）
+    ensure_access_token(config_manager)
     config = config_manager.config
     logger = build_logger(config, config_manager)
     log = logger.get_logger()

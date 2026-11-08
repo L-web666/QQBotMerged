@@ -126,6 +126,9 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         key = _client_key()
         if _auth_blocked(key):
             logger.warning("令牌尝试次数过多，暂时拒绝：%s", key)
+            # 取证：因爆破被拒的请求也要留痕
+            audit("security.auth_blocked", target=request.path, result="denied",
+                  detail={"key": key, "method": request.method})
             return jsonify({"success": False, "auth_required": True,
                             "message": "令牌错误次数过多，请 %d 分钟后再试"
                                        % (AUTH_BLOCK_SECONDS // 60)}), 429
@@ -134,14 +137,103 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
             auth_failures.pop(key, None)       # 成功即清零
             return None
         _note_auth_failure(key)
-        logger.warning("令牌校验失败（来源 %s，累计 %d 次）", key,
-                       (auth_failures.get(key) or {}).get("count", 1))
+        failures = (auth_failures.get(key) or {}).get("count", 1)
+        logger.warning("令牌校验失败（来源 %s，累计 %d 次）", key, failures)
+        # 取证：失败的鉴权尝试同样留痕（**不记录提供的令牌内容**）
+        audit("security.auth_failed", target=request.path, result="denied",
+              detail={"key": key, "count": failures, "method": request.method})
         return jsonify({"success": False, "message": "token 无效或缺失", "auth_required": True}), 401
 
     def guard():
         """返回 401 或 None，供每个接口调用。"""
         blocked = check_token()
         return blocked
+
+    # ---- CSRF 防护（跨站请求伪造）----
+    # 背景：默认配置是「只监听本机 + 不设令牌」，`check_token()` 此时直接放行。
+    # 于是任意网页只要用**跨站简单请求**（`Content-Type: text/plain`，不触发预检）
+    # POST 到 /api/admin/shutdown 或 /api/admin/update/install，就能让本机浏览器
+    # 替它发请求 —— 已实测能真正关掉程序、并进入更新逻辑。
+    #
+    # 做法：对**所有会改变状态的方法**（POST/PUT/PATCH/DELETE）校验来源。
+    # 只放行这几种，而不是去拦"看起来像外站"的请求（白名单思路更不容易漏）：
+    #   · Sec-Fetch-Site: same-origin / none / same-site（浏览器自动带，脚本改不了）
+    #   · Origin 与本次请求的 Host 同源
+    #   · Origin 与配置里的 web.public_base_url 同源（反向代理场景：外部域名≠内部 Host）
+    #   · 两者都没有（curl / 脚本 / 旧浏览器）：放行 —— 但这类请求本来就无法携带
+    #     浏览器凭据，不属于 CSRF 的攻击面；真正的防护仍是令牌。
+    _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+
+    def _origin_allowed(origin: str) -> bool:
+        """判断 Origin 头是否与本站同源。"""
+        if not origin:
+            return False
+        try:
+            parsed = urlparse(origin)
+        except ValueError:
+            return False
+        origin_host = (parsed.hostname or "").strip().lower()
+        origin_port = parsed.port
+        if not origin_host:
+            return False
+        # 本次请求的 Host（浏览器发的 Origin 会与之一致）
+        request_host = ""
+        try:
+            request_host = (urlparse("//" + (request.host or "")).hostname or "").lower()
+        except ValueError:
+            request_host = ""
+        candidates = {request_host}
+        # 反向代理：外部域名与内部 Host 不同，允许配置里的对外地址
+        try:
+            public = config_manager.config.str_of("web", "public_base_url", default="")
+            if public:
+                candidates.add((urlparse(public).hostname or "").lower())
+        except Exception:
+            pass
+        candidates.discard("")
+        if origin_host in candidates:
+            return True
+        # 本机访问的各种写法：127.0.0.1 / localhost / ::1 视为同一台机器
+        local_names = {"127.0.0.1", "localhost", "::1", "[::1]"}
+        if origin_host in local_names and (candidates & local_names):
+            # 端口也要一致（同端口才是同源）；没写端口按协议默认端口
+            if origin_port is None:
+                return True
+            for candidate in candidates:
+                if candidate in local_names:
+                    return True
+            return False
+        return False
+
+    def check_csrf() -> Optional[Response]:
+        """校验写操作是否来自本站。返回 403 表示拒绝，None 表示放行。"""
+        if request.method in _SAFE_METHODS:
+            return None
+        # 1) 浏览器自动带的 Sec-Fetch-Site：最可靠，脚本无法伪造
+        site = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site in ("same-origin", "none", "same-site"):
+            return None
+        if site == "cross-site":
+            logger.warning("拒绝跨站写请求：%s %s（Origin=%s）", request.method,
+                           request.path, request.headers.get("Origin") or "-")
+            # 取证：被 CSRF 拦下的请求也要留痕（失败的敏感操作同样重要）
+            audit("security.csrf_blocked", target=request.path, result="denied",
+                  detail={"origin": request.headers.get("Origin") or "",
+                          "sec_fetch_site": site, "method": request.method})
+            return jsonify({"success": False, "cross_site_blocked": True,
+                            "message": "已拒绝跨站请求（CSRF 防护）："
+                                       "请从本程序的后台页面操作"}), 403
+        # 2) 没有 Sec-Fetch-Site（旧浏览器/部分代理）：退回校验 Origin
+        origin = (request.headers.get("Origin") or "").strip()
+        if origin:
+            if _origin_allowed(origin):
+                return None
+            logger.warning("拒绝来源不符的写请求：%s %s（Origin=%s）", request.method,
+                           request.path, origin)
+            return jsonify({"success": False, "cross_site_blocked": True,
+                            "message": "已拒绝来源不明的请求（CSRF 防护）"}), 403
+        # 3) 两者都没有：非浏览器客户端（curl/脚本），CSRF 不适用，放行
+        return None
 
     def _upload_limit_bytes(rt) -> int:
         """单次上传允许读入内存的上限（业务上限，比 HTTP 层的 256MiB 小得多）。"""
@@ -217,6 +309,15 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         if request.path.startswith("/api/"):
             return jsonify({"success": False, "message": "接口不存在"}), 404
         return render_template("index.html", boot=boot_payload()), 404
+
+    @app.before_request
+    def csrf_guard():
+        """全局 CSRF 拦截：写操作先过来源校验，再到各接口自己的令牌检查。
+
+        放在 before_request 而不是逐个接口里加，是为了**不遗漏**：
+        新增端点时自动获得防护，不依赖有人记得调用。
+        """
+        return check_csrf()
 
     @app.after_request
     def security_headers(response):
@@ -1564,6 +1665,8 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
                             "message": "自动更新已在设置里关闭（update.enabled）"}), 403
         engine = _updater()
         if engine.state.snapshot().get("busy"):
+            audit("update.install", target="busy", result="denied",
+                  detail={"reason": "已有更新在进行中"})
             return jsonify({"success": False, "message": "已经有一个更新在进行中"}), 409
 
         body = request.get_json(silent=True) or {}
@@ -1572,9 +1675,16 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
             # 没指定版本就现查一次，用最新版本
             latest = engine.check(force=True)
             if latest.get("error"):
+                audit("update.install", target="", result="failed",
+                      detail={"reason": "检查更新失败", "error": str(latest["error"])[:120]})
                 return jsonify({"success": False,
                                 "message": "检查更新失败：%s" % latest["error"]}), 502
             if not latest.get("has_update"):
+                # 取证：被拒绝的更新尝试也要留痕（无鉴权时这里最容易被远程触发）
+                audit("update.install", target=str(latest.get("latest") or ""),
+                      result="denied",
+                      detail={"reason": "已是最新版本",
+                              "current": engine.current_version})
                 return jsonify({"success": False, "message": "当前已是最新版本",
                                 "current": engine.current_version}), 409
             tag = str(latest.get("tag") or latest.get("latest") or "")
