@@ -364,6 +364,112 @@ def main():
         except UpdateError:
             fallback, fallback_safe = "(被拒绝)", True
         check("HTTP（非 HTTPS）候选被忽略，只回退到 HTTPS", fallback_safe, fallback)
+
+        # ---------- 16. 双源校验：tag → commit → 下载 → 比对 ----------
+        print("\n[16] 双源校验（commit 身份 + 本地字节指纹）")
+        dvs = Updater(base_dir=root, data_dir=os.path.join(root, "dvs"))
+        COMMIT = "44d84b77df09f7dad809f80d4f2aed3f2bc9a137"
+        SHA = "d65f924c61da363864b7da0e6e2f82216c637ded62110129e38ea284cebb1284"
+
+        # refs 接口用桩替换（不联网）：模拟"附注 tag 指向 commit"
+        calls = {"count": 0}
+
+        def fake_refs(_tag):
+            calls["count"] += 1
+            return COMMIT
+
+        original_resolve = dvs.resolve_tag_commit
+        dvs.resolve_tag_commit = fake_refs
+        try:
+            # 先写一条"下载记录"，模拟刚下载完的现场
+            dvs._write_download_record("v1.3.0", {
+                "tag": "v1.3.0", "commit": COMMIT, "sha256": SHA,
+                "bytes": 1234, "downloaded_at": 0})
+
+            info = dvs.verify_download("v1.3.0", COMMIT, SHA)
+            check("三处一致时校验通过", info.get("sha256") == SHA, str(info))
+            check("返回的 commit 正确", info.get("commit") == COMMIT, "")
+
+            # sha256 被改
+            try:
+                dvs.verify_download("v1.3.0", COMMIT, "0" * 64)
+                rejected = False
+            except UpdateError as exc:
+                rejected = "sha256" in str(exc)
+            check("sha256 不一致被拒绝", rejected, "")
+
+            # commit 被换成别的
+            try:
+                dvs.verify_download("v1.3.0", "1" * 40, SHA)
+                rejected = False
+            except UpdateError as exc:
+                rejected = "commit" in str(exc)
+            check("commit 不一致被拒绝", rejected, "")
+
+            # 格式不合法
+            for bad_sha in ("", "abc", "z" * 64):
+                try:
+                    dvs.verify_download("v1.3.0", COMMIT, bad_sha)
+                    rejected = False
+                except UpdateError:
+                    rejected = True
+                check(f"非法 sha256 {bad_sha[:8] or '(空)'!r} 被拒绝", rejected, "")
+            for bad_commit in ("", "xyz", "1" * 39):
+                try:
+                    dvs.verify_download("v1.3.0", bad_commit, SHA)
+                    rejected = False
+                except UpdateError:
+                    rejected = True
+                check(f"非法 commit {bad_commit[:8] or '(空)'!r} 被拒绝", rejected, "")
+
+            # refs 接口给出的 commit 与调用方先前拿到的不一致
+            # （模拟：下载期间 tag 被改指向了别的 commit）
+            dvs.resolve_tag_commit = lambda _tag: "2" * 40
+            try:
+                dvs.verify_download("v1.3.0", COMMIT, SHA)
+                rejected = False
+            except UpdateError as exc:
+                rejected = "发生变化" in str(exc)
+            check("tag 指向的 commit 变了会被拒绝", rejected, "")
+        finally:
+            dvs.resolve_tag_commit = original_resolve
+
+        # ---------- 17. 本地包复用前必须重新校验 ----------
+        print("\n[17] 本地已下载的包：校验通过才复用，被改过就重下")
+        pkg = os.path.join(dvs.download_dir, "v1.3.0.tar.gz")
+        os.makedirs(dvs.download_dir, exist_ok=True)
+        with open(pkg, "wb") as handle:
+            handle.write(b"original-package-content")
+        good = dvs._sha256_of(pkg)
+        dvs._write_download_record("v1.3.0", {
+            "tag": "v1.3.0", "commit": COMMIT, "sha256": good, "bytes": 24,
+            "downloaded_at": 0})
+        stale = dvs.verify_local_package("v1.3.0")
+        check("记录与文件一致时 ok=True", stale.get("ok") is True, str(stale))
+
+        # 文件被换掉 → 校验应失败
+        with open(pkg, "wb") as handle:
+            handle.write(b"tampered!!")
+        tampered = dvs.verify_local_package("v1.3.0")
+        check("文件被替换后 ok=False", tampered.get("ok") is False, str(tampered))
+        check("提示里说明可能被替换",
+              "不一致" in (tampered.get("message") or ""), tampered.get("message"))
+
+        # ---------- 18. 版本号以"被更新的目录"为准 ----------
+        print("\n[18] current_version 读的是程序目录里的版本，不是进程里的")
+        fake_dir = os.path.join(root, "fakever")
+        os.makedirs(os.path.join(fake_dir, "core"), exist_ok=True)
+        with open(os.path.join(fake_dir, "core", "version.py"), "w", encoding="utf-8") as h:
+            h.write('__version__ = "7.7.7"\n')
+        check("能从指定目录读出 7.7.7",
+              updater_module._read_version_of(fake_dir) == "7.7.7",
+              updater_module._read_version_of(fake_dir))
+        probe = Updater(base_dir=fake_dir, data_dir=os.path.join(fake_dir, "data"))
+        check("Updater.current_version 跟着目录走", probe.current_version == "7.7.7",
+              probe.current_version)
+        check("目录里没有版本文件时回退到本程序版本",
+              updater_module._read_version_of(os.path.join(root, "nope"))
+              == "", updater_module._read_version_of(os.path.join(root, "nope")))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

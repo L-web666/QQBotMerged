@@ -15,10 +15,10 @@ from typing import List, Optional, Tuple
 #
 # 版本规则：`主.次.修订`
 #   · 主版本：不兼容的大改（配置结构变动、需要手动迁移）
-#   · 次版本：新增功能（如本次的自动更新体系）
-#   · 修订号：只修 bug
+#   · 次版本：新增功能（如自动更新体系）
+#   · 修订号：安全加固与 bug 修复（如 v1.3.1 的更新包双源校验）
 # 注意：必须**严格递增**，否则已装旧版的用户收不到更新提示（按版本号比较）。
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 APP_NAME = "QQBotMerged"
 APP_TITLE = "QQ 机器人合并版"
@@ -31,6 +31,8 @@ REPO_URL = f"https://github.com/{REPO_SLUG}"
 RELEASES_URL = f"{REPO_URL}/releases"
 RELEASES_API = f"https://api.github.com/repos/{REPO_SLUG}/releases"
 TAGS_API = f"https://api.github.com/repos/{REPO_SLUG}/tags"
+# GitHub Git Data API（用来把 tag 解析成 commit，做双源校验）
+API_BASE = f"https://api.github.com/repos/{REPO_SLUG}"
 
 # 允许下载更新包的主机白名单（HTTPS only）。GitHub 的 tarball 会跳转到这些域名。
 ALLOWED_UPDATE_HOSTS = (

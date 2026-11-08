@@ -16,7 +16,7 @@
 
 ## 当前状态
 
-- 程序版本：**v1.3.0**（唯一来源 `core/version.py` 的 `__version__`；网页侧栏/关于页/接口都从这里取）
+- 程序版本：**v1.3.1**（唯一来源 `core/version.py` 的 `__version__`；网页侧栏/关于页/接口都从这里取）
 - 启动命令：
   - 正常：`python run.py`
   - 自检：`python run.py --check`
@@ -264,6 +264,34 @@
     强制走回退逻辑；**把 `latestVersion()` 改回读 `.version` 时该测试会红**
     （实测「最新版本」变回"未检查"、提示变成"新版本"没具体版本号）。
     全套回归：`test_offline` 576 项、`check_frontend`、14 个单元测试、5 个 DOM、单实例锁全绿。
+
+- 2026-11-08：**自动更新加上"双源校验"（commit 身份 + 本地 sha256 指纹）；发布 v1.3.1**：
+  - **改了什么**：`Updater` 新增 `resolve_tag_commit()` / `verify_download()` /
+    `verify_local_package()` 与下载记录（`data/update/downloads.json`）。
+    安装流程变为：**解析 tag → commit** → **按该 commit 下载**（`archive/<sha>.tar.gz`，
+    tag 若被改指向别的 commit 会 404）→ 下载完**再查一次 tag 指向**并与本地记录的
+    sha256 比对 → 全部一致才继续解压安装；任一项不符抛错并中止。
+    本地已下载的包再用前会**重新算 sha256**、并核对 commit，不一致就删除重下。
+  - **修了什么（一个隐患）**：`Updater.current_version` 原来取自"当前进程导入的版本"，
+    在副本/测试环境或"装了新版未重启"时不准。改为读**被更新目录**下 `core/version.py`
+    的版本（不 import，直接读文件）。
+  - **为什么改**：原来更新包**只靠 TLS**，没有任何内容校验；下载链路被换包、传输截断、
+    或 tag 发布后被改指向，都发现不了。
+  - **边界（如实写明，已同时写进 README 与界面提示）**：commit 与 sha256 两个来源
+    **都在 GitHub 上**，能挡住换包/损坏/tag 改指向，但**挡不住仓库本身被攻破**；
+    真正的信任锚需要发布方签名（离线私钥 + 内置公钥），本次**没有做**，
+    按用户选择只实现双源比对、不引入私钥。
+  - **界面**：更新卡片显示「已校验 commit xxxxxxxx · sha256 xxxxxxxx…」，
+    并常驻一段校验范围说明（明确"仓库被攻破时挡不住"）。
+  - **怎么验证**：`tests/unit/test_updater.py` 扩到 **94 项**（新增 [16] 双源校验：
+    三处一致通过、sha256 不符拒绝、commit 不符拒绝、非法格式拒绝、tag 改指向拒绝；
+    [17] 本地包校验与篡改识别；[18] current_version 跟随目录）；
+    `tests/dom_test_update.js` 扩到 **27 项**（新增 [9] 校验信息展示）。
+    **把 `verify_download` 改成直接放行后测试会红（实测 10 项失败）**。
+    另用真实 GitHub 实测：v1.3.0 解析出 commit `44d84b7…`、下载 sha256 `d65f924c…`，
+    双源比对通过；把本地包改掉后会检测到并重下；在副本上完整安装 98 个文件，
+    配置与 `data/` 未被动。全套回归：`test_offline` 576 项、`check_frontend`、
+    14 个单元测试、5 个 DOM、单实例锁全绿。
 
 - 2026-11-07：**加回版本号 + 从 GitHub 检查/下载/安装更新（发布 v1.3.0）**：
   - **版本号统一到 `core/version.py`**：`__version__` 是唯一来源，

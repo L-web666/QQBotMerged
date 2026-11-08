@@ -290,6 +290,24 @@ function main() {
     check('刷新后仍提示有可安装的新版本',
           el('updateInstall').style.display !== 'none', el('updateInstall').style.display);
 
+    // ---- [9] 双源校验结果要展示出来 ----
+    console.log('\n[9] 显示双源校验信息（commit / sha256）');
+    currentPayload = {
+      stage: 'idle', message: '', progress: 0, enabled: true,
+      current_display: SHOW, repo: 'L-web666/QQBotMerged',
+      pending_restart: false, last_install: {}, busy: false,
+      verify: { commit_short: '44d84b77df09', sha256_short: 'd65f924c61da' },
+    };
+    return Admin.loadUpdateStatus();
+  }).then(function () {
+    const html = el('updateGrid').innerHTML;
+    check('显示 commit 短哈希', html.indexOf('44d84b77df09') >= 0, html.slice(0, 260));
+    check('显示 sha256 短哈希', html.indexOf('d65f924c61da') >= 0, html.slice(0, 260));
+    check('提示里说明校验范围（不夸大）',
+          el('updateHint').innerHTML.indexOf('双源校验') >= 0 &&
+          el('updateHint').innerHTML.indexOf('挡不住') >= 0,
+          el('updateHint').innerHTML.slice(-220));
+
     console.log('\n' + '='.repeat(66));
     console.log('  通过 ' + PASSED.length + ' 项，失败 ' + FAILED.length + ' 项');
     FAILED.forEach(function (item) { console.log('   [FAIL] ' + item[0] + '  ' + item[1]); });

@@ -56,6 +56,11 @@ MAX_EXTRACT_BYTES = 256 * 1024 * 1024      # 解压后总大小上限
 DOWNLOAD_TIMEOUT = 30                      # 单个请求超时（秒）
 CACHE_MINUTES = 30                         # 检查结果缓存时间（避开 GitHub 限流）
 
+# git 对象 SHA（完整 40 位十六进制）
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+# 下载记录：每个版本一条 {tag, commit, sha256, bytes, downloaded_at}
+RECORD_FILE = "downloads.json"
+
 # 安装时必须存在、且必须"看起来像本项目"的文件（防止装进一个空包/错包）
 REQUIRED_FILES = ("run.py", os.path.join("core", "__init__.py"),
                   os.path.join("web", "templates", "index.html"))
@@ -73,6 +78,22 @@ _USER_AGENT = "QQBotMerged-Updater/1.0 (+%s)" % version_module.REPO_URL
 
 class UpdateError(RuntimeError):
     """更新过程中的可预期失败（网络/校验/安装），消息可直接给用户看。"""
+
+
+def _read_version_of(base_dir: str) -> str:
+    """从某个程序目录的 `core/version.py` 里读出 `__version__`。
+
+    直接读文件而**不 import**：要读的是"磁盘上这份代码"的版本，
+    而不是当前进程里已经加载的那个模块。
+    """
+    path = os.path.join(base_dir, "core", "version.py")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            source = handle.read(64 * 1024)
+    except OSError:
+        return ""
+    match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', source, re.M)
+    return version_module.normalize_version(match.group(1)) if match else ""
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +232,9 @@ class Updater:
         self.marker_file = os.path.join(self.update_dir, "last_install.json")
         self.state = UpdateState()
         self._install_lock = threading.Lock()
-        self.current_version = version_module.__version__
+        # 以**被更新的那份程序目录**里的版本号为准，而不是"当前进程导入的那个版本"：
+        # 这两者在测试/副本、以及"装了新版本但还没重启"的场景下会不同。
+        self.current_version = _read_version_of(self.base_dir) or version_module.__version__
 
     # ------------------------------------------------------------ 工具
     def _ensure_dirs(self):
@@ -375,20 +398,81 @@ class Updater:
             return url
         raise UpdateError("找不到合法的更新包下载地址（tag=%s）" % tag)
 
-    def download(self, tag: str, tarball_url: str = "") -> Tuple[str, str]:
-        """下载更新包，返回 (本地路径, sha256)。已下载过则直接复用。"""
+    # ------------------------------------------------ 双源校验（commit 身份）
+    def resolve_tag_commit(self, tag: str) -> str:
+        """把 tag 解析成它指向的 **commit SHA**（来源一：git refs 接口）。
+
+        两种 tag 都要处理：
+          · 轻量 tag：ref 直接指向 commit；
+          · 附注 tag：ref 指向一个 `tag` 对象，其中 `object.sha` 才是 commit
+            （本项目发布用的是附注 tag，所以这条分支一定会走到）。
+        """
+        ref = str(tag or "").strip()
+        if not ref:
+            raise UpdateError("没有指定版本标签")
+        payload = _read_json("%s/git/ref/tags/%s" % (version_module.API_BASE, ref))
+        if not isinstance(payload, dict):
+            raise UpdateError("GitHub 返回的 tag 信息格式不对（%s）" % ref)
+        target = payload.get("object") or {}
+        sha = str(target.get("sha") or "")
+        kind = str(target.get("type") or "")
+        if kind == "tag":
+            # 附注 tag：再解一次，拿到真正的 commit
+            annotated = _read_json("%s/git/tags/%s" % (version_module.API_BASE, sha))
+            sha = str(((annotated or {}).get("object") or {}).get("sha") or "")
+            kind = "commit"
+        if not sha or not _SHA_RE.match(sha):
+            raise UpdateError("解析 tag %s 的 commit 失败" % ref)
+        return sha.lower()
+
+    def download(self, tag: str, tarball_url: str = "",
+                 expected_commit: str = "") -> Tuple[str, str]:
+        """下载更新包，返回 (本地路径, sha256)。已下载过则直接复用。
+
+        `expected_commit` 给了就必须匹配：GitHub 的 `archive/<sha>.tar.gz`
+        下载的是**那个 commit**，所以 tag 万一被改指向别的 commit，这里的请求
+        会直接 404 —— 这就是"双源"的意义（refs 接口说该 tag 是哪个 commit，
+        实际下载的也必须真的是那个 commit）。
+        """
         self._ensure_dirs()
         safe_tag = re.sub(r"[^A-Za-z0-9._-]", "_", tag or "")
         if not safe_tag:
             raise UpdateError("版本标签不合法")
         target = os.path.join(self.download_dir, "%s.tar.gz" % safe_tag)
+        commit = (expected_commit or "").strip().lower()
 
+        # 复用本地已有文件前必须**重新校验**：本地缓存可能被换掉/被截断，
+        # 且记录的 commit 必须与本次要装的 tag 一致，否则宁可重下。
         if os.path.isfile(target) and os.path.getsize(target) > 0:
-            digest = self._sha256_of(target)
-            self.log.info("复用已下载的更新包：%s", os.path.basename(target))
-            return target, digest
+            record = self._read_download_record().get(safe_tag) or {}
+            same_commit = (not commit and not record.get("commit")) or \
+                          (commit and record.get("commit") == commit)
+            if same_commit and record.get("sha256"):
+                digest = self._sha256_of(target)
+                if digest and digest == record.get("sha256"):
+                    self.log.info("复用已下载的更新包（sha256 校验通过）：%s",
+                                  os.path.basename(target))
+                    return target, digest
+                self.log.warning("本地更新包校验不通过（可能损坏或被替换），重新下载：%s",
+                                 os.path.basename(target))
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
+            else:
+                self.log.info("本地缓存的更新包与目标版本/commit 不一致，重新下载")
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
 
         url = self._tarball_url(tag, tarball_url)
+        # 指定了 commit 时优先按 **commit** 下载：这样拿到的字节由 commit 决定，
+        # 而 commit 又由 refs 接口独立给出，两个来源必须一致（双源比对的第一环）。
+        if expected_commit and _SHA_RE.match(expected_commit):
+            url = "https://codeload.github.com/%s/tar.gz/%s" % (
+                version_module.REPO_SLUG, expected_commit.lower())
+            _check_url(url)
         self.state.set("downloading", "正在下载 %s…" % tag, 5, tag)
         response = _open_url(url)
         total = 0
@@ -429,8 +513,97 @@ class Updater:
         sha = digest.hexdigest()
         self.log.info("更新包已下载：%s（%.1fMB, sha256=%s…）",
                       os.path.basename(target), total / 1048576, sha[:12])
+        # 记下"这个版本是哪个 commit、字节指纹是多少"，供下次复用前复核
+        self._write_download_record(safe_tag, {
+            "tag": tag, "commit": commit, "sha256": sha, "bytes": total,
+            "url": url, "downloaded_at": time.time(),
+        })
         self.state.set("downloading", "下载完成", 90, tag)
         return target, sha
+
+    # ------------------------------------------------ 双源校验（最终确认）
+    def verify_download(self, tag: str, commit: str, sha256: str) -> Dict[str, Any]:
+        """下载完成后做一次"双源比对"，任何一项不一致都抛 `UpdateError`。
+
+        **能防住的**：
+          · 下载链路被中间人换包 / 传输损坏 / 半包截断（sha256 与记录不符）；
+          · tag 在发布后被改指向别的 commit（refs 接口与下载实际 commit 不符）；
+          · 本地缓存的旧包被替换（复用前会重新算 sha256）。
+
+        **防不住的（必须如实说明）**：
+          两个来源（refs 接口 / archive 下载）**都在 GitHub 上**。若仓库本身被攻破，
+          攻击者可以让两边一致，这条校验就失效了。真正的信任锚需要发布方签名
+          （离线私钥 + 程序内置公钥），本项目当前**没有**做这一层。
+        """
+        if not sha256 or not re.match(r"^[0-9a-f]{64}$", sha256):
+            raise UpdateError("下载得到的 sha256 不合法（%r）" % (sha256 or ""))
+        if not commit or not _SHA_RE.match(commit):
+            raise UpdateError("拿不到可信的 commit（%r），拒绝安装" % (commit or ""))
+
+        # 源一：refs 接口**再查一次**，与调用方先前拿到的 commit 比对。
+        # 中间隔着一次真实下载（几十秒），这正是 tag 可能被改指向的时间窗。
+        fresh = self.resolve_tag_commit(tag)
+        if fresh.lower() != commit.lower():
+            raise UpdateError(
+                "tag %s 指向的 commit 在下载期间发生变化（%s → %s），已拒绝安装"
+                % (tag, commit[:12], fresh[:12]))
+        # 源一同源核对：再次确认 commit 格式合法（防上游给回奇怪的值）
+        if not _SHA_RE.match(fresh):
+            raise UpdateError("GitHub 返回的 commit 不合法（%r）" % fresh)
+
+        # 源二：本地记录（下载时写入的 commit + 字节指纹）
+        safe_tag = re.sub(r"[^A-Za-z0-9._-]", "_", str(tag or ""))
+        record = (self._read_download_record().get(safe_tag) or {})
+        if record.get("commit") and record["commit"].lower() != commit.lower():
+            raise UpdateError(
+                "本地下载记录里的 commit（%s）与 GitHub 上的（%s）不一致，已拒绝安装"
+                % (record["commit"][:12], commit[:12]))
+        if record.get("sha256") and record["sha256"] != sha256:
+            raise UpdateError(
+                "本地记录的 sha256（%s…）与这次算出的（%s…）不一致，已拒绝安装"
+                % (record["sha256"][:12], sha256[:12]))
+
+        return {"tag": tag, "commit": commit, "sha256": sha256,
+                "sha256_short": sha256[:12], "commit_short": commit[:12],
+                "sources": ["git-refs", "local-record"]}
+
+    # ------------------------------------------------ 下载记录（本地指纹）
+    def _record_path(self) -> str:
+        return os.path.join(self.update_dir, RECORD_FILE)
+
+    def _read_download_record(self) -> Dict[str, Any]:
+        try:
+            with open(self._record_path(), "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_download_record(self, key: str, payload: Dict[str, Any]):
+        record = self._read_download_record()
+        record[key] = payload
+        try:
+            self._ensure_dirs()
+            tmp = self._record_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(record, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._record_path())
+        except OSError as exc:
+            self.log.debug("写入下载记录失败：%s", exc)
+
+    def verify_local_package(self, tag: str) -> Dict[str, Any]:
+        """检查本地是否已有这个版本的完整包（给前端/诊断用，不联网）。"""
+        safe_tag = re.sub(r"[^A-Za-z0-9._-]", "_", tag or "")
+        target = os.path.join(self.download_dir, "%s.tar.gz" % safe_tag)
+        record = (self._read_download_record().get(safe_tag) or {})
+        if not os.path.isfile(target):
+            return {"exists": False, "ok": False, "message": "本地没有这个版本的包"}
+        digest = self._sha256_of(target)
+        ok = bool(record.get("sha256")) and digest == record.get("sha256")
+        return {"exists": True, "ok": ok, "sha256": digest,
+                "expected": record.get("sha256") or "",
+                "commit": record.get("commit") or "",
+                "message": "校验通过" if ok else "sha256 与记录不一致（可能损坏或被替换）"}
 
     @staticmethod
     def _sha256_of(path: str) -> str:
@@ -672,6 +845,8 @@ class Updater:
         if not self._install_lock.acquire(blocking=False):
             raise UpdateError("已经有一个更新在进行中，请稍候")
         backup_zip = ""
+        # 双源校验结果（local-test / 直接给目录的路径没有下载，也就没有这条记录）
+        verified: Dict[str, Any] = {}
         try:
             self._ensure_dirs()
             if source_root:
@@ -681,7 +856,16 @@ class Updater:
             else:
                 if not tag:
                     raise UpdateError("没有指定要安装的版本")
-                archive, sha = self.download(tag, tarball_url)
+                # **双源校验**：先问 GitHub "这个 tag 指向哪个 commit"，
+                # 再按那个 commit 下载；两条路径得到的 SHA 必须一致，
+                # 否则说明 tag 被改过、或中间有东西在改包 —— 直接拒绝。
+                commit = self.resolve_tag_commit(tag)
+                self.log.info("tag %s 解析到 commit %s", tag, commit[:12])
+                archive, sha = self.download(tag, tarball_url, expected_commit=commit)
+                verified = self.verify_download(tag, commit, sha)
+                self.log.info("双源校验通过：tag=%s commit=%s sha256=%s",
+                              tag, commit[:12], (sha or "")[:12])
+                self.state.set("downloading", "校验通过（sha256 " + (sha or "")[:12] + "…）", 90, tag)
                 self.log.info("开始安装 %s（sha256=%s…）", tag, (sha or "")[:12])
                 staging = self.extract(archive, tag)
 
@@ -699,6 +883,8 @@ class Updater:
                 "backup": backup_zip,
                 "written": written,
                 "restart_required": True,
+                # 这次装的是哪个 commit、字节指纹是多少（事后可核对）
+                "verify": verified,
             }
             try:
                 with open(self.marker_file, "w", encoding="utf-8") as handle:
@@ -811,5 +997,7 @@ class Updater:
             "pending_restart": self.pending_restart(),
             "last_install": self.last_install(),
             "last_check": last_check,
+            # 上次安装时通过双源校验的 commit / sha256（给界面展示"装的是哪一版"）
+            "verify": self.last_install().get("verify") or {},
         })
         return snap

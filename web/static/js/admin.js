@@ -175,6 +175,12 @@
     if (data.message && (data.busy || stage === 'done' || stage === 'failed')) {
       parts.push(kv('进度', data.message, stage === 'failed' ? 'err-text' : ''));
     }
+    // 上次安装时通过双源校验的 commit 与 sha256（事后可核对装的是哪一版）
+    var verify = data.verify || {};
+    if (verify.commit_short || verify.sha256_short) {
+      parts.push(kv('已校验', (verify.commit_short ? 'commit ' + verify.commit_short : '') +
+        (verify.sha256_short ? ' · sha256 ' + verify.sha256_short + '…' : ''), 'ok-text'));
+    }
     if (data.pending_restart) {
       var marker = data.last_install || {};
       parts.push(kv('待重启', '已装好 ' + (marker.to_version ? 'v' + marker.to_version : '新版本') +
@@ -203,6 +209,14 @@
       } else {
         hint.innerHTML = '点「检查更新」查询 GitHub 上是否有新版本。' +
           '更新源固定为本项目仓库，安装前会自动备份、失败自动回滚。';
+      }
+      // 校验说明常驻：让用户知道"校验到什么程度"，不夸大
+      if (hint && data.enabled) {
+        hint.innerHTML += '<div class="tiny" style="margin-top:6px">' +
+          '🔐 下载后会做<b>双源校验</b>：GitHub 的 tag 接口给出的 commit，' +
+          '必须与实际下载的包一致，再比对本地记录的 sha256；任一项不符即拒绝安装。' +
+          '注意两个来源都在 GitHub 上，<b>仓库本身被攻破时这层挡不住</b>' +
+          '（真正的保证需要发布方签名）。</div>';
       }
     }
 
