@@ -113,13 +113,18 @@ def main():
         check("无来源头的 POST 不是 403", response.status_code != 403,
               str(response.status_code))
 
-        # ---------- 6. 同站（same-site）视为安全 ----------
-        print("\n[6] same-site / none 视为可接受")
-        for site in ("same-site", "none"):
-            response = client.post("/api/admin/maintenance",
-                                   headers={"Sec-Fetch-Site": site}, data="{}")
-            check(f"Sec-Fetch-Site={site} 不是 403", response.status_code != 403,
-                  str(response.status_code))
+        # ---------- 6. same-site 不再被无条件信任 ----------
+        # 改动原因（审计 SEC-05）：同一注册域下的其它站点也是 same-site，
+        # 它们的 XSS 可以直接驱动写接口。现在 same-site 必须再通过 Origin 精确比对。
+        print("\n[6] same-site 不再单独放行；none 仍可接受")
+        response = client.post("/api/admin/maintenance",
+                               headers={"Sec-Fetch-Site": "same-site"}, data="{}")
+        check("Sec-Fetch-Site=same-site（无 Origin）被拒绝",
+              response.status_code == 403, str(response.status_code))
+        response = client.post("/api/admin/maintenance",
+                               headers={"Sec-Fetch-Site": "none"}, data="{}")
+        check("Sec-Fetch-Site=none 不是 403", response.status_code != 403,
+              str(response.status_code))
 
         # ---------- 7. 拒绝必须留痕 ----------
         print("\n[7] 被拦下的请求在审计日志里留痕")
@@ -170,8 +175,10 @@ def main():
             json.dump(cfg, handle, ensure_ascii=False)
 
         manager = load_config(blank)
-        generated = run_module.ensure_access_token(manager)
+        # 返回值已改为 (令牌, (状态, 说明))，见 v1.3.5 的 SEC-02 修复
+        generated, state = run_module.ensure_access_token(manager)
         check("生成了令牌", bool(generated), repr(generated))
+        check("状态为 created", state[0] == "created", str(state))
         check("长度 >= 32", len(generated) >= 32, str(len(generated)))
         check("不是弱令牌",
               __import__("core.security_rules", fromlist=["token_weakness"])
@@ -179,16 +186,20 @@ def main():
         reloaded = load_config(blank)
         check("已写入配置文件",
               reloaded.config.str_of("web", "token", default="") == generated, "")
-        check("已有令牌时不重新生成",
-              run_module.ensure_access_token(reloaded) == "", "")
+        again, state2 = run_module.ensure_access_token(reloaded)
+        check("已有令牌时状态为 existing（不重新生成）",
+              state2[0] == "existing" and again == generated,
+              "%r / %s" % (again, state2))
 
         keep = os.path.join(root, "keep.json")
         cfg2 = schema.default_config()
         cfg2["web"]["token"] = "USER-SET-TOKEN-0123456789abcdef"
         with open(keep, "w", encoding="utf-8") as handle:
             json.dump(cfg2, handle, ensure_ascii=False)
+        kept, kept_state = run_module.ensure_access_token(load_config(keep))
         check("用户自己设的令牌不会被改动",
-              run_module.ensure_access_token(load_config(keep)) == "", "")
+              kept == "USER-SET-TOKEN-0123456789abcdef" and kept_state[0] == "existing",
+              str(kept_state))
     finally:
         paths.LOG_DIR = original_log
         shutil.rmtree(root, ignore_errors=True)

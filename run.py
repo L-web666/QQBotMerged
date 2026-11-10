@@ -538,32 +538,35 @@ def _mask_token(token: str) -> str:
     return "%s…%s" % (value[:4], value[-4:])
 
 
-def ensure_access_token(config_manager) -> str:
-    """首次运行时自动生成访问令牌并写进 config.json，返回生成的令牌（没生成则为空）。
+def ensure_access_token(config_manager):
+    """确保存在访问令牌。返回 `(令牌, 状态)`。
 
-    **为什么**：空令牌时 `check_token()` 直接放行，本机浏览器就可能被跨站请求
-    当成载体去关程序、驱动更新端点。CSRF 校验已经挡了一层，但"默认无鉴权"
-    本身就是不安全的默认值，这里把它改成安全默认。
+    状态取值：
+      · `"existing"` —— 原本就有令牌（什么都不做）
+      · `"created"`  —— 本次刚生成并写进了 config.json
+      · `"failed"`   —— 令牌为空且**生成/保存失败**（调用方必须据此拒绝启动）
 
-    **可见性**：令牌以 `print` 输出到**控制台**（方便第一次复制），
-    **不写进日志文件**（日志会被云同步上传、会被发到群里截图）。
-    日志里只出现打码后的形式。
+    **为什么失败要单独报出来**：空令牌时 `check_token()` 直接放行，后台会以
+    无鉴权状态运行。以前这里只打印一句"不影响启动"就继续，等于让"配置文件不可写"
+    （只读部署、Docker 只读挂载、权限不足）静默降级成"后台不设防"。
+    现在把失败如实交给调用方，由它决定拒绝启动。
+
+    **可见性**：令牌以 `print` 输出到**控制台**，**不写进日志文件**。
 
     **不覆盖已有令牌**：只有原本为空时才生成；用户自己设过的永远不动。
     """
     try:
         current = config_manager.config.str_of("web", "token", default="")
-    except Exception:
-        return ""
+    except Exception as exc:
+        return "", ("failed", "读取配置失败：%s" % exc)
     if current:
-        return ""
+        return current, ("existing", "")
     try:
         new_token = secrets.token_urlsafe(24)      # 32 个字符，约 192 bit
         config_manager.set_path("web.token", new_token)
         config_manager.save()
     except Exception as exc:
-        print("⚠️  自动生成访问令牌失败（不影响启动，可稍后在设置里手动设置）：%s" % exc)
-        return ""
+        return "", ("failed", str(exc))
 
     port = 8666
     try:
@@ -578,7 +581,7 @@ def ensure_access_token(config_manager) -> str:
     print("   日志里只会显示为 %s，请把上面这行**保存好**（浏览器会记住这次的令牌）" % masked)
     print("   想换掉它：设置 → 网页后台 → 访问令牌，填新的后重启")
     print("=" * 66)
-    return new_token
+    return new_token, ("created", "")
 
 
 def startup_update_check(config, log) -> None:
@@ -650,6 +653,8 @@ def main() -> int:
     parser.add_argument("--config", default="", help="指定配置文件路径（默认 config.json）")
     parser.add_argument("--allow-open-web", action="store_true",
                         help="允许「非本机监听 + 无令牌」这种全开放组合（默认拒绝启动，不推荐）")
+    parser.add_argument("--allow-no-token", action="store_true",
+                        help="允许在没有令牌、且自动生成失败时继续启动（后台将无鉴权，不推荐）")
     args = parser.parse_args()
 
     if args.check:
@@ -658,7 +663,26 @@ def main() -> int:
     paths.ensure_dirs()
     config_manager = load_config(args.config or None)
     # 首次运行自动生成访问令牌（写在配置落盘之前，见函数说明）
-    ensure_access_token(config_manager)
+    token_value, token_state = ensure_access_token(config_manager)
+    if token_state[0] == "failed":
+        # 令牌为空又生成失败 → 后台会以**无鉴权**状态运行。
+        # 这是最容易被忽略的降级路径（只读部署、Docker 只读挂载、权限不足），
+        # 因此默认**拒绝启动**，而不是"打印一句继续跑"。
+        print("=" * 66)
+        print("❌ 拒绝启动：没有访问令牌，而且自动生成也失败了")
+        print("   原因：%s" % token_state[1])
+        print("   后果：如果继续启动，后台将**不需要任何令牌**就能使用 ——")
+        print("         任何能访问该端口的人都能发消息、改配置、关程序。")
+        print("")
+        print("   怎么修（任选其一）：")
+        print("     1) 让程序目录可写（config.json 需要能被保存）；")
+        print("     2) 手动在 config.json 的 web.token 里填一个强令牌，例如：")
+        print("        python -c \"import secrets; print(secrets.token_urlsafe(24))\"")
+        print("     3) 只在本机调试、明确接受无鉴权风险时，加 --allow-no-token 启动")
+        print("=" * 66)
+        if not getattr(args, "allow_no_token", False):
+            return 2
+        print("⚠️  已按 --allow-no-token 继续启动：后台当前**没有任何鉴权**")
     config = config_manager.config
     logger = build_logger(config, config_manager)
     log = logger.get_logger()

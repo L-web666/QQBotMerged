@@ -877,3 +877,111 @@ body[data-compact="1"] .card { padding: 11px 13px; margin-bottom: 9px; }
 body[data-compact="1"] .msg { margin-bottom: 7px; }
 body[data-compact="1"] .conv-item { padding: 6px 9px; }
 body[data-compact="1"] .page { padding: 12px 14px 18px; }
+
+/* ====================================================================
+   设置页左侧分类导航
+   配置项很多，右侧一长串卡片很难找。这里把分组列成左侧清单，点一下滚到对应卡片。
+   只在设置页可见（page-settings 显隐由 .page 控制）。
+   ==================================================================== */
+.settings-layout {
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.settings-nav {
+  position: sticky;
+  top: 8px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 8px;
+  max-height: calc(100vh - 180px);
+  overflow-y: auto;
+}
+
+.settings-nav-title {
+  font-size: 11.5px;
+  color: var(--muted);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  padding: 2px 8px 8px;
+}
+
+.settings-nav-list { display: flex; flex-direction: column; gap: 2px; }
+
+.settings-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  padding: 7px 9px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+.settings-nav-item:hover { background: rgba(var(--accent-rgb), .10); }
+.settings-nav-item.active {
+  background: rgba(var(--accent-rgb), .16);
+  color: var(--primary);
+  font-weight: 600;
+}
+.settings-nav-item .nav-ico { width: 18px; text-align: center; flex: 0 0 18px; }
+.settings-nav-item .nav-text {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.settings-nav-item .nav-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--bg);
+  border-radius: 999px;
+  padding: 1px 6px;
+}
+.settings-nav-item .nav-scope {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0 4px;
+}
+.settings-nav-empty { font-size: 12px; color: var(--muted); padding: 6px 9px; }
+
+.settings-body { min-width: 0; }
+
+/* 目标卡片短暂高亮，让"跳到了哪里"一眼可见 */
+@keyframes settingsFlash {
+  0%   { box-shadow: 0 0 0 2px rgba(var(--accent-rgb), .55); }
+  100% { box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0); }
+}
+.cfg-section.flash { animation: settingsFlash 1.1s ease-out; }
+
+/* 窄屏：导航变成横向可滚动的条，不再占左侧一列 */
+@media (max-width: 980px) {
+  .settings-layout { grid-template-columns: minmax(0, 1fr); }
+  .settings-nav {
+    position: static;
+    max-height: none;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .settings-nav-list { flex-direction: row; flex-wrap: nowrap; gap: 6px; }
+  .settings-nav-item {
+    width: auto; flex: 0 0 auto;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 5px 11px;
+  }
+  .settings-nav-item .nav-count { display: none; }
+}
+
+body[data-compact="1"] .settings-nav-item { padding: 5px 8px; font-size: 12.5px; }

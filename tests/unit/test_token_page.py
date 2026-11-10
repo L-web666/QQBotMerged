@@ -102,12 +102,15 @@ def main():
         response = client.get("/", headers={"X-Auth-Token": TOKEN})
         check("请求头令牌 → 200", response.status_code == 200, str(response.status_code))
 
-        print("\n[A6] 未配置令牌时不做门禁（保持原行为）")
+        print("\n[A6] 未配置令牌时不加门禁（但启动流程会拒绝无令牌运行）")
+        # 说明：`check_token()` 本身在"令牌为空"时仍然放行 —— 这是历史行为，
+        # 真正的把关在启动阶段（run.py 的 ensure_access_token + 拒绝启动）。
+        # 这条用例只描述**服务层**语义，不再把"无鉴权可用"当成推荐配置：
+        # 启动侧由 test_auth.py / 本轮新增用例保证"生成失败即拒绝启动"。
         open_client = make_client(root, "")
         response = open_client.get("/")
-        check("无令牌配置 → 200", response.status_code == 200, str(response.status_code))
-        check("正常拿到后台页面",
-              "boot-data" in response.get_data(as_text=True), "")
+        check("服务层：无令牌配置不做门禁", response.status_code == 200,
+              str(response.status_code))
 
         print("\n[A7] 令牌错误次数过多时首页也是提示页")
         hammer = make_client(root, TOKEN)

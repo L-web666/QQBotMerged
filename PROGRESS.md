@@ -16,7 +16,7 @@
 
 ## 当前状态
 
-- 程序版本：**v1.3.4**（唯一来源 `core/version.py` 的 `__version__`；网页侧栏/关于页/接口都从这里取）
+- 程序版本：**v1.3.5**（唯一来源 `core/version.py` 的 `__version__`；网页侧栏/关于页/接口都从这里取）
 - 启动命令：
   - 正常：`python run.py`
   - 自检：`python run.py --check`
@@ -33,13 +33,16 @@
     `test_auth.py`（令牌常数时间比较 / 暴力破解防护 / 弱令牌告警）、
     `test_security_audit.py`（配置安全体检 / 审计日志与脱敏）、
     `test_csrf.py`（跨站请求防护 / 首次运行生成令牌）、
-    `test_token_page.py`（无令牌不加载页面 / 控制台与日志分离）
+    `test_token_page.py`（无令牌不加载页面 / 控制台与日志分离）、
+    `test_security_v135.py`（同源判定 / 令牌失败拒绝启动 / 审计取证 / 回滚清理）
   - 单实例锁：`python tests/test_instance_lock.py`
   - 前端契约：`python tests/check_frontend.py`
   - DOM 会话列表：`node tests/dom_test_conversations.js`
   - DOM 消息渲染：`node tests/dom_test_messages.js`（40 项）
   - DOM 全局保护：`node tests/dom_test_globals.js`
   - DOM 设置页：`node tests/dom_test_settings.js`（重复插入 / 事件只绑一次）
+  - DOM 设置页导航：`node tests/dom_test_settings_nav.js`（结构 / 分组齐全）、
+    `node tests/dom_test_settings_nav_render.js`（真实渲染：条目与卡片一一对应）
   - DOM 版本与更新：`node tests/dom_test_update.js`（版本显示 / 更新进度 / 待重启提示）
   - 测试分层说明：`tests/README.md`
   - 模拟注入：`python tests/simulate_message.py`
@@ -268,6 +271,70 @@
     强制走回退逻辑；**把 `latestVersion()` 改回读 `.version` 时该测试会红**
     （实测「最新版本」变回"未检查"、提示变成"新版本"没具体版本号）。
     全套回归：`test_offline` 576 项、`check_frontend`、14 个单元测试、5 个 DOM、单实例锁全绿。
+
+- 2026-11-11：**设置页新增左侧分类导航**：
+  - **改了什么**：设置页原先是一条通到底的卡片列表，共 **18 个分组、117 个配置项**，
+    找某一项要一直滚。现在在设置页左侧加了一列「配置分类」导航：
+    · 每个分组一行，带图标、名称、`机器人/全局` 标记与配置项数量；
+    · 点一下平滑滚到对应卡片，并让卡片短暂高亮（`.cfg-section.flash`）；
+    · 滚动右侧内容时，左侧自动高亮当前所在分组；
+    · **搜索时导航同步收缩**：只留下还有匹配项的分组，位置与卡片严格对应；
+    · 窄屏（< 980px）自动变成顶部横向滚动的胶囊条，不再挤占内容宽度。
+    导航内容完全由 `render()` 实际产出的卡片推导（`querySelectorAll('.cfg-section')`），
+    因此搜索过滤、切换机器人后都不会与右侧对不上。
+  - **为什么改**：配置项太多，靠滚动找很容易漏。
+  - **实现要点**：
+    · HTML 增加 `.settings-layout` 两栏容器（`#settingsNav` + `#settingsForm`）；
+    · 卡片补上 `data-title` / `data-icon` / `data-perbot`，供导航读取；
+    · 事件**只绑定一次**（`navMounted` 标记），与之前修过的"重复绑监听器"保持同一思路；
+    · 滚动监听挂在 `.page`（CSS 里 `.page{overflow-y:auto}` 才是滚动容器），
+      不是 `app-main`。
+  - **怎么验证**：新增 `tests/dom_test_settings_nav.js`（23 项：模板/CSS 元素齐全、
+    后端 18 个关键分组都在）与 `tests/dom_test_settings_nav_render.js`
+    （15 项：用真实 `sections_payload()` 跑 `render()`，断言
+    **导航条目数与卡片数相等、顺序完全一致**、图标标题正确、搜索过滤后仍一一对应、
+    无匹配时给出空态提示）。另启动真实服务确认 CORS 之外的资源链路：
+    页面含导航容器、`settings.js` 含导航逻辑、CSS 含样式、配置接口返回 18 个分组。
+    全套回归：`test_offline` 576 项、`check_frontend`、19 个单元测试、
+    **7 个** DOM 测试、单实例锁、`run.py --check` 全绿。
+
+- 2026-11-11：**第五轮审计修复：CSRF 同源判定 / 令牌失败拒绝启动 / 审计取证 / 更新回滚；发布 v1.3.5**：
+  - **SEC-05 + NEW5-01：CSRF 同源判定实际是死代码（已实测复现）**。
+    旧 `_origin_allowed()` 的问题：
+    ① `candidates` 只存主机名，`origin_host in candidates` 在比较端口前就返回 True，
+    后面带端口的 `local_names` 分支**永远到不了**；
+    ② 即使执行到那段，循环体也只判断"候选里有没有本机名"，**从未比较端口**——
+    注释写的"端口也要一致"并不存在；
+    ③ `Sec-Fetch-Site: same-site` 被无条件放行。
+    实测（旧版）：`Origin: http://127.0.0.1:9999`、`https://127.0.0.1:8666`、
+    `same-site + 外部 Origin` **全部放行**。
+    改法：直接比较 **(scheme, host, port) 三元组**，不再有"先命中主机名就放行"的近路；
+    `same-site` 不再单独放行，必须再通过 Origin 精确比对；拒绝逻辑抽成 `_deny_csrf()` 统一留痕。
+  - **SEC-02：令牌生成失败仍无鉴权启动**。`ensure_access_token()` 失败时只打印一句
+    "不影响启动"就返回，调用处也不看返回值 —— 只读部署 / Docker 只读挂载 / 权限不足
+    会静默降级成"后台不设防"。改法：返回 `(令牌, (状态, 说明))`，状态区分
+    `existing` / `created` / `failed`；`failed` 时**默认拒绝启动**（退出码 2），
+    并给出三种修复办法；确实要裸跑需显式 `--allow-no-token`。
+  - **SEC-09：审计日志无条件信任 `X-Forwarded-For`**。`client_of()` 直接取该头，
+    而同一项目的令牌失败计数 `_client_key()` 却做了 `trust_proxy` 门控 —— 标准不一致，
+    后果是**取证链可被摧毁**（攻击者能把来源改成任意 IP）。现在 `client_of()` 增加
+    `trust_proxy` 参数，`server.py` 的 `audit()` 传入同一配置项。
+  - **SEC-07：更新回滚不删新增文件**。`rollback()` 原先只恢复备份里有的文件，
+    失败后新旧版本混合。现在回滚后会删除"备份里没有、本次更新新增"的**代码类文件**
+    （受保护路径与用户自己的非代码文件不动）。
+  - **SEC-08：解压成员数限制太晚**。`extract()` 原用 `tar.getmembers()` 先把全部成员
+    读进内存再检查上限。改为**流式两遍**：第一遍只记名字并计数（超限立即中止），
+    第二遍重新遍历逐个解压，成员对象不驻留内存。
+  - **SEC-06：云同步符号链接逃逸**。`_download()` 写入前增加真实路径校验：
+    目标目录 realpath 必须在程序目录内，目标文件若是符号链接直接拒绝。
+  - **测试基线也一并修正**：`test_csrf.py` 里"same-site 视为可接受"的断言改为
+    "必须被拒绝"；`test_token_page.py` 的 A6 不再把"无令牌可用"当成推荐配置
+    （改为只描述服务层语义，真正的把关在启动阶段）。
+  - **怎么验证**：新增 `tests/unit/test_security_v135.py`（28 项）覆盖上述六条；
+    实测复现旧行为、修复后逐项通过（同源放行 / 跨端口拒绝 / 跨协议拒绝 /
+    same-site 拒绝 / 伪造 XFF 不入审计 / 保存失败状态 failed / 回滚删除新增文件 /
+    成员超限早拒绝）。全套回归：`test_offline` 576 项、`check_frontend`、
+    19 个单元测试、5 个 DOM、单实例锁、`run.py --check` 全绿。
 
 - 2026-11-11：**控制台每次打印带令牌的访问地址；无令牌不再加载后台页面；发布 v1.3.4**：
   - **改了什么（两处）**：

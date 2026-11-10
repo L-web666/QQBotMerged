@@ -647,22 +647,32 @@ class Updater:
         members_seen = 0
         try:
             with tarfile.open(archive, "r:gz") as tar:
-                entries = tar.getmembers()
-                if len(entries) > MAX_MEMBERS:
-                    raise UpdateError("压缩包内文件过多（%d > %d），已拒绝"
-                                      % (len(entries), MAX_MEMBERS))
-                # 先算一遍顶层目录，用来剥壳
-                tops = {self._safe_member_name(item.name).split("/")[0]
-                        for item in entries if self._safe_member_name(item.name)}
+                # **先流式扫一遍名字**（只记名字、不保留 member 对象），用来：
+                #   1) 统计成员数并在超限时立即中止；
+                #   2) 判断顶层是不是只有一层外壳目录。
+                # 审计 SEC-08：旧写法用 `tar.getmembers()` 一次性把全部成员读进内存，
+                # 一个成员极多的包能在限制生效之前就吃掉大量内存/CPU。
+                names = []
+                seen = 0
+                for item in tar:
+                    seen += 1
+                    if seen > MAX_MEMBERS:
+                        raise UpdateError("压缩包内文件过多（超过 %d 个），已拒绝"
+                                          % MAX_MEMBERS)
+                    relative = self._safe_member_name(item.name)
+                    if relative:
+                        names.append(relative)
+                tops = {name.split("/")[0] for name in names}
                 strip_top = ""
                 if len(tops) == 1:
                     only = next(iter(tops))
-                    if all(self._safe_member_name(item.name).startswith(only + "/")
-                           or self._safe_member_name(item.name) == only
-                           for item in entries if self._safe_member_name(item.name)):
+                    if all(name.startswith(only + "/") or name == only for name in names):
                         strip_top = only + "/"
 
-                for item in entries:
+                # 第二遍：重新打开、逐个成员解压。
+                # 成员列表不驻留内存，内存占用只与单个文件大小相关。
+            with tarfile.open(archive, "r:gz") as tar:
+                for item in tar:
                     members_seen += 1
                     relative = self._safe_member_name(item.name)
                     if not relative:
@@ -806,15 +816,28 @@ class Updater:
         return written
 
     def rollback(self, backup_zip: str) -> int:
-        """用备份 zip 恢复代码（只覆盖备份里有的文件）。"""
+        """用备份 zip 恢复代码。
+
+        **不只是覆盖**：还会把"备份里没有、但现在程序目录里有"的文件删掉。
+        旧实现只恢复备份中存在的文件，更新失败后新版本多出来的文件会留在原地，
+        导致新旧版本混合（审计 SEC-07）——那种状态比回滚失败更难排查。
+
+        只删**安装时会覆盖的那类文件**（受保护路径一律跳过），
+        并且只删备份目录树里本就不存在的相对路径。
+        """
         if not backup_zip or not os.path.isfile(backup_zip):
             raise UpdateError("找不到备份文件，无法回滚")
         restored = 0
+        removed = 0
         try:
             with zipfile.ZipFile(backup_zip) as archive:
+                members = set()
                 for member in archive.namelist():
                     relative = self._safe_member_name(member)
-                    if not relative or self._is_protected(relative):
+                    if not relative:
+                        continue
+                    members.add(relative)
+                    if self._is_protected(relative):
                         continue
                     destination = os.path.join(self.base_dir, *relative.split("/"))
                     if not os.path.abspath(destination).startswith(
@@ -826,9 +849,51 @@ class Updater:
                         with open(destination, "wb") as handle:
                             shutil.copyfileobj(source, handle, 256 * 1024)
                     restored += 1
+            # 删除"备份里没有、现在却存在"的文件（= 本次更新新增的）
+            removed = self._remove_files_not_in(members)
         except (OSError, zipfile.BadZipFile) as exc:
             raise UpdateError("回滚失败：%s（备份文件：%s）" % (exc, backup_zip))
+        if removed:
+            self.log.info("回滚时清理了 %d 个本次更新新增的文件", removed)
         return restored
+
+    def _remove_files_not_in(self, keep: set) -> int:
+        """删除程序目录里不在 `keep` 中的代码文件（受保护路径不碰）。"""
+        removed = 0
+        for current_dir, dirnames, filenames in os.walk(self.base_dir):
+            relative_dir = os.path.relpath(current_dir, self.base_dir)
+            if relative_dir == ".":
+                relative_dir = ""
+            dirnames[:] = [name for name in dirnames
+                           if not self._is_protected(os.path.join(relative_dir, name))]
+            for name in filenames:
+                relative = os.path.join(relative_dir, name).replace("\\", "/")
+                if self._is_protected(relative):
+                    continue
+                if relative in keep:
+                    continue
+                # 只清理"更新会覆盖"的类型，避免误删用户自己放的文件
+                if not self._is_code_file(relative):
+                    continue
+                try:
+                    os.remove(os.path.join(current_dir, name))
+                    removed += 1
+                except OSError:
+                    continue
+        return removed
+
+    _CODE_SUFFIXES = (".py", ".pyw", ".js", ".css", ".html", ".htm", ".txt",
+                      ".md", ".json", ".yaml", ".yml", ".sh", ".bat", ".spec",
+                      ".ini", ".cfg", ".toml")
+
+    @classmethod
+    def _is_code_file(cls, relative: str) -> bool:
+        """是否属于"程序代码/资源"文件（回滚清理只针对这些）。"""
+        name = str(relative or "").lower()
+        if name.endswith(cls._CODE_SUFFIXES):
+            return True
+        # 无扩展名的启动脚本之类
+        return os.path.basename(name) in ("license", "makefile", "dockerfile")
 
     def install(self, tag: str = "", tarball_url: str = "",
                 source_root: str = "") -> Dict[str, Any]:

@@ -130,15 +130,26 @@ def read_tail(limit: int = 200) -> list:
     return out
 
 
-def client_of(request) -> str:
-    """从 Flask 请求里取"操作来源"，用于审计记录。"""
+def client_of(request, trust_proxy: bool = False) -> str:
+    """从 Flask 请求里取"操作来源"，用于审计记录。
+
+    **`X-Forwarded-For` 默认不信任**：这个头客户端可以随便伪造，
+    如果审计日志照单全收，攻击者就能把每条记录的来源改成任意 IP（甚至嫁祸内网其他机器），
+    事后追责能力被直接摧毁。只有确实部署在反向代理后面、并显式打开
+    `web.trust_proxy` 时才采用它 —— 与 `web/server.py` 里令牌失败计数
+     (`_client_key`) 用的判定保持一致。
+
+    旧实现无条件读 `X-Forwarded-For`，与鉴权侧的标准不一致，已修正。
+    """
     try:
-        forwarded = ""
-        try:
-            forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-        except Exception:
-            forwarded = ""
         address = request.remote_addr or ""
-        return forwarded or address or "unknown"
     except Exception:
         return "unknown"
+    if not trust_proxy:
+        return address or "unknown"
+    try:
+        forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    except Exception:
+        forwarded = ""
+    return forwarded or address or "unknown"
+

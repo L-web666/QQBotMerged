@@ -218,7 +218,16 @@
         </div>
       </div>
       <div class="hint" id="settingsPath"></div>
-      <div id="settingsForm"></div>
+      <!-- 设置页专用的左侧导航：配置项太多，按分组列出来便于跳转 -->
+      <div class="settings-layout">
+        <aside class="settings-nav" id="settingsNav">
+          <div class="settings-nav-title">配置分类</div>
+          <div class="settings-nav-list" id="settingsNavList"></div>
+        </aside>
+        <div class="settings-body">
+          <div id="settingsForm"></div>
+        </div>
+      </div>
       <div class="sticky">
         <span id="settingsMsg" class="cfg-msg"></span>
         <button class="btn primary" id="settingsSave">💾 保存配置</button>

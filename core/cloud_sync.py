@@ -559,6 +559,23 @@ class CloudSync:
         from core import paths
         full = os.path.join(paths.BASE_DIR, rel)
         try:
+            # **符号链接边界校验**（审计 SEC-06）：
+            # `in_scope()` 只做字符串层面的检查（挡住 `/` 开头与 `..`），挡不住
+            # "程序目录里已经存在一个指向外部的符号链接"这种情形 —— 那样云端内容
+            # 会被写到程序目录之外。这里补一层真实路径判断：
+            #   · 目标文件的父目录 realpath 必须在 BASE_DIR 之内；
+            #   · 目标文件本身若已存在且是符号链接，直接拒绝（不跟随）。
+            base_real = os.path.realpath(paths.BASE_DIR)
+            parent_real = os.path.realpath(os.path.dirname(full) or paths.BASE_DIR)
+            if parent_real != base_real and not parent_real.startswith(base_real + os.sep):
+                self.log.warning("拒绝恢复 %s：目标目录真实路径在程序目录之外（%s）",
+                                 rel, parent_real)
+                self._note_skip(rel)
+                return "skip"
+            if os.path.islink(full):
+                self.log.warning("拒绝恢复 %s：目标文件是符号链接，已拒绝写入", rel)
+                self._note_skip(rel)
+                return "skip"
             if only_if_newer and item["updated_at"] <= int(
                     os.stat(full).st_mtime * 1000 if os.path.exists(full) else 0):
                 return "ok"

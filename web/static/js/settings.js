@@ -273,7 +273,10 @@
         ? '<button class="btn tiny" data-copyall="' + U.esc(section.key) +
           '" title="把当前机器人在这个分组里的设置复制给其它所有机器人">📋 应用到所有机器人</button>'
         : '';
-      html.push('<div class="card cfg-section" data-section="' + U.esc(section.key) + '">' +
+      html.push('<div class="card cfg-section" data-section="' + U.esc(section.key) + '"' +
+        ' data-title="' + U.esc(section.title) + '"' +
+        ' data-icon="' + U.esc(section.icon || '•') + '"' +
+        ' data-perbot="' + (perBot ? '1' : '0') + '">' +
         '<h3>' + U.esc(section.icon || '') + ' ' + U.esc(section.title) + ' ' + scopeBadge +
         '</h3>' +
         (section.scope_hint || section.tip
@@ -285,7 +288,114 @@
     form.innerHTML = html.join('') || '<div class="card"><div class="tiny">没有匹配的配置项</div></div>';
     U.el('settingsPath').innerHTML = '配置文件：<code>' + U.esc(spec.path) + '</code>' +
       ' · 密钥类字段以掩码显示，留空保存表示不修改';
+    renderNav(keyword);
     bindFormEvents();
+  }
+
+  /* ============================ 左侧分类导航 ============================
+     配置项太多，一整列卡片翻起来很难找。这里把每个分组列成左侧清单：
+       · 点一下平滑滚到对应卡片，并短暂高亮；
+       · 显示每个分组有多少项、是否按机器人隔离；
+       · 搜索时只留下"还有匹配项"的分组；
+       · 滚动右侧内容时自动高亮当前所在分组。
+     导航内容完全由 render() 产出的卡片决定，所以搜索过滤后点哪都能对上。
+  */
+  var navMounted = false;      // 事件是否已绑定（只绑一次，避免累积）
+  var navObserver = null;      // IntersectionObserver，用来跟随滚动高亮
+
+  function sectionCards() {
+    var form = U.el('settingsForm');
+    if (!form) return [];
+    var nodes = form.querySelectorAll('.cfg-section');
+    var out = [];
+    for (var i = 0; i < nodes.length; i++) out.push(nodes[i]);
+    return out;
+  }
+
+  function renderNav(keyword) {
+    var list = U.el('settingsNavList');
+    if (!list) return;
+    var cards = sectionCards();
+    if (!cards.length) {
+      list.innerHTML = '<div class="settings-nav-empty">' +
+        (keyword ? '没有匹配的配置项' : '暂无可配置项') + '</div>';
+      return;
+    }
+    var html = [];
+    for (var i = 0; i < cards.length; i++) {
+      var card = cards[i];
+      var key = card.getAttribute('data-section') || '';
+      var title = card.getAttribute('data-title') || key;
+      var icon = card.getAttribute('data-icon') || '•';
+      var count = card.querySelectorAll('.field').length;
+      var perBot = card.getAttribute('data-perbot') === '1';
+      html.push('<button class="settings-nav-item" type="button" data-goto="' +
+        U.esc(key) + '" title="' + U.esc(title) + '">' +
+        '<span class="nav-ico">' + U.esc(icon) + '</span>' +
+        '<span class="nav-text">' + U.esc(title) + '</span>' +
+        '<span class="nav-scope">' + (perBot ? '机器人' : '全局') + '</span>' +
+        '<span class="nav-count">' + count + '</span>' +
+        '</button>');
+    }
+    list.innerHTML = html.join('');
+    bindNavEvents();
+    highlightByScroll();
+  }
+
+  function bindNavEvents() {
+    if (navMounted) return;           // **只绑一次**：render 会反复调用
+    var list = U.el('settingsNavList');
+    if (!list) return;
+    navMounted = true;
+    list.addEventListener('click', function (event) {
+      var button = event.target.closest('[data-goto]');
+      if (!button) return;
+      var key = button.getAttribute('data-goto');
+      var target = document.querySelector('.cfg-section[data-section="' +
+        (window.CSS && CSS.escape ? CSS.escape(key) : key) + '"]');
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        target.classList.remove('flash');
+        // 强制回流后再加，保证重复点击也能重新播放高亮动画
+        void target.offsetWidth;
+        target.classList.add('flash');
+        setActive(key);
+      }
+    }, false);
+  }
+
+  function setActive(key) {
+    var items = document.querySelectorAll('.settings-nav-item');
+    for (var i = 0; i < items.length; i++) {
+      items[i].classList.toggle('active', items[i].getAttribute('data-goto') === key);
+    }
+  }
+
+  function highlightByScroll() {
+    var cards = sectionCards();
+    if (!cards.length) return;
+    var best = null;
+    var bestTop = -Infinity;
+    for (var i = 0; i < cards.length; i++) {
+      var top = cards[i].getBoundingClientRect().top;
+      // 取"已经滚过视口顶部（或最接近）"的那一个
+      if (top - 90 <= 0 && top > bestTop) {
+        bestTop = top;
+        best = cards[i];
+      }
+    }
+    if (!best) best = cards[0];
+    setActive(best.getAttribute('data-section'));
+  }
+
+  function onSettingsScroll() {
+    if (U.debounce) {
+      onSettingsScroll.handler = onSettingsScroll.handler ||
+        U.debounce(highlightByScroll, 120);
+      onSettingsScroll.handler();
+    } else {
+      highlightByScroll();
+    }
   }
 
   function bindFormEvents() {
@@ -553,6 +663,11 @@
     U.el('settingsSave').addEventListener('click', save);
     U.el('settingsReload').addEventListener('click', function () { load(); });
     U.el('settingsSearch').addEventListener('input', U.debounce(function () { render(); }, 200));
+    // 滚动右侧内容时，左侧导航跟随高亮当前所在分组。
+    // 滚动容器是 `.page` 自己（CSS 里 .page{overflow-y:auto}），不是 app-main。
+    var page = U.el('page-settings');
+    if (page) page.addEventListener('scroll', onSettingsScroll, { passive: true });
+    window.addEventListener('resize', U.debounce(highlightByScroll, 150));
     window.addEventListener('beforeunload', function (event) {
       if (Settings.dirty) {
         event.preventDefault();

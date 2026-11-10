@@ -60,10 +60,18 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         """记录一条审计日志（谁从哪里做了什么）。
 
         只记"改变状态或可能造成破坏"的操作；写日志失败不影响业务。
+        来源 IP 的取法与令牌失败计数 (`_client_key`) 一致：**默认不信任
+        `X-Forwarded-For`**（客户端可伪造），只有开了 `web.trust_proxy` 才采用。
         """
         try:
+            trust_proxy = False
+            try:
+                trust_proxy = config_manager.config.bool_of(
+                    "web", "trust_proxy", default=False)
+            except Exception:
+                trust_proxy = False
             audit_log.record(action, target=target, result=result, detail=detail,
-                             client=audit_log.client_of(request))
+                             client=audit_log.client_of(request, trust_proxy=trust_proxy))
         except Exception as exc:            # 审计绝不能让接口失败
             logger.debug("写审计日志失败：%s", exc)
 
@@ -156,84 +164,138 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
     # 替它发请求 —— 已实测能真正关掉程序、并进入更新逻辑。
     #
     # 做法：对**所有会改变状态的方法**（POST/PUT/PATCH/DELETE）校验来源。
-    # 只放行这几种，而不是去拦"看起来像外站"的请求（白名单思路更不容易漏）：
-    #   · Sec-Fetch-Site: same-origin / none / same-site（浏览器自动带，脚本改不了）
-    #   · Origin 与本次请求的 Host 同源
-    #   · Origin 与配置里的 web.public_base_url 同源（反向代理场景：外部域名≠内部 Host）
-    #   · 两者都没有（curl / 脚本 / 旧浏览器）：放行 —— 但这类请求本来就无法携带
-    #     浏览器凭据，不属于 CSRF 的攻击面；真正的防护仍是令牌。
+    #
+    # 判定顺序（越靠前越可信）：
+    #   1. `Sec-Fetch-Site: same-origin` 或 `none` —— 浏览器自动带、脚本改不了，直接放行。
+    #      **`same-site` 不再无条件放行**：同一注册域下的其它站点（另一子域、
+    #      共享域名的第三方页面）也是 same-site，它们的 XSS 能直接驱动这里的写接口。
+    #      现在 same-site 必须再通过下面的 Origin 精确比对。
+    #   2. `Origin` 与本站**完整同源**（scheme + host + port 全等）才放行。
+    #   3. 两者都没有（curl / 脚本 / 旧浏览器）：放行 —— 这类请求无法携带浏览器
+    #      凭据，不构成 CSRF 攻击面；真正的防护仍是令牌。
     _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 
-    def _origin_allowed(origin: str) -> bool:
-        """判断 Origin 头是否与本站同源。"""
-        if not origin:
-            return False
+    # 本机访问的等价写法（同一个端口下视为同源）
+    _LOCAL_NAMES = {"127.0.0.1", "localhost", "::1"}
+    _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+    def _split_origin(value: str):
+        """把一个 origin / Host 拆成 (scheme, host, port) 三元组。
+
+        `scheme` 为空表示"来源没给出协议"（如 `Host: 127.0.0.1:8666`），
+        这种情况只做 host+port 比较；给出协议时必须三者全等。
+        """
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if "://" not in text:
+            text = "//" + text
         try:
-            parsed = urlparse(origin)
+            parsed = urlparse(text)
         except ValueError:
-            return False
-        origin_host = (parsed.hostname or "").strip().lower()
-        origin_port = parsed.port
-        if not origin_host:
-            return False
-        # 本次请求的 Host（浏览器发的 Origin 会与之一致）
-        request_host = ""
+            return None
+        host = (parsed.hostname or "").strip().lower()
+        if not host:
+            return None
+        scheme = (parsed.scheme or "").strip().lower()
         try:
-            request_host = (urlparse("//" + (request.host or "")).hostname or "").lower()
+            port = parsed.port
         except ValueError:
-            request_host = ""
-        candidates = {request_host}
-        # 反向代理：外部域名与内部 Host 不同，允许配置里的对外地址
+            return None
+        if port is None and scheme in _DEFAULT_PORTS:
+            port = _DEFAULT_PORTS[scheme]
+        return (scheme, host, port)
+
+    def _origin_candidates():
+        """本站被视为可信的 origin 列表（来自本次请求 Host 与配置的对外地址）。"""
+        candidates = []
+        # 本次请求的 Host：浏览器同源时发的 Origin 会与它完全一致
         try:
-            public = config_manager.config.str_of("web", "public_base_url", default="")
-            if public:
-                candidates.add((urlparse(public).hostname or "").lower())
+            request_origin = "%s://%s" % (request.scheme, request.host or "")
+            parsed = _split_origin(request_origin)
+            if parsed:
+                candidates.append(parsed)
         except Exception:
             pass
-        candidates.discard("")
-        if origin_host in candidates:
-            return True
-        # 本机访问的各种写法：127.0.0.1 / localhost / ::1 视为同一台机器
-        local_names = {"127.0.0.1", "localhost", "::1", "[::1]"}
-        if origin_host in local_names and (candidates & local_names):
-            # 端口也要一致（同端口才是同源）；没写端口按协议默认端口
-            if origin_port is None:
-                return True
-            for candidate in candidates:
-                if candidate in local_names:
-                    return True
+        # 反向代理：外部域名与内部 Host 不同，用配置里的对外地址
+        try:
+            public = config_manager.config.str_of("web", "public_base_url", default="")
+            parsed = _split_origin(public)
+            if parsed:
+                candidates.append(parsed)
+        except Exception:
+            pass
+        return candidates
+
+    def _origin_allowed(origin: str) -> bool:
+        """判断 Origin 头是否与本站**完整同源**（协议 + 主机 + 端口都要一致）。
+
+        旧实现有两个缺陷（已在实测中确认）：
+          · `candidates` 只存主机名，`origin_host in candidates` 在比较端口之前
+            就已经返回 True —— 后面带端口的那段是**够不到的死代码**；
+          · 即使执行到那段，循环体也只判断"候选里有没有本机名"，
+            **从来没有拿端口做比较**，注释写的"端口也要一致"并不存在。
+        现在改为直接比较 (scheme, host, port) 三元组，不再有"先命中主机名就放行"的近路。
+        """
+        parsed = _split_origin(origin)
+        if not parsed:
             return False
+        origin_scheme, origin_host, origin_port = parsed
+        for candidate in _origin_candidates():
+            cand_scheme, cand_host, cand_port = candidate
+            # 协议：来源给了就必须相等（http 与 https 是不同源）
+            if origin_scheme and cand_scheme and origin_scheme != cand_scheme:
+                continue
+            # 端口：必须相等（同主机不同端口不是同源）
+            if origin_port != cand_port:
+                continue
+            # 主机：完全相等，或双方都是本机写法（127.0.0.1 / localhost / ::1 视为同一台机器）
+            if origin_host == cand_host:
+                return True
+            if origin_host in _LOCAL_NAMES and cand_host in _LOCAL_NAMES:
+                return True
         return False
+
 
     def check_csrf() -> Optional[Response]:
         """校验写操作是否来自本站。返回 403 表示拒绝，None 表示放行。"""
         if request.method in _SAFE_METHODS:
             return None
-        # 1) 浏览器自动带的 Sec-Fetch-Site：最可靠，脚本无法伪造
-        site = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
-        if site in ("same-origin", "none", "same-site"):
-            return None
-        if site == "cross-site":
-            logger.warning("拒绝跨站写请求：%s %s（Origin=%s）", request.method,
-                           request.path, request.headers.get("Origin") or "-")
-            # 取证：被 CSRF 拦下的请求也要留痕（失败的敏感操作同样重要）
-            audit("security.csrf_blocked", target=request.path, result="denied",
-                  detail={"origin": request.headers.get("Origin") or "",
-                          "sec_fetch_site": site, "method": request.method})
-            return jsonify({"success": False, "cross_site_blocked": True,
-                            "message": "已拒绝跨站请求（CSRF 防护）："
-                                       "请从本程序的后台页面操作"}), 403
-        # 2) 没有 Sec-Fetch-Site（旧浏览器/部分代理）：退回校验 Origin
         origin = (request.headers.get("Origin") or "").strip()
+        # 浏览器自动带的 Sec-Fetch-Site：脚本无法伪造，最可靠
+        site = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
+
+        # 1) 只有 same-origin / none 可以**单独**作为放行依据。
+        if site in ("same-origin", "none"):
+            return None
+        # 2) cross-site 直接拒绝。
+        if site == "cross-site":
+            return _deny_csrf("拒绝跨站写请求", origin, site)
+        # 3) same-site **不能单独放行**：同一注册域下的其它站点（另一子域、
+        #    共享域名的第三方页面）也是 same-site，它们的 XSS 可以直接驱动这里的写接口。
+        #    必须再通过 Origin 的完整同源比对。
+        #    其余情况（没有该头 = 旧浏览器/代理）同样走 Origin 比对。
         if origin:
             if _origin_allowed(origin):
                 return None
-            logger.warning("拒绝来源不符的写请求：%s %s（Origin=%s）", request.method,
-                           request.path, origin)
-            return jsonify({"success": False, "cross_site_blocked": True,
-                            "message": "已拒绝来源不明的请求（CSRF 防护）"}), 403
-        # 3) 两者都没有：非浏览器客户端（curl/脚本），CSRF 不适用，放行
+            return _deny_csrf("拒绝来源不符的写请求", origin, site)
+        if site == "same-site":
+            # 声称 same-site 却给不出 Origin：无法验证，拒绝
+            return _deny_csrf("拒绝无法验证来源的写请求", origin, site)
+        # 4) 两者都没有：非浏览器客户端（curl/脚本），CSRF 不适用，放行
         return None
+
+    def _deny_csrf(reason: str, origin: str, site: str) -> Response:
+        """统一的 CSRF 拒绝：记日志 + 审计留痕 + 返回 403。"""
+        logger.warning("%s：%s %s（Origin=%s, Sec-Fetch-Site=%s）", reason,
+                       request.method, request.path, origin or "-", site or "-")
+        audit("security.csrf_blocked", target=request.path, result="denied",
+              detail={"origin": origin, "sec_fetch_site": site,
+                      "method": request.method, "reason": reason})
+        return jsonify({"success": False, "cross_site_blocked": True,
+                        "message": "已拒绝跨站请求（CSRF 防护）："
+                                   "请从本程序的后台页面操作"}), 403
+
 
     def _upload_limit_bytes(rt) -> int:
         """单次上传允许读入内存的上限（业务上限，比 HTTP 层的 256MiB 小得多）。"""
