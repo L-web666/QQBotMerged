@@ -308,6 +308,10 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
     def not_found(_exc):
         if request.path.startswith("/api/"):
             return jsonify({"success": False, "message": "接口不存在"}), 404
+        # SPA 的任意前端路由都回落到首页；同样要先过令牌，否则这里就成了绕过入口
+        blocked = check_token()
+        if blocked:
+            return _denied_page(), 401
         return render_template("index.html", boot=boot_payload()), 404
 
     @app.before_request
@@ -392,8 +396,45 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         }
 
     # ================================================================== 页面
+    def _denied_page() -> str:
+        """未通过令牌校验时返回的极简页面（不含任何后台逻辑与数据）。"""
+        return """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>需要访问令牌</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+       background:#0f1115;color:#e6e8ee}
+  .box{max-width:560px;padding:32px 28px;border:1px solid #2a2f3a;border-radius:14px;
+       background:#161a21}
+  h1{margin:0 0 12px;font-size:20px}
+  p{margin:8px 0;line-height:1.7;color:#b7bdc9}
+  code{background:#0b0e13;padding:2px 6px;border-radius:5px;color:#8ab4f8;
+       word-break:break-all}
+  .tip{margin-top:18px;padding-top:14px;border-top:1px solid #2a2f3a;font-size:13px;color:#8b93a3}
+</style></head><body>
+<div class="box">
+  <h1>🔒 需要访问令牌</h1>
+  <p>这个后台需要令牌才能打开。请在地址后面加上 <code>?token=你的令牌</code>。</p>
+  <p>程序的<b>控制台窗口</b>在每次启动时都会打印带令牌的完整地址，直接复制到浏览器即可。</p>
+  <div class="tip">令牌在 <code>config.json</code> 的 <code>web.token</code>，
+    也可以在「设置 → 网页后台」里修改。</div>
+</div>
+</body></html>"""
+
     @app.route("/")
     def index():
+        """首页：**没有令牌就不加载页面**，直接返回一个"需要令牌"的极简提示页。
+
+        以前的做法是先正常渲染整个后台，再让页面里的脚本发现 401 后弹提示 ——
+        那样没令牌的人能先拿到完整的页面结构与前端代码，体验上也是"先给看再报错"。
+        现在改为服务端直接判断：令牌不对就只返回一页提示，绝不下发后台页面。
+        """
+        blocked = check_token()
+        if blocked:
+            # 401 的语义在这里同样成立；但页面已经给了可读的说明，不额外弹窗
+            return _denied_page(), 401
         return render_template("index.html", boot=boot_payload())
 
     @app.route("/health")

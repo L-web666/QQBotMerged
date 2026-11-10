@@ -530,6 +530,14 @@ def _token_weakness(token: str) -> str:
     return token_weakness(token)
 
 
+def _mask_token(token: str) -> str:
+    """令牌打码：只留头尾各 4 位，用于写进日志。"""
+    value = str(token or "")
+    if len(value) <= 10:
+        return "***" if value else ""
+    return "%s…%s" % (value[:4], value[-4:])
+
+
 def ensure_access_token(config_manager) -> str:
     """首次运行时自动生成访问令牌并写进 config.json，返回生成的令牌（没生成则为空）。
 
@@ -562,7 +570,7 @@ def ensure_access_token(config_manager) -> str:
         port = config_manager.config.int_of("web", "port", default=8666)
     except Exception:
         pass
-    masked = new_token[:4] + "…" + new_token[-4:]
+    masked = _mask_token(new_token)
     print("=" * 66)
     print("🔑 已为你生成后台访问令牌（写入了 config.json 的 web.token）")
     print("   令牌：%s" % new_token)
@@ -733,9 +741,27 @@ def main() -> int:
 
         # 启动日志里**不再输出令牌**：URL 里的令牌会留在浏览器历史、终端回滚、
         # 截图和反向代理日志里（审计 SEC-10）。
+        # 控制台上打印**带令牌**的完整访问地址（方便直接复制），
+        # 但**不经过 logger**：URL 里的令牌会留在日志文件、终端回滚、
+        # 截图和反向代理日志里（审计 SEC-10）。所以这里用 print 只输出到控制台，
+        # 日志文件里只留打码形式。
+        base_url = "http://%s:%s/" % (shown_host, port)
+        if token:
+            masked = _mask_token(token)
+            print("=" * 66)
+            print("🌐 后台访问地址（已带令牌，复制即可用）：")
+            print("   %s?token=%s" % (base_url, token))
+            print("   （日志文件里只会显示为 %s）" % masked)
+            print("=" * 66)
+        else:
+            print("=" * 66)
+            print("🌐 后台访问地址（当前未设置令牌）：%s" % base_url)
+            print("=" * 66)
+
         log.info("网页后台已就绪：http://%s:%s/", shown_host, port)
         if token:
-            log.info("（已设置访问令牌：请在网页提示处输入，或加 ?token=你的令牌）")
+            log.info("（已设置访问令牌 %s：完整地址只打印在控制台，日志里不记令牌）",
+                     _mask_token(token))
         if not token and host in ("127.0.0.1", "localhost", "::1"):
             log.info("（仅本机可访问，未设置令牌）")
 
