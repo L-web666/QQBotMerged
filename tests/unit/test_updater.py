@@ -114,7 +114,13 @@ def main():
               version_module.compare_versions(current, "1.2.7") >= 0, current)
         for raw, expect in [("v1.2.7", "1.2.7"), ("V1.2.7", "1.2.7"),
                             ("1.2.7", "1.2.7"), ("release-1.2.7", "1.2.7"),
-                            ("1.2.7-beta", "1.2.7"), ("sha-abc123", ""),
+                            # 先行版本号**保留**（语义化版本第 9 条）：
+                            # 以前会被截成 `1.2.7`，导致 1.2.7-beta 被当成正式版
+                            ("1.2.7-beta", "1.2.7-beta"),
+                            ("1.2.7-rc.1", "1.2.7-rc.1"),
+                            # 编译信息不参与比较，丢弃（第 10 条）
+                            ("1.2.7+build.5", "1.2.7"),
+                            ("sha-abc123", ""),
                             ("", "")]:
             check(f"normalize({raw!r}) = {expect!r}",
                   version_module.normalize_version(raw) == expect,
