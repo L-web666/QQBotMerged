@@ -25,9 +25,18 @@ CHECK_INTERVAL = 60
 
 
 def collect_problems(rt) -> List[Dict[str, str]]:
-    """检查运行时当前有哪些严重问题。返回 [{key, message, detail}]。"""
+    """检查运行时当前有哪些严重问题。返回 [{bot_id, key, message, detail}]。
+
+    `bot_id` 是"这个告警应该由谁发、发给谁"的依据 —— 因为告警配置按机器人隔离，
+    每一项都必须能说清它属于哪个机器人（存储/插件这类全局问题归到当前活动的机器人）。
+    """
     problems: List[Dict[str, str]] = []
     now = time.time()
+    active = ""
+    try:
+        active = str(rt.config_manager.active_bot_id() or "")
+    except Exception:
+        active = ""
 
     # ---- 机器人长时间离线 ----
     try:
@@ -53,7 +62,8 @@ def collect_problems(rt) -> List[Dict[str, str]]:
             if now - since < OFFLINE_ALERT_AFTER:
                 continue
             problems.append({
-                "key": "bot_offline:%s" % bot_id,
+                "bot_id": bot_id,
+                "key": "bot_offline",
                 "message": "机器人「%s」已超过 %d 分钟没有连上 QQ" % (
                     info.get("name") or bot_id, (now - since) // 60),
                 "detail": "当前状态：%s。请检查 AppID/AppSecret 是否有效、"
@@ -62,7 +72,7 @@ def collect_problems(rt) -> List[Dict[str, str]]:
     except Exception as exc:
         logger.debug("检查机器人在线状态失败：%s", exc)
 
-    # ---- 插件加载失败 ----
+    # ---- 插件加载失败（全局问题，归到当前活动的机器人）----
     try:
         manager = getattr(rt, "plugin_manager", None)
         failed = []
@@ -71,6 +81,7 @@ def collect_problems(rt) -> List[Dict[str, str]]:
                 failed.append("%s（%s）" % (info.get("name"), str(info["error"])[:80]))
         if failed:
             problems.append({
+                "bot_id": active,
                 "key": "plugin_load_failed",
                 "message": "有 %d 个插件没能加载" % len(failed),
                 "detail": "；".join(failed[:5]),
@@ -78,7 +89,7 @@ def collect_problems(rt) -> List[Dict[str, str]]:
     except Exception as exc:
         logger.debug("检查插件状态失败：%s", exc)
 
-    # ---- 存储降级 ----
+    # ---- 存储降级（全局问题，归到当前活动的机器人）----
     try:
         store = getattr(rt, "store", None)
         # 与状态接口同一套判定：不是 SQLiteStore 就是降级成了内存库
@@ -86,6 +97,7 @@ def collect_problems(rt) -> List[Dict[str, str]]:
                             and store.__class__.__name__ == "SQLiteStore") else "memory"
         if kind == "memory":
             problems.append({
+                "bot_id": active,
                 "key": "storage_degraded",
                 "message": "数据库未能初始化，当前用的是内存存储",
                 "detail": "所有消息只存在内存里，程序重启就会全部丢失。"
@@ -98,11 +110,16 @@ def collect_problems(rt) -> List[Dict[str, str]]:
 
 
 def check_and_notify(rt, alerter) -> int:
-    """跑一次检查并把新问题发出去；返回本次发送的条数。"""
+    """跑一次检查并把新问题发出去；返回本次发送的条数。
+
+    每条问题都带上自己的 `bot_id` —— 告警配置按机器人隔离，
+    所以"用谁的凭据发、发给谁的 openid"都由这一项决定。
+    """
     sent = 0
     for item in collect_problems(rt):
         try:
-            if alerter.notify(item["key"], item["message"], item.get("detail", "")):
+            if alerter.notify(item.get("bot_id") or "", item["key"],
+                              item["message"], item.get("detail", "")):
                 sent += 1
         except Exception as exc:
             logger.debug("发送告警失败：%s", exc)

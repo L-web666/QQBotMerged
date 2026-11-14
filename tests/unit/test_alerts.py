@@ -107,72 +107,105 @@ class FakeRuntime:
         # 要测降级时显式传 store=None。
         self.store = SQLiteStoreStub() if store == "default" else store
         self.plugin_manager = type("PM", (), {"list_plugins": lambda self_: plugins or []})()
+        self.config_manager = type("CM", (), {"active_bot_id": lambda self_: ""})()
 
 
-def make_cfg(**security):
-    data = schema.default_config()
-    data["security"].update(security)
-    return FakeManager(data)
+class PerBotManager:
+    """按机器人隔离的配置替身：`resolve_for_bot()` 返回该机器人自己的 security。"""
+
+    def __init__(self, per_bot=None, default=None):
+        self._per_bot = per_bot or {}
+        self.config = FakeConfig({"security": default or {}})
+
+    def resolve_for_bot(self, bot_id):
+        sec = self._per_bot.get(bot_id)
+        if sec is None:
+            return {"security": dict(schema.default_config().get("security") or {})}
+        base = dict(schema.default_config().get("security") or {})
+        base.update(sec)
+        return {"security": base}
+
+
+def make_per_bot(bot_id, **security):
+    return PerBotManager({bot_id: security})
 
 
 def main():
     print("=" * 70)
-    print("  出错告警（openid 按机器人隔离）")
+    print("  出错告警（按机器人隔离）")
     print("=" * 70)
 
-    print("\n[A1] 配置项齐全")
+    print("\n[A1] 配置项齐全，且整组按机器人隔离")
     data = schema.default_config()
     sec = data.get("security") or {}
-    check("有「用哪个机器人发告警」", "alert_bot_id" in sec, str(list(sec)))
-    check("有「告警接收人 openid」", "alert_owner_openid" in sec, "")
+    check("有管理员 openid", "admin_openids" in sec, str(list(sec)))
+    check("有告警开关", "alert_enabled" in sec, "")
+    check("有告警接收人 openid", "alert_owner_openid" in sec, "")
     check("有冷却时间", "alert_cooldown_seconds" in sec, "")
-    meta = schema.FIELDS.get("security.alert_bot_id") or {}
-    check("是下拉选择（enum）", meta.get("type") == "enum", str(meta.get("type")))
-    hint = str(meta.get("hint") or "")
-    check("提示里说明了 openid 按机器人隔离", "openid" in hint and "机器人" in hint, hint[:60])
-    check("openid 字段的提示写明不是 QQ 号",
-          "不是 QQ 号" in str((schema.FIELDS.get("security.alert_owner_openid")
-                              or {}).get("hint") or ""), "")
+    check("不再有「用哪个机器人发告警」（改为按机器人）",
+          "alert_bot_id" not in sec, str(list(sec)))
+    check("security 是 per_bot 分组",
+          "security" in schema.PER_BOT_SECTIONS, "")
+    for path in ("security.admin_openids", "security.alert_enabled",
+                 "security.alert_owner_openid", "security.alert_cooldown_seconds"):
+        check("%s 按机器人隔离" % path, schema.is_per_bot(path), "")
+    hint = str((schema.FIELDS.get("security.alert_owner_openid") or {}).get("hint") or "")
+    check("openid 提示写明不是 QQ 号", "不是 QQ 号" in hint, hint[:60])
+    check("openid 提示写明各机器人不能混用", "混用" in hint, hint[:80])
 
     print("\n[A2] 没配置时不会发送（也不报错）")
-    alerter = alerts.Alerter(make_cfg(), runtime_getter=lambda: None)
-    check("available() 为假", alerter.available() is False, "")
-    check("notify 返回 False", alerter.notify("k", "测试") is False, "")
+    alerter = alerts.Alerter(make_per_bot("bot1"), runtime_getter=lambda: None)
+    check("available() 为假", alerter.available("bot1") is False, "")
+    check("notify 返回 False", alerter.notify("bot1", "k", "测试") is False, "")
 
-    print("\n[A3] 只选了机器人、没填 openid → 不发")
-    alerter = alerts.Alerter(make_cfg(alert_bot_id="bot1"), runtime_getter=lambda: None)
-    check("available() 仍为假", alerter.available() is False, "")
-
-    print("\n[A4] 只填了 openid、没选机器人 → 不发")
-    alerter = alerts.Alerter(make_cfg(alert_owner_openid="OPENID-X"), runtime_getter=lambda: None)
-    check("available() 仍为假", alerter.available() is False, "")
-
-    print("\n[A5] 关掉总开关 → 不发")
+    print("\n[A3] 只有 openid、但告警关掉了 → 不发")
     alerter = alerts.Alerter(
-        make_cfg(alert_enabled=False, alert_bot_id="bot1", alert_owner_openid="OPENID-X"),
+        make_per_bot("bot1", alert_enabled=False, alert_owner_openid="X"),
         runtime_getter=lambda: None)
-    check("available() 为假", alerter.available() is False, "")
+    check("available() 为假", alerter.available("bot1") is False, "")
 
-    print("\n[A6] 机器人 + openid 都配对 → 用该机器人自己的凭据发")
+    print("\n[A4] 没填 openid → 不发")
+    alerter = alerts.Alerter(
+        make_per_bot("bot1", alert_enabled=True, alert_owner_openid=""),
+        runtime_getter=lambda: None)
+    check("available() 为假", alerter.available("bot1") is False, "")
+
+    print("\n[A5] 两个机器人各配各的，互不串")
+    two = PerBotManager({
+        "bot1": {"alert_enabled": True, "alert_owner_openid": "OPENID-BOT1"},
+        "bot2": {"alert_enabled": False, "alert_owner_openid": "OPENID-BOT2"},
+    })
+    alerter = alerts.Alerter(two, runtime_getter=lambda: None)
+    check("bot1 可用", alerter.available("bot1") is True, "")
+    check("bot2 关掉了 → 不可用", alerter.available("bot2") is False, "")
+    check("bot1 的 openid 是自己的",
+          alerter.target("bot1")["openid"] == "OPENID-BOT1", "")
+    check("bot2 的 openid 是自己的",
+          alerter.target("bot2")["openid"] == "OPENID-BOT2", "")
+    check("bot2 关着告警时 notify 返回 False",
+          alerter.notify("bot2", "k", "测试") is False, "")
+
+    print("\n[A6] openid + 开关都配好 → 用该机器人自己的凭据发")
     client = FakeClient()
     rt = FakeRuntime({"bot1": FakeBot("bot1", client)})
     alerter = alerts.Alerter(
-        make_cfg(alert_bot_id="bot1", alert_owner_openid="OPENID-BOT1"),
+        make_per_bot("bot1", alert_enabled=True, alert_owner_openid="OPENID-BOT1"),
         runtime_getter=lambda: rt)
-    check("available() 为真", alerter.available() is True, "")
-    sent = alerter.notify("test_key", "机器人掉线了", "详情若干")
+    check("available() 为真", alerter.available("bot1") is True, "")
+    sent = alerter.notify("bot1", "test_key", "机器人掉线了", "详情若干")
     check("发送成功", sent is True, "")
     check("用的是单聊（c2c）", client.sent and client.sent[0][0] == "c2c",
           str(client.sent[:1]))
-    check("发给了配置里的 openid", client.sent and client.sent[0][1] == "OPENID-BOT1", "")
+    check("发给了该机器人自己的 openid",
+          client.sent and client.sent[0][1] == "OPENID-BOT1", "")
     check("正文里带告警标记", client.sent and "告警" in client.sent[0][2], "")
     check("正文里带详情", client.sent and "详情若干" in client.sent[0][2], "")
 
-    print("\n[A7] 冷却：同类问题在冷却期内只发一次")
+    print("\n[A7] 冷却按机器人分别计算")
     client.sent.clear()
-    again = alerter.notify("test_key", "机器人掉线了")
+    again = alerter.notify("bot1", "test_key", "机器人掉线了")
     check("冷却期内不再发送", again is False and client.sent == [], str(client.sent))
-    other = alerter.notify("another_key", "另一个问题")
+    other = alerter.notify("bot1", "another_key", "另一个问题")
     check("不同 key 不受影响", other is True and len(client.sent) == 1, str(client.sent))
 
     print("\n[A8] 发送失败时把真实原因写进日志（不静默）")
@@ -187,9 +220,9 @@ def main():
     client = FakeClient(boom="openid 不属于该机器人")
     rt = FakeRuntime({"bot1": FakeBot("bot1", client)})
     alerter = alerts.Alerter(
-        make_cfg(alert_bot_id="bot1", alert_owner_openid="WRONG-OPENID"),
+        make_per_bot("bot1", alert_enabled=True, alert_owner_openid="WRONG-OPENID"),
         runtime_getter=lambda: rt, logger_obj=Log())
-    result = alerter.notify("fail_key", "测试失败")
+    result = alerter.notify("bot1", "fail_key", "测试失败")
     check("返回 False", result is False, "")
     text = " ".join(str(item[1]) for item in logged)
     check("日志里有真实原因", "openid 不属于该机器人" in text, text[:120])
@@ -200,18 +233,19 @@ def main():
     client = FakeClient(configured=False)
     rt = FakeRuntime({"bot1": FakeBot("bot1", client)})
     alerter = alerts.Alerter(
-        make_cfg(alert_bot_id="bot1", alert_owner_openid="X"),
+        make_per_bot("bot1", alert_enabled=True, alert_owner_openid="X"),
         runtime_getter=lambda: rt, logger_obj=Log())
-    check("返回 False", alerter.notify("dead", "测试") is False, "")
+    check("返回 False", alerter.notify("bot1", "dead", "测试") is False, "")
     text = " ".join(str(item[1]) for item in logged)
     check("日志说明机器人不可用", "不可用" in text, text[:100])
 
-    print("\n[A10] 选了一个不存在的机器人 → 不发、不崩")
-    rt = FakeRuntime({"bot1": FakeClient() and FakeBot("bot1", FakeClient())})
+    print("\n[A10] 机器人不存在 → 不发、不崩")
+    rt = FakeRuntime({"bot1": FakeBot("bot1", FakeClient())})
     alerter = alerts.Alerter(
-        make_cfg(alert_bot_id="no_such_bot", alert_owner_openid="X"),
+        make_per_bot("no_such_bot", alert_enabled=True, alert_owner_openid="X"),
         runtime_getter=lambda: rt, logger_obj=Log())
-    check("返回 False 且不抛异常", alerter.notify("x", "测试") is False, "")
+    check("返回 False 且不抛异常",
+          alerter.notify("no_such_bot", "x", "测试") is False, "")
 
     # ================= B. 检查项 =================
     print("\n[B1] 只报告严重问题，不报正常状态")
@@ -226,7 +260,9 @@ def main():
     bot._offline_since = time.time() - alert_checks.OFFLINE_ALERT_AFTER - 5
     problems = alert_checks.collect_problems(rt)
     check("超时后报出机器人掉线",
-          any(item["key"].startswith("bot_offline") for item in problems), str(problems))
+          any(item["key"] == "bot_offline" for item in problems), str(problems))
+    check("掉线告警带上是哪个机器人",
+          any(item.get("bot_id") == "bot1" for item in problems), str(problems))
 
     print("\n[B3] 没配凭据的机器人不算故障")
     empty = FakeBot("bot2", FakeClient(configured=False), online=False)
@@ -267,11 +303,78 @@ def main():
     check("start() 里调用", "_start_alert_watcher()" in lifecycle, "")
     check("用了 alert_checks", "alert_checks.check_and_notify" in lifecycle, "")
 
-    print("\n[C2] 设置页能动态拿到机器人列表")
+    print("\n[C2] 前端按机器人渲染（security 是 per_bot 分组）")
     server_src = open(os.path.join(PROJECT, "web", "server.py"),
                       encoding="utf-8").read()
-    check("填充 alert_bot_id 的选项", "security.alert_bot_id" in server_src, "")
-    check("从 config.bots 取机器人", 'payload.get("config") or {}' in server_src, "")
+    check("已不再有「用哪个机器人发告警」的动态选项逻辑",
+          "_fill_alert_bot_options" not in server_src, "")
+    settings_js = open(os.path.join(PROJECT, "web", "static", "js", "settings.js"),
+                       encoding="utf-8").read()
+    check("前端按 per_bot 分组读 bot_config",
+          "section.per_bot" in settings_js and "spec.bot_config" in settings_js, "")
+
+    print("\n[C3] 真接口：两个机器人的告警配置互不影响")
+    try:
+        import json as _json
+        from core.config_manager import load_config
+        from web.server import create_app
+        tmp = os.path.join(PROJECT, "data", "_selftest", "unit_alert_iso")
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp, exist_ok=True)
+        token = "ISO-TOKEN-0123456789"
+        raw = schema.default_config()
+        raw["web"].update({"host": "127.0.0.1", "token": token})
+        raw["update"]["check_on_start"] = False
+        raw["bots"] = [
+            {"id": "bot1", "name": "机器人一", "enabled": True, "app_id": "A1", "app_secret": "s1"},
+            {"id": "bot2", "name": "机器人二", "enabled": True, "app_id": "A2", "app_secret": "s2"},
+        ]
+        cfg_path = os.path.join(tmp, "cfg.json")
+        with open(cfg_path, "w", encoding="utf-8") as handle:
+            _json.dump(raw, handle, ensure_ascii=False)
+        web = create_app(load_config(cfg_path)).test_client()
+
+        # 给 bot1 单独配一套
+        two_bots = [
+            {"id": "bot1", "name": "机器人一", "enabled": True, "app_id": "A1", "app_secret": ""},
+            {"id": "bot2", "name": "机器人二", "enabled": True, "app_id": "A2", "app_secret": ""},
+        ]
+        body1 = _json.loads(_json.dumps(schema.default_config()))
+        body1["security"]["alert_owner_openid"] = "OPENID-BOT1"
+        body1["security"]["admin_openids"] = ["ADMIN-BOT1"]
+        body1["bots"] = two_bots          # 必须带上完整机器人列表，否则 bot2 会被当成未知
+        r1 = web.post("/api/admin/config?token=" + token,
+                      json={"config": body1, "bot_id": "bot1"}).get_json() or {}
+        check("给 bot1 保存成功", r1.get("success") is True, str(r1.get("message"))[:80])
+
+        # 给 bot2 配另一套
+        body2 = _json.loads(_json.dumps(schema.default_config()))
+        body2["security"]["alert_owner_openid"] = "OPENID-BOT2"
+        body2["security"]["admin_openids"] = ["ADMIN-BOT2"]
+        body2["bots"] = two_bots
+        r2 = web.post("/api/admin/config?token=" + token,
+                      json={"config": body2, "bot_id": "bot2"}).get_json() or {}
+        check("给 bot2 保存成功", r2.get("success") is True, str(r2.get("message"))[:80])
+
+        saved = load_config(cfg_path)
+        for bid, openid, admin in (("bot1", "OPENID-BOT1", ["ADMIN-BOT1"]),
+                                   ("bot2", "OPENID-BOT2", ["ADMIN-BOT2"])):
+            sec = ((saved.resolve_for_bot(bid) or {}).get("security") or {})
+            check("%s 的 openid 是它自己的" % bid,
+                  sec.get("alert_owner_openid") == openid, str(sec.get("alert_owner_openid")))
+            check("%s 的管理员是它自己的" % bid,
+                  sec.get("admin_openids") == admin, str(sec.get("admin_openids")))
+
+        global_sec = saved.config.data.get("security") or {}
+        check("全局兜底值没被污染（openid 仍为空）",
+              global_sec.get("alert_owner_openid") == "",
+              repr(global_sec.get("alert_owner_openid")))
+        check("全局兜底值没被污染（管理员仍为空）",
+              global_sec.get("admin_openids") == [],
+              str(global_sec.get("admin_openids")))
+        shutil.rmtree(tmp, ignore_errors=True)
+    except Exception as exc:
+        check("真接口验证没抛异常", False, str(exc))
 
     print("\n" + "=" * 70)
     print(f"  通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")

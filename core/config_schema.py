@@ -254,15 +254,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "image_lightbox": True,
     },
 
-    # ---------------- 权限与告警 ----------------
+    # ---------------- 权限与告警（按机器人隔离，见 PER_BOT_SECTIONS） ----------------
+    # 这里只是"没有机器人时的兜底默认值"；真正生效的值按机器人各自存。
+    # 为什么整组按机器人隔离：openid 本身就是**按机器人隔离**的 —— 同一个人
+    # 在每个机器人下拿到的 openid 都不一样，所以"谁的管理员""告警发给谁"
+    # 天然就该跟着机器人走，用一份全局值根本表达不了。
     "security": {
         "admin_openids": [],
         "alert_enabled": True,
         "alert_owner_openid": "",
-        # 用哪个机器人把告警私聊发给主人。留空 = 不启用。
-        # 为什么要单独选：openid 是**按机器人隔离**的 —— 同一个人在每个机器人
-        # 下面拿到的 openid 都不一样，所以"发给谁"必须和"谁去发"配对。
-        "alert_bot_id": "",
         # 冷却时间（秒）：同一类问题在这段时间内只发一次，避免刷屏。
         "alert_cooldown_seconds": 600,
     },
@@ -464,21 +464,16 @@ FIELDS: Dict[str, Dict[str, Any]] = {
     "ui.show_avatar": _f("bool", "显示头像", ""),
     "ui.image_lightbox": _f("bool", "图片点击放大", ""),
 
-    # ---------------- security ----------------
-    "security.admin_openids": _f("list", "管理员 openid", "每行一个，拥有机器人指令的管理权限"),
+    # ---------------- security（按机器人隔离） ----------------
+    "security.admin_openids": _f("list", "管理员 openid",
+                                 "每行一个，拥有**本机器人**指令的管理权限；"
+                                 "必须是本机器人下看到的 openid（openid 按机器人隔离）"),
     "security.alert_enabled": _f("bool", "启用出错告警",
-                                 "机器人凭据失效、网关反复连不上、插件加载失败等严重问题时"
-                                 "私聊通知主人（普通日志不通知）"),
-    "security.alert_bot_id": _f("enum", "用哪个机器人发告警",
-                                "openid 是按机器人隔离的：同一个人在每个机器人下拿到的 "
-                                "openid 都不同。所以「发给谁」必须和「谁来发」配对 —— "
-                                "选一个机器人，再填它在下面看到的你的 openid。"
-                                "选「不发送」= 不启用告警",
-                                # 真实选项由 web/server.py 按当前机器人列表动态填入
-                                options=[["", "不发送"]]),
+                                 "**本机器人**出严重问题时（凭据失效、长时间连不上、"
+                                 "插件加载失败、存储降级）用它自己私聊通知你。普通日志不通知"),
     "security.alert_owner_openid": _f("str", "告警接收人 openid",
-                                      "用上面那个机器人私聊到的你的 openid（不是 QQ 号）；"
-                                      "各机器人的 openid 不能混用"),
+                                      "填**本机器人**私聊到你时显示的 openid（不是 QQ 号）。"
+                                      "各机器人的 openid 不能混用 —— openid 本身就是按机器人隔离的"),
     "security.alert_cooldown_seconds": _f("int", "告警冷却（秒）",
                                           "同一类问题在这段时间内只通知一次，避免刷屏",
                                           min=60, max=86400),
@@ -512,7 +507,8 @@ SECRET_MASK = "********"
 
 # 每个机器人自己的设置（在「设置」页里，这些分组作用于**当前选中的机器人**）
 # 未列出的分组都是全局设置（网页后台 / 存储 / 日志 / 界面 / 云同步 …）
-PER_BOT_SECTIONS = ("ai", "reply", "filters", "features", "send", "scheduler", "panels", "plugins")
+PER_BOT_SECTIONS = ("ai", "reply", "filters", "features", "send", "scheduler",
+                    "panels", "plugins", "security")
 
 # 分组虽然按机器人隔离，但这两项是"整台程序"的开关/目录：按机器人覆盖它们没有意义
 # （插件只加载一次），所以在上面统一判定的基础上单独放行成全局项。
@@ -534,7 +530,8 @@ SCOPE_HINTS: Dict[str, str] = {
     "plugins": "「本机器人启用/停用的插件」只作用于**当前选中的机器人**；"
                "插件总开关与插件目录是全局设置（所有机器人共用）",
     "cloud": "全局设置（所有机器人共用）",
-    "security": "全局设置（所有机器人共用；管理员按 openid 判定）",
+    "security": "以下设置只作用于**当前选中的机器人**：管理员 openid 与出错告警都按机器人分开 —— "
+                "openid 本身就是按机器人隔离的，同一个人在每个机器人下看到的都不一样",
     "logging": "全局设置（所有机器人共用）",
     "ui": "全局设置（所有机器人共用）",
     "context": "只作用于**当前选中的机器人**",
@@ -632,8 +629,7 @@ SECTION_FIELDS: Dict[str, List[str]] = {
               "cloud_sync.startup_buffer", "cloud_sync.startup_buffer_minutes",
               "cloud_sync.startup_buffer_max_mb", "cloud_sync.startup_buffer_keep_remote"],
     "security": ["security.admin_openids", "security.alert_enabled",
-                 "security.alert_bot_id", "security.alert_owner_openid",
-                 "security.alert_cooldown_seconds"],
+                 "security.alert_owner_openid", "security.alert_cooldown_seconds"],
     "logging": ["logging.level", "logging.max_size_mb", "logging.console_color",
                 "logging.keep_days"],
     "ui": ["ui.theme", "ui.animation", "ui.poll_interval_ms", "ui.message_bubbles",

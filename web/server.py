@@ -1134,26 +1134,6 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
                 return blocked
             payload = config_manager.payload()
             payload["success"] = True
-            # 「用哪个机器人发告警」的选项来自当前机器人列表（动态，不能写死在 schema 里）。
-            # openid 按机器人隔离，所以必须让用户先选机器人、再填该机器人下的 openid。
-            try:
-                fields = payload.get("fields") or {}
-                meta = fields.get("security.alert_bot_id")
-                if isinstance(meta, dict):
-                    options = [["", "不发送"]]
-                    # 机器人列表在 config.bots 里（payload["bots"] 不存在）
-                    raw_bots = (payload.get("config") or {}).get("bots") or []
-                    for item in raw_bots:
-                        if not isinstance(item, dict):
-                            continue
-                        bid = str(item.get("id") or "").strip()
-                        if not bid:
-                            continue
-                        label = str(item.get("name") or bid)
-                        options.append([bid, "%s（%s）" % (label, bid)])
-                    meta["options"] = options
-            except Exception as exc:
-                logger.debug("填充告警机器人选项失败：%s", exc)
             rt = runtime()
             if rt is not None:
                 payload["runtime_web"] = {
