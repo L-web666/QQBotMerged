@@ -20,11 +20,8 @@ from typing import Any, Dict, List
 
 from core import version as version_module
 
-# 多行日志的续行缩进。日志前缀是「时间 [级别] 」（`01:56:55 [INFO] `，共 16 列），
-# 续行缩到与之对齐，读起来是整齐的两段式：
-#   01:56:55 [INFO] 🔵 [提示] 云同步已开启
-#   01:56:55 [INFO]    说明：……
-_SUB = "    "
+# 多行日志的排版见 format_report()：正文用定宽纯文本标签 `[提示] `，
+# 续行按标签宽度缩进，因此不需要额外的常量。
 
 
 def _is_local_host(host: str) -> bool:
@@ -141,24 +138,34 @@ def check_config(config) -> List[Dict[str, Any]]:
 
 
 def format_report(issues: List[Dict[str, Any]]) -> List[str]:
-    """把体检结果整理成若干行日志文本（带图标与修复建议）。
+    """把体检结果整理成若干行日志文本。
 
-    **缩进说明**：日志行的前缀是 `时间 [级别] `（如 `01:56:55 [INFO] `，约 16 列），
-    多行内容如果只写 `"     说明："` 就会和标题行参差不齐。
-    这里统一用 `_SUB` 缩进，让"说明/建议"与标题文字大致对齐；
-    标题行本身不加前导空格，直接跟在 `[INFO] ` 后面。
+    **对齐说明**：日志前缀是 `15:55:23 [INFO] `，后面接正文。
+    为了让"说明/建议"与标题文字对齐，正文用固定宽度的**纯文本标签**开头：
+
+        配置安全体检：发现 1 项需要注意
+        [提示] 云同步已开启
+               说明：data/ 下的用户数据会上传到 Cloudflare D1…
+               建议：确认 cloud_sync.skip_secret_files 保持开启
+
+    为什么不用 emoji 图标：`🔵` 这类字符在终端里占 2 列，但 Python 的字符串长度
+    按 1 个字符算 —— 用空格数去对齐它必然错位（而且不同终端渲染宽度还不一致）。
+    改用纯文本 `[严重]/[风险]/[提示]`（每个 4 列，与前面的标签宽度相同）后，
+    缩进量是个确定值，任何终端都能对齐。
     """
     if not issues:
-        return ["✅ 配置安全体检：没有发现明显问题"]
-    icons = {"critical": "🔴", "warning": "🟠", "info": "🔵"}
+        return ["配置安全体检：没有发现明显问题"]
     labels = {"critical": "严重", "warning": "风险", "info": "提示"}
-    lines = ["配置安全体检：发现 %d 项需要注意" % len(issues)]
+    # 标题标签形如「[提示] 」（4 列 + 1 个空格 = 5 列），续行缩进同样的宽度
+    line_head = "配置安全体检：发现 %d 项需要注意" % len(issues)
+    lines = [line_head]
     for item in issues:
         level = item.get("level") or "info"
-        lines.append("%s [%s] %s" % (icons.get(level, "•"),
-                                     labels.get(level, level), item.get("title")))
+        tag = "[%s]" % labels.get(level, level)
+        lines.append("%s %s" % (tag, item.get("title") or ""))
+        indent = " " * (len(tag) + 1)        # 与标题正文起点对齐
         if item.get("detail"):
-            lines.append("%s说明：%s" % (_SUB, item["detail"]))
+            lines.append("%s说明：%s" % (indent, item["detail"]))
         if item.get("fix"):
-            lines.append("%s建议：%s" % (_SUB, item["fix"]))
+            lines.append("%s建议：%s" % (indent, item["fix"]))
     return lines

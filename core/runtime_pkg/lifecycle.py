@@ -51,6 +51,23 @@ class RuntimeLifecycleMixin:
     NAME_REFRESH_FIRST_DELAY = 12        # 启动后多久开始第一轮（等机器人连接就绪）
     NAME_REFRESH_TICK = 60               # 之后每隔多久检查一次
 
+    def _start_bot_name_refresher(self):
+        """每小时把机器人显示名称与开放平台对齐（平台改名后跟着变）。
+
+        名称不再由用户手填：保存机器人时同步一次，之后靠这个线程定期校正。
+        """
+        if getattr(self, "_bot_name_refresher", None) is not None:
+            return
+        try:
+            from core import bot_names
+            refresher = bot_names.NameRefresher(self.config_manager,
+                                                config=self.config,
+                                                logger_obj=self.log)
+            refresher.start()
+            self._bot_name_refresher = refresher
+        except Exception as exc:
+            self.log.debug("启动机器人名称刷新失败：%s", exc)
+
     def start_name_refresher(self):
         """后台自动刷新群名：群名变了、或还没拿到群名的群，不需要用户手动点。
 
@@ -137,6 +154,7 @@ class RuntimeLifecycleMixin:
         self._start_stats_saver()
         self.start_port_watcher()
         self.start_name_refresher()
+        self._start_bot_name_refresher()
         if self.cloud_sync is not None and self.cloud_sync.enabled:
             self.cloud_sync.start(immediate=self.config.bool_of("cloud_sync", "pull_on_start",
                                                                default=True))
@@ -159,6 +177,13 @@ class RuntimeLifecycleMixin:
     def stop(self):
         self._scheduler_running = False
         self._watching = False
+        refresher = getattr(self, "_bot_name_refresher", None)
+        if refresher is not None:
+            try:
+                refresher.stop()
+            except Exception:
+                pass
+            self._bot_name_refresher = None
         try:
             if self.cloud_sync is not None and self.cloud_sync.enabled:
                 self.cloud_sync.stop(final_sync=True)

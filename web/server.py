@@ -1194,6 +1194,19 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
                 logger.error("配置热更新失败: %s", exc)
         secret["token"] = config_manager.config.str_of("web", "token", default="")
 
+        # 保存了机器人账号 → 用凭据去平台把「显示名称」同步下来。
+        # 名称以开放平台为准，不信任页面传来的值；失败不影响保存结果。
+        if any(str(item) == "bots" for item in changed):
+            try:
+                from core import bot_names
+                new_names = bot_names.refresh_names(
+                    config_manager, config=config_manager.config,
+                    logger_obj=logger, force=True)
+                for bot_id, name in (new_names or {}).items():
+                    audit("config.bot_name", target=bot_id, detail={"name": name})
+            except Exception as exc:
+                logger.debug("保存后同步机器人名称失败：%s", exc)
+
         # 指令面板是注册在 QQ 服务器上的，改完必须重新注册，否则"保存了但不生效"
         panels_result = None
         panels_note = ""
@@ -2107,55 +2120,6 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
             rt.broadcast({"type": "active_bot_changed", "bot_id": chosen})
         return jsonify({"success": True, "active": chosen,
                         "message": f"已切换到机器人 {chosen}（设置页与聊天窗口都以它为准）"})
-
-    @app.route("/api/admin/config/probe_bot", methods=["POST"])
-    def admin_config_probe_bot():
-        """用刚填的 AppID + AppSecret 去问 QQ 平台「这个机器人叫什么」。
-
-        用途：添加机器人时，用户填完凭据后自动把「显示名称」补上，
-        不用再去开放平台复制一遍。
-
-        安全/行为要点：
-          · 只在**内存里**用这两个凭据换取 token，不写配置、不落日志；
-          · 凭据不完整就直接返回 400（不发网络请求）；
-          · 平台返回失败时把原因原样带回（常见：AppID/Secret 填错、IP 未加白名单）；
-          · 该接口只读（`GET /users/@me`），不改任何状态。
-        """
-        blocked = check_token()
-        if blocked:
-            return blocked
-        body = request.get_json(silent=True) or {}
-        app_id = str(body.get("app_id") or "").strip()
-        app_secret = str(body.get("app_secret") or "").strip()
-        if not app_id or not app_secret:
-            return jsonify({"success": False,
-                            "message": "请先填好 AppID 与 AppSecret"}), 400
-
-        try:
-            from core.qq_api import QQApiClient
-            # 用一个临时客户端（不挂到运行时，不影响正在运行的机器人）
-            api = QQApiClient(bot_id="probe", app_id=app_id, app_secret=app_secret,
-                              config=config_manager.config, logger_obj=logger)
-            info = api.bot_info()
-        except Exception as exc:
-            message = _ai_redact_text(str(exc), app_secret)
-            # 凭据是错的才会走到这里，**不要把 secret 写进日志**
-            logger.warning("检测机器人失败（AppID=%s）：%s", app_id, message[:200])
-            audit("config.probe_bot", target=app_id, result="failed",
-                  detail={"error": message[:120]})
-            return jsonify({"success": False, "message": "检测失败：%s" % message}), 502
-
-        name = str(info.get("username") or "")
-        if not name:
-            audit("config.probe_bot", target=app_id, result="failed",
-                  detail={"error": "平台没有返回机器人名称"})
-            return jsonify({"success": False,
-                            "message": "凭据能通过校验，但平台没有返回机器人名称"}), 502
-
-        audit("config.probe_bot", target=app_id, detail={"name": name})
-        return jsonify({"success": True, "name": name,
-                        "avatar": info.get("avatar") or "",
-                        "qq_id": info.get("id") or ""})
 
     @app.route("/api/admin/config/copy_to_all", methods=["POST"])
     def admin_config_copy_to_all():

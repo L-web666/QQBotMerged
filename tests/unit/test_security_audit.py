@@ -162,31 +162,38 @@ def main():
             print("    抛异常:", exc)
         check("空配置返回空列表而不是崩", ok, "")
 
-        print("\n[A8] 报告文本包含图标/说明/建议")
+        print("\n[A8] 报告文本包含级别标签/说明/建议")
         issues = security_audit.check_config(
             Cfg({**schema.default_config(),
                  "web": {**schema.default_config()["web"],
                          "host": "0.0.0.0", "token": "12345678"}}))
         lines = security_audit.format_report(issues)
         text = "\n".join(lines)
-        check("含严重图标", "🔴" in text, text[:80])
+        check("含 [严重] 标签", "[严重]" in text, text[:80])
         check("含「说明」", "说明：" in text, "")
         check("含「建议」", "建议：" in text, "")
 
-        # 排版：标题行不能有前导空格（会与日志前缀 `01:56:55 [INFO] ` 错位），
-        # 续行（说明/建议）统一缩进，且缩进量一致。
-        print("\n[A9] 日志排版：标题顶格、续行统一缩进")
+        # 排版：正文用定宽纯文本标签，续行缩进与标签宽度相同 —— 任何终端都能对齐。
+        # 不能用 emoji 做标签：`🔵` 在终端占 2 列，但 Python 的 len() 按 1 个字符算，
+        # 用空格数去对齐它必然错位。
+        print("\n[A9] 日志排版：纯文本标签 + 续行严格对齐")
         title_lines = [ln for ln in lines if ln and not ln.startswith(" ")]
         cont_lines = [ln for ln in lines if ln.startswith(" ")]
         check("标题行都顶格（无前导空格）",
               all(not ln.startswith(" ") for ln in title_lines), str(title_lines[:2]))
+        check("不再使用 emoji 图标",
+              not any(ch in text for ch in "🔴🟠🔵"), text[:80])
         check("续行都以空格缩进", len(cont_lines) > 0, str(len(cont_lines)))
         indents = {len(ln) - len(ln.lstrip(" ")) for ln in cont_lines}
         check("续行缩进量一致", len(indents) == 1, str(indents))
-        check("缩进是 4 个空格", indents == {4}, str(indents))
-        check("续行不含多余的图标前缀",
-              all("🔴" not in ln and "🟠" not in ln and "🔵" not in ln
-                  for ln in cont_lines), "")
+        check("缩进是 5 个空格（[提示] + 空格）", indents == {5}, str(indents))
+        # 关键：标题正文起点必须等于续行起点
+        starts = set()
+        for ln in title_lines:
+            if ln.startswith("["):
+                starts.add(ln.index("]") + 2)
+        check("标题正文起点也是第 5 列", starts == {5}, str(starts))
+        check("正文起点与续行起点一致", starts == indents, "%s vs %s" % (starts, indents))
 
         # ================= B. 审计日志 =================
         print("\n[B1] 审计日志写入格式")

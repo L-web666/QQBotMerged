@@ -17,6 +17,7 @@
     logTimer: null,
     statusTimer: null,
     updateBusy: false,       // 更新进行中（防止重复点击）
+    updateLockUntil: 0,      // 刚点过更新、服务端还没切到 busy 的本地锁定截止时间
     updateLatest: null       // 最近一次检查到的可安装版本 {tag, version}
   };
 
@@ -239,9 +240,14 @@
       renderUpdate(data || {});
       if (data && data.busy) {
         Admin.updateBusy = true;
+        Admin.updateLockUntil = 0;                 // 服务端已确认在跑，解除本地锁
         setTimeout(loadUpdateStatus, 1000);        // 更新中：每秒刷新进度
+      } else if (Admin.updateLockUntil && Date.now() < Admin.updateLockUntil) {
+        // 刚点过"立即更新"，服务端可能还没切到 busy：先不解锁，继续轮询
+        setTimeout(loadUpdateStatus, 600);
       } else {
         Admin.updateBusy = false;
+        Admin.updateLockUntil = 0;
       }
       return data;
     }).catch(function (error) {
@@ -289,11 +295,15 @@
     }
     var tag = (Admin.updateLatest && (Admin.updateLatest.tag || Admin.updateLatest.latest)) || '';
     Admin.updateBusy = true;
+    // 从"请求发出"到"后台线程真正开跑"之间有一小段空窗（网络往返）。
+    // 这段窗口里不要因为一次 idle 轮询就把按钮解锁，否则用户会以为没生效而再点一次。
+    Admin.updateLockUntil = Date.now() + 10000;
     U.postJSON('/api/admin/update/install', { tag: tag }).then(function (data) {
       U.toast(data.message || '已开始更新', 'ok');
-      setTimeout(loadUpdateStatus, 500);
+      setTimeout(loadUpdateStatus, 400);
     }).catch(function (error) {
       Admin.updateBusy = false;
+      Admin.updateLockUntil = 0;
       U.toast(error.message, 'err');
       loadUpdateStatus();
     });

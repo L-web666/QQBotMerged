@@ -9,8 +9,8 @@
 
   B. **`GET /users/@me` 客户端**：把官方返回整理成统一结构（不依赖具体字段位置）。
 
-  C. **`/api/admin/config/probe_bot` 接口**：用 AppID + AppSecret 换取机器人名称；
-     参数校验、平台报错透传、**绝不把 AppSecret 泄漏到消息/日志里**。
+  C. **名称由程序自动维护**：保存机器人时按凭据取名称（`core.bot_names`），
+     页面上不再提供手填/手动获取入口。
 
 不联网：平台调用全部用桩替换（真实网络只在手工实测时跑过）。
 
@@ -165,64 +165,38 @@ def main():
         check("支持 data 包一层", client.bot_info().get("username") == "嵌在 data 里",
               str(client.bot_info()))
 
-        # ================= C. probe_bot 接口 =================
-        print("\n[C1] 参数校验")
-        web = make_client(root)
-        response = web.post("/api/admin/config/probe_bot", json={})
-        check("没有令牌 → 401", response.status_code == 401, str(response.status_code))
-        response = web.post("/api/admin/config/probe_bot?token=" + TOKEN,
-                            json={"app_secret": "x"})
-        check("缺 AppID → 400", response.status_code == 400, str(response.status_code))
-        response = web.post("/api/admin/config/probe_bot?token=" + TOKEN,
-                            json={"app_id": "102000001"})
-        check("缺 AppSecret → 400", response.status_code == 400, str(response.status_code))
+        # ================= C. 名称自动维护（新设计） =================
+        print("\n[C1] 名称不再由用户手动填写")
+        js2 = open(os.path.join(PROJECT, "web", "static", "js", "settings.js"),
+                   encoding="utf-8").read()
+        check("名称输入框是只读", "readonly" in js2, "")
+        check("没有「获取名称」按钮", "data-probename" not in js2, "")
+        check("新机器人名称留空", "name: ''" in js2, "")
+        check("提示名称为自动获取", "名称自动获取" in js2, "")
 
-        print("\n[C2] 成功路径（桩替换平台调用）")
-        import core.qq_api as qq_module
-        original = qq_module.QQApiClient.bot_info
+        print("\n[C2] 保存配置时自动同步名称")
+        server_src = open(os.path.join(PROJECT, "web", "server.py"),
+                          encoding="utf-8").read()
+        check("保存后调用 refresh_names", "bot_names.refresh_names(" in server_src, "")
+        check("只对 bots 变更触发", '"bots" for item in changed' in server_src, "")
 
-        def fake_info(self):
-            return {"id": "123", "username": "测试机器人", "avatar": "https://a", "bot": True}
+        print("\n[C3] 每小时定时刷新已接进运行时")
+        lifecycle = open(os.path.join(PROJECT, "core", "runtime_pkg", "lifecycle.py"),
+                         encoding="utf-8").read()
+        check("启动时开启", "_start_bot_name_refresher()" in lifecycle, "")
+        check("停止时关闭", "refresher.stop()" in lifecycle, "")
 
-        qq_module.QQApiClient.bot_info = fake_info
-        try:
-            response = web.post("/api/admin/config/probe_bot?token=" + TOKEN,
-                                json={"app_id": "102000001", "app_secret": FAKE_SECRET})
-            body = response.get_json() or {}
-            check("成功 → 200", response.status_code == 200, str(response.status_code))
-            check("带回机器人名称", body.get("name") == "测试机器人", str(body))
-            check("带回头像", bool(body.get("avatar")), str(body))
+        print("\n[C4] 名称模块的关键行为")
+        from core import bot_names as name_module
+        check("刷新间隔是一小时", name_module.REFRESH_SECONDS == 3600, "")
+        check("取不到名称时返回空串", name_module.fetch_bot_name("", "") == "", "")
+        check("有后台线程类", hasattr(name_module, "NameRefresher"), "")
 
-            print("\n[C3] 平台没给名称时算失败")
-            qq_module.QQApiClient.bot_info = lambda self: {"username": ""}
-            response = web.post("/api/admin/config/probe_bot?token=" + TOKEN,
-                                json={"app_id": "102000001", "app_secret": FAKE_SECRET})
-            check("名称为空 → 502", response.status_code == 502, str(response.status_code))
-
-            print("\n[C4] 平台报错时**不泄漏 AppSecret**")
-            def boom(self):
-                raise RuntimeError("凭据错误 secret=%s" % self.app_secret)
-
-            qq_module.QQApiClient.bot_info = boom
-            response = web.post("/api/admin/config/probe_bot?token=" + TOKEN,
-                                json={"app_id": "102000001", "app_secret": FAKE_SECRET})
-            body = response.get_json() or {}
-            message = str(body.get("message") or "")
-            check("失败 → 502", response.status_code == 502, str(response.status_code))
-            check("错误信息里有原因", "检测失败" in message, message[:80])
-            check("错误信息里没有 AppSecret", FAKE_SECRET not in message, message[:120])
-        finally:
-            qq_module.QQApiClient.bot_info = original
-
-        print("\n[C5] 前端入口齐全")
-        js = open(os.path.join(PROJECT, "web", "static", "js", "settings.js"),
-                  encoding="utf-8").read()
-        check("编辑器里有「获取名称」按钮", "data-probename" in js, "")
-        check("点击事件里接了处理", "probeBotName(target)" in js, "")
-        check("调用了 probe_bot 接口", "/api/admin/config/probe_bot" in js, "")
-        check("会写回「显示名称」", "nameInput.value = data.name" in js, "")
-        check("漏填密钥时给出提示",
-              "请重新填一次 AppSecret" in js, "")
+        print("\n[C5] 一次性探测接口已移除")
+        web2 = make_client(root)
+        response = web2.post("/api/admin/config/probe_bot?token=" + TOKEN, json={})
+        check("probe_bot 不再可用",
+              response.status_code in (404, 405), str(response.status_code))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

@@ -909,6 +909,12 @@ class Updater:
                               "请到 GitHub 下载新的 exe 替换旧文件")
         if not self._install_lock.acquire(blocking=False):
             raise UpdateError("已经有一个更新在进行中，请稍候")
+        # **拿到锁就立刻标记为"进行中"**（修复：要点两次更新才提示重启）。
+        # 以前这里不设状态，首次设状态要等到 download() 里，而在此之前还有
+        # "解析 tag → 查 commit"两次网络请求。这段时间状态仍是 idle，
+        # 前端每秒轮询看到 busy=False 就会把按钮重新点亮、进度条也不显示，
+        # 于是用户以为没生效，又点了一次。
+        self.state.set("downloading", "正在准备更新…", 1, str(tag or ""))
         backup_zip = ""
         # 双源校验结果（local-test / 直接给目录的路径没有下载，也就没有这条记录）
         verified: Dict[str, Any] = {}
@@ -958,11 +964,12 @@ class Updater:
                 self.log.debug("写入更新标记失败：%s", exc)
 
             self.state.set("done", "已更新到 %s，请重启程序" % tag, 100, tag)
-            self.log.warning("=" * 60)
-            self.log.warning("更新已安装：%s → %s（写入 %d 个文件）",
-                             self.current_version, marker["to_version"], written)
-            self.log.warning("**请重启程序让新版本生效**（备份：%s）", backup_zip)
-            self.log.warning("=" * 60)
+            # 不打印 `====` 横线框：与其他日志行格式不一致，
+            # 版本、文件数、备份位置一行说清即可。
+            self.log.warning("更新已安装：%s → %s（写入 %d 个文件），"
+                             "**请重启程序让新版本生效**（备份：%s）",
+                             self.current_version, marker["to_version"], written,
+                             backup_zip)
             self.cleanup(keep_backups=3)
             return {"success": True, "message": "已更新到 %s，请重启程序" % tag,
                     "from_version": self.current_version,

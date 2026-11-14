@@ -783,13 +783,13 @@ def main() -> int:
         # 只报告不拦截：真正必须拦的「非本机 + 无令牌」在下面单独判断并拒绝启动。
         try:
             report = security_audit.check_config(config)
-            # 级别对应：🔴 严重 / 🟠 风险 → WARNING；🔵 提示 → INFO。
+            # 级别对应：[严重] / [风险] → WARNING；[提示] → INFO。
             # 续行（说明/建议）跟随所属条目的级别，避免"标题黄色、说明蓝色"的割裂感：
             # `format_report` 产出的续行以空格开头，据此判断它属于上一条。
             current_warning = False
             for line in security_audit.format_report(report):
                 if not line.startswith(" "):
-                    current_warning = (line.startswith("🔴") or line.startswith("🟠")
+                    current_warning = (line.startswith("[严重]") or line.startswith("[风险]")
                                        or line.startswith("配置安全体检：发现"))
                 (log.warning if current_warning else log.info)(line)
         except Exception as exc:        # 体检本身绝不能影响启动
