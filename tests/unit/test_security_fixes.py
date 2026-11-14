@@ -159,7 +159,13 @@ def main():
     print("\n[SEC-10] 启动日志不再输出带令牌的 URL")
     run_src = open(os.path.join(PROJECT, "run.py"), encoding="utf-8").read()
     check("日志里没有 ?token= 拼接", 'f"?token={token}" if token else ""' not in run_src, "")
-    check("保留了「已设置令牌」的提示", "已设置访问令牌" in run_src, "")
+    # 说明：令牌展示方式后来有调整 —— 现在令牌跟在这一行日志里：
+    #   [INFO] 网页后台已就绪：http://127.0.0.1:8666/?token=xxxx
+    # 原来那句独立的「已设置访问令牌」提示被去掉（避免同一个信息出现两次）。
+    # 这里改为确认"启动日志显式带入令牌"这一条，详细断言见
+    # tests/unit/test_token_page.py 的 [B2]。
+    check("启动日志显式带入令牌",
+          'log.info("网页后台已就绪：%s?token=%s"' in run_src, "")
 
     # ============================================================
     # SEC-11 / NEW-06：错误信息脱敏

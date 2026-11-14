@@ -131,6 +131,10 @@
       '<input type="checkbox" data-bot-secret-clear> 清空密钥</label>' +
       '<label class="chk"><input type="checkbox" data-bot-sandbox' +
       (data.sandbox ? ' checked' : '') + '> 沙箱</label>' +
+      /* 填完 AppID + AppSecret 后可以一键去 QQ 平台取机器人名称 */
+      '<button class="btn tiny" type="button" data-probename ' +
+      'title="用上面的 AppID / AppSecret 去 QQ 开放平台查询机器人名称，自动填到「显示名称」">' +
+      '🔍 获取名称</button>' +
       '</div>' +
       '<div class="row" style="margin-top:6px">' +
       '<label class="tiny">intents <input type="number" data-bot-intents value="' +
@@ -398,6 +402,51 @@
     }
   }
 
+  /* ---------------- 自动获取机器人名称 ----------------
+     添加机器人时，用户填完 AppID + AppSecret 后不用再去开放平台复制名称。
+     点「🔍 获取名称」→ 后端用这两个凭据换 token 并查询 `GET /users/@me`，
+     把返回的 username 填进「显示名称」。
+     注意：已经在用的机器人 AppSecret 是留空表示"不修改"，
+     这种情况拿不到密钥，只能提示用户重新填一次。 */
+  function probeBotName(button) {
+    var editor = button.closest('[data-bot]');
+    if (!editor) return;
+    var appIdInput = editor.querySelector('[data-bot-appid]');
+    var secretInput = editor.querySelector('[data-bot-secret]');
+    var nameInput = editor.querySelector('[data-bot-name]');
+    var appId = (appIdInput && appIdInput.value || '').trim();
+    var secret = (secretInput && secretInput.value || '').trim();
+    if (!appId) {
+      U.toast('请先填 AppID', 'err');
+      return;
+    }
+    if (!secret) {
+      U.toast('请重新填一次 AppSecret（留空表示沿用已保存的，无法查询）', 'err');
+      return;
+    }
+    var original = button.textContent;
+    button.disabled = true;
+    button.textContent = '查询中…';
+    U.postJSON('/api/admin/config/probe_bot', { app_id: appId, app_secret: secret })
+      .then(function (data) {
+        if (data && data.name && nameInput) {
+          nameInput.value = data.name;
+          // 让"有未保存修改"的提示生效（名称是随表单一起保存的）
+          Settings.dirty = true;
+          U.toast('已获取名称：' + data.name + '（记得点保存）', 'ok');
+        } else {
+          U.toast('没有拿到机器人名称', 'warn');
+        }
+      })
+      .catch(function (error) {
+        U.toast(error.message || '获取失败', 'err', 6000);
+      })
+      .then(function () {
+        button.disabled = false;
+        button.textContent = original;
+      });
+  }
+
   function bindFormEvents() {
     var form = U.el('settingsForm');
     /* **只绑定一次**（审计修复）：
@@ -434,6 +483,10 @@
       if (target.matches('[data-delbot]')) {
         var editor = target.closest('[data-bot]');
         if (editor) editor.parentNode.removeChild(editor);
+        return;
+      }
+      if (target.matches('[data-probename]')) {
+        probeBotName(target);
         return;
       }
       if (target.matches('[data-addtask]')) {

@@ -20,6 +20,12 @@ from typing import Any, Dict, List
 
 from core import version as version_module
 
+# 多行日志的续行缩进。日志前缀是「时间 [级别] 」（`01:56:55 [INFO] `，共 16 列），
+# 续行缩到与之对齐，读起来是整齐的两段式：
+#   01:56:55 [INFO] 🔵 [提示] 云同步已开启
+#   01:56:55 [INFO]    说明：……
+_SUB = "    "
+
 
 def _is_local_host(host: str) -> bool:
     """监听地址是否只对本机开放。"""
@@ -135,7 +141,13 @@ def check_config(config) -> List[Dict[str, Any]]:
 
 
 def format_report(issues: List[Dict[str, Any]]) -> List[str]:
-    """把体检结果整理成若干行日志文本（带图标与修复建议）。"""
+    """把体检结果整理成若干行日志文本（带图标与修复建议）。
+
+    **缩进说明**：日志行的前缀是 `时间 [级别] `（如 `01:56:55 [INFO] `，约 16 列），
+    多行内容如果只写 `"     说明："` 就会和标题行参差不齐。
+    这里统一用 `_SUB` 缩进，让"说明/建议"与标题文字大致对齐；
+    标题行本身不加前导空格，直接跟在 `[INFO] ` 后面。
+    """
     if not issues:
         return ["✅ 配置安全体检：没有发现明显问题"]
     icons = {"critical": "🔴", "warning": "🟠", "info": "🔵"}
@@ -143,10 +155,10 @@ def format_report(issues: List[Dict[str, Any]]) -> List[str]:
     lines = ["配置安全体检：发现 %d 项需要注意" % len(issues)]
     for item in issues:
         level = item.get("level") or "info"
-        lines.append("  %s [%s] %s" % (icons.get(level, "•"),
-                                        labels.get(level, level), item.get("title")))
+        lines.append("%s [%s] %s" % (icons.get(level, "•"),
+                                     labels.get(level, level), item.get("title")))
         if item.get("detail"):
-            lines.append("     说明：%s" % item["detail"])
+            lines.append("%s说明：%s" % (_SUB, item["detail"]))
         if item.get("fix"):
-            lines.append("     建议：%s" % item["fix"])
+            lines.append("%s建议：%s" % (_SUB, item["fix"]))
     return lines

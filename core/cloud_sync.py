@@ -501,6 +501,8 @@ class CloudSync:
                     result["skipped"] += 1
 
         self.first_sync_done = True
+        self.totals = self.totals or {}
+        self._sync_runs = int(getattr(self, "_sync_runs", 0) or 0) + 1
         for key in ("uploaded", "downloaded", "deleted", "skipped", "errors"):
             self.totals[key] += result.get(key, 0)
         result["ok"] = result["errors"] == 0
@@ -515,16 +517,35 @@ class CloudSync:
         result["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.last_result = result
         if result.get("out_of_scope"):
-            self.log.info("云端另有 %d 条记录不属于本程序（其它程序写的日志/锁文件等），已跳过不算失败",
-                          result["out_of_scope"])
+            self.log.debug("云端另有 %d 条记录不属于本程序（其它程序写的日志/锁文件等），已跳过不算失败",
+                           result["out_of_scope"])
         if result["sensitive"]:
             self.log.warning("有 %d 个文件含密钥字段、按设置没有上传：%s",
                              result["sensitive"], "；".join(result["sensitive_files"][:6]))
+        # 每次同步的"完成"摘要降到 debug —— 默认间隔下这条会周期性刷屏，
+        # 而它对日常使用没有信息量（成功时零变化）。
+        # 退出程序前会统一汇总一次（见 summary()），所以不会丢掉这些数据。
         if result["errors"]:
             self.log.warning("云同步完成但有失败：%s", result["message"])
         else:
-            self.log.info("云同步完成：%s", result["message"])
+            self.log.debug("云同步完成：%s", result["message"])
         return result
+
+    def summary(self) -> str:
+        """整次运行期间的云同步汇总（退出前打一条）。
+
+        为什么需要：单次同步的「完成」日志降到 debug 后，默认 log 级别下
+        用户就完全看不到云同步在做什么。这里在退出前给一行总账。
+        一次都没同步过时返回空串（不打无意义的"上传 0"）。
+        """
+        runs = int(getattr(self, "_sync_runs", 0) or 0)
+        if not runs:
+            return ""
+        totals = getattr(self, "totals", {}) or {}
+        return ("本次运行云同步共 %d 次：上传 %d，恢复 %d，删除 %d，跳过 %d，失败 %d"
+                % (runs, totals.get("uploaded", 0), totals.get("downloaded", 0),
+                   totals.get("deleted", 0), totals.get("skipped", 0),
+                   totals.get("errors", 0)))
 
     def _upload(self, backend: D1Backend, path: str, rel: str, mtime: int) -> str:
         """上传一个文件。返回 `ok` / `sensitive`（含密钥字段，故意没传）/ `fail`。"""
@@ -675,7 +696,8 @@ class CloudSync:
             if immediate:
                 first = self.sync_once()
                 if first.get("ok"):
-                    self.log.info("首次云同步完成：%s", first.get("message"))
+                    # 同样降到 debug：退出前会汇总（见 summary()）
+                    self.log.debug("首次云同步完成：%s", first.get("message"))
             while self._running:
                 time.sleep(max(5, min(self.interval, 30)))
                 # 按配置间隔判断是否到点（用整数对齐，避免漂移）

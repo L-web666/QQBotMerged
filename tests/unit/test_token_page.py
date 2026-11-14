@@ -5,8 +5,9 @@
      等于"先把页面给你看，再告诉你没权限"。现在服务端直接判断，令牌不对只返回
      一页极简提示，**绝不下发后台页面**（含前端路由回落 404 那条路）。
 
-  B. **控制台带令牌、日志不带**：每次启动在控制台打印带令牌的完整地址（方便复制），
-     但写进日志文件的只有打码形式 —— 日志会轮转、会被云同步上传、会被截图。
+  B. **令牌出现在启动日志那一行里**：不再单独用 print 打印一个带令牌的地址框，
+     令牌直接跟在「网页后台已就绪：…?token=…」后面 —— 复制一行就能进后台。
+     因此日志文件里也会有令牌（令牌本来就存 config.json，日志也是本机文件）。
 
 不联网、不碰真实 data/。
 
@@ -121,8 +122,12 @@ def main():
               "boot-data" not in response.get_data(as_text=True),
               str(response.status_code))
 
-        # ---------- B. 控制台带令牌、日志打码 ----------
-        print("\n[B1] 打码函数")
+        # ---------- B. 令牌打印方式 ----------
+        # 现在的行为（与旧版相反）：**不再**用 print 单独打印一个带令牌的地址框，
+        # 而是把令牌直接跟在「网页后台已就绪」这一行日志后面。
+        # 因此日志文件里**也会有**令牌 —— 这是明确的选择（令牌本来就存在
+        # config.json 里，日志也是本机文件），换取"启动后复制一行就能进后台"。
+        print("\n[B1] 打码函数（仍供其它地方使用）")
         code = ("import sys; sys.path.insert(0, %r)\n"
                 "import run\n"
                 "print('M1:', run._mask_token(%r))\n"
@@ -137,14 +142,22 @@ def main():
         check("空令牌返回空串", "M3: ''" in out, "")
         check("打码结果不含完整令牌", TOKEN not in out, "")
 
-        print("\n[B2] 源码层面：控制台用 print，日志用打码")
+        print("\n[B2] 源码层面：令牌跟在「网页后台已就绪」这一行")
         source = open(os.path.join(PROJECT, "run.py"), encoding="utf-8").read()
-        check("有控制台打印带令牌地址",
-              re.search(r'print\([^)]*\?token=', source) is not None, "")
-        # 日志里必须出现打码函数，不能直接把 token 传给 log
-        check("日志里用的是打码形式", "_mask_token(token)" in source, "")
-        bad = re.search(r'log\.\w+\([^)]*token=%s', source)
-        check("没有把 token 直接拼进日志", bad is None, str(bad) if bad else "")
+        # 只禁"启动后每个版本都打印地址框"的那种 print。
+        # `ensure_access_token()` 里首次生成令牌时的 print 属于另一回事（只在新生成时出现）。
+        startup_print = re.search(
+            r'print\([^)]*?token=%s', source.split("def main()")[-1])
+        check("启动流程里不再有单独打印带令牌地址的 print",
+              startup_print is None,
+              startup_print.group(0) if startup_print else "")
+        check("不再打印「后台访问地址」框",
+              "后台访问地址" not in source, "")
+        check("日志行里带入令牌",
+              re.search(r'log\.info\("网页后台已就绪：%s\?token=%s"', source) is not None,
+              "")
+        check("无令牌时仍打印普通地址",
+              re.search(r'log\.info\("网页后台已就绪：%s"', source) is not None, "")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

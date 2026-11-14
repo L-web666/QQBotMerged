@@ -737,6 +737,28 @@ class QQApiClient(QQUploadMixin):
             self.log.error("[%s] 指令面板关联%s失败(%s)：%s", self.bot_id, payload["op"], scope, exc)
             return False
 
+    # ------------------------------------------------------------------ 机器人自身信息
+    def bot_info(self) -> Dict[str, Any]:
+        """获取当前机器人自己的信息（官方 `GET /users/@me`）。
+
+        返回里 `username` 就是机器人在 QQ 开放平台上显示的名称，
+        `avatar` 是头像地址。用户填完 AppID + AppSecret 后，可以用它自动把
+        「显示名称」补上，省得再去开放平台复制一遍。
+
+        注意：字段会因权限不同而不同（`union_openid` 需特殊申请），
+        这里只取 `username` / `avatar` / `id`，取不到就返回空。
+        """
+        result = self.request("GET", f"{self.api_base}/users/@me")
+        data = result.get("data") if isinstance(result.get("data"), dict) else result
+        if not isinstance(data, dict):
+            return {}
+        return {
+            "id": str(data.get("id") or ""),
+            "username": str(data.get("username") or "").strip(),
+            "avatar": str(data.get("avatar") or ""),
+            "bot": bool(data.get("bot")),
+        }
+
     # ------------------------------------------------------------------ 群信息 / 成员
     def group_info(self, group_openid: str) -> Dict[str, Any]:
         result = self.request("GET", f"{self.api_base}/v2/groups/{group_openid}/info")

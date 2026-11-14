@@ -173,6 +173,21 @@ def main():
         check("含「说明」", "说明：" in text, "")
         check("含「建议」", "建议：" in text, "")
 
+        # 排版：标题行不能有前导空格（会与日志前缀 `01:56:55 [INFO] ` 错位），
+        # 续行（说明/建议）统一缩进，且缩进量一致。
+        print("\n[A9] 日志排版：标题顶格、续行统一缩进")
+        title_lines = [ln for ln in lines if ln and not ln.startswith(" ")]
+        cont_lines = [ln for ln in lines if ln.startswith(" ")]
+        check("标题行都顶格（无前导空格）",
+              all(not ln.startswith(" ") for ln in title_lines), str(title_lines[:2]))
+        check("续行都以空格缩进", len(cont_lines) > 0, str(len(cont_lines)))
+        indents = {len(ln) - len(ln.lstrip(" ")) for ln in cont_lines}
+        check("续行缩进量一致", len(indents) == 1, str(indents))
+        check("缩进是 4 个空格", indents == {4}, str(indents))
+        check("续行不含多余的图标前缀",
+              all("🔴" not in ln and "🟠" not in ln and "🔵" not in ln
+                  for ln in cont_lines), "")
+
         # ================= B. 审计日志 =================
         print("\n[B1] 审计日志写入格式")
         paths.LOG_DIR = os.path.join(root, "logs")     # 重定向到临时目录

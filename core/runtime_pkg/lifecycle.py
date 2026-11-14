@@ -162,6 +162,11 @@ class RuntimeLifecycleMixin:
         try:
             if self.cloud_sync is not None and self.cloud_sync.enabled:
                 self.cloud_sync.stop(final_sync=True)
+                # 单次同步的「完成」日志已降到 debug（避免周期性刷屏），
+                # 这里在退出前给一行总账，让用户知道云同步整场做了什么。
+                line = self.cloud_sync.summary()
+                if line:
+                    self.log.info("%s", line)
         except Exception as exc:
             self.log.debug("停止云同步失败: %s", exc)
         for bot in self.bots.values():
