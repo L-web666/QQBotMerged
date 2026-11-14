@@ -1134,6 +1134,26 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
                 return blocked
             payload = config_manager.payload()
             payload["success"] = True
+            # 「用哪个机器人发告警」的选项来自当前机器人列表（动态，不能写死在 schema 里）。
+            # openid 按机器人隔离，所以必须让用户先选机器人、再填该机器人下的 openid。
+            try:
+                fields = payload.get("fields") or {}
+                meta = fields.get("security.alert_bot_id")
+                if isinstance(meta, dict):
+                    options = [["", "不发送"]]
+                    # 机器人列表在 config.bots 里（payload["bots"] 不存在）
+                    raw_bots = (payload.get("config") or {}).get("bots") or []
+                    for item in raw_bots:
+                        if not isinstance(item, dict):
+                            continue
+                        bid = str(item.get("id") or "").strip()
+                        if not bid:
+                            continue
+                        label = str(item.get("name") or bid)
+                        options.append([bid, "%s（%s）" % (label, bid)])
+                    meta["options"] = options
+            except Exception as exc:
+                logger.debug("填充告警机器人选项失败：%s", exc)
             rt = runtime()
             if rt is not None:
                 payload["runtime_web"] = {
@@ -1307,8 +1327,9 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         """按机器人设置"启用哪些插件"（每个机器人可以跑不同的插件）。
 
         请求：`{"bot_id": "...", "allowed": ["插件名", ...]}`。
-        服务端会归一化成"黑名单"存储（`plugins.disabled_names`）；勾满全部插件 =
-        两个名单都清空（该机器人不限制）。插件名必须是当前已加载的插件。
+        服务端把它写成该机器人的**白名单**（`plugins.enabled_names`）——
+        与插件管理页的勾选状态一一对应，设置页的「本机器人启用的插件」能直接看到。
+        勾满全部插件 = 两个名单都清空（该机器人不限制）。插件名必须是当前已加载的插件。
         """
         blocked = check_token()
         if blocked:
@@ -1342,8 +1363,13 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
             enabled_names: List[str] = []
             disabled_names: List[str] = []
         else:
-            enabled_names = []                  # 统一用黑名单表达，避免两份名单互相打架
-            disabled_names = [name for name in known if name not in allowed]
+            # **写白名单（enabled_names）而不是黑名单**：
+            # 设置页的「本机器人启用的插件」读的就是 enabled_names，
+            # 以前这里统一写黑名单，导致插件管理页勾了插件、设置页却显示为空。
+            # 白名单与黑名单在语义上是等价的（前者"只允许这些"、后者"除了这些都允许"），
+            # 但白名单与用户在页面上看到的勾选状态一致，也更不容易被误读。
+            enabled_names = [name for name in known if name in allowed]
+            disabled_names = []
         config_manager.set_for_bot(bot_id, "plugins.enabled_names", enabled_names)
         config_manager.set_for_bot(bot_id, "plugins.disabled_names", disabled_names)
         config_manager.save()

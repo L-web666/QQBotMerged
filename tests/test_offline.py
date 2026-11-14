@@ -4099,9 +4099,15 @@ class GroupPlugin(Star):
         check("接口把「没勾选的插件」标成 false",
               any(value is False for value in (_api39.get("bot_allowed") or {}).values()),
               str(_api39.get("bot_allowed"))[:200])
-        check("接口写进的是该机器人的覆盖（不是全局配置）",
+        # 说明：服务端改为写**白名单**（enabled_names）而不是黑名单。
+        # 原因：设置页的「本机器人启用的插件」读的是 enabled_names，
+        # 以前统一写黑名单，导致插件管理页勾了插件、设置页却显示为空。
+        # 白名单与黑名单在语义上等价（都表达"只允许这些"），但白名单与页面勾选一致。
+        check("接口写进的是该机器人的白名单（不是全局配置）",
               (config_manager.bot_overrides(_b1_39).get("plugins") or {}
-               ).get("disabled_names") == [name for name in _names39 if name != _dice39],
+               ).get("enabled_names") == [_dice39]
+              and (config_manager.bot_overrides(_b1_39).get("plugins") or {}
+                   ).get("disabled_names") == [],
               str(config_manager.bot_overrides(_b1_39).get("plugins"))[:200])
         check("接口没有碰全局 plugins 段",
               (config_manager.config.data.get("plugins") or {}).get("disabled_names") == []

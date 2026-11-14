@@ -259,6 +259,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "admin_openids": [],
         "alert_enabled": True,
         "alert_owner_openid": "",
+        # 用哪个机器人把告警私聊发给主人。留空 = 不启用。
+        # 为什么要单独选：openid 是**按机器人隔离**的 —— 同一个人在每个机器人
+        # 下面拿到的 openid 都不一样，所以"发给谁"必须和"谁去发"配对。
+        "alert_bot_id": "",
+        # 冷却时间（秒）：同一类问题在这段时间内只发一次，避免刷屏。
+        "alert_cooldown_seconds": 600,
     },
 
     # ---------------- 上下文（保留兼容顶层便捷项） ----------------
@@ -460,8 +466,22 @@ FIELDS: Dict[str, Dict[str, Any]] = {
 
     # ---------------- security ----------------
     "security.admin_openids": _f("list", "管理员 openid", "每行一个，拥有机器人指令的管理权限"),
-    "security.alert_enabled": _f("bool", "启用出错告警", ""),
-    "security.alert_owner_openid": _f("str", "告警接收人 openid", "主人 openid"),
+    "security.alert_enabled": _f("bool", "启用出错告警",
+                                 "机器人凭据失效、网关反复连不上、插件加载失败等严重问题时"
+                                 "私聊通知主人（普通日志不通知）"),
+    "security.alert_bot_id": _f("enum", "用哪个机器人发告警",
+                                "openid 是按机器人隔离的：同一个人在每个机器人下拿到的 "
+                                "openid 都不同。所以「发给谁」必须和「谁来发」配对 —— "
+                                "选一个机器人，再填它在下面看到的你的 openid。"
+                                "选「不发送」= 不启用告警",
+                                # 真实选项由 web/server.py 按当前机器人列表动态填入
+                                options=[["", "不发送"]]),
+    "security.alert_owner_openid": _f("str", "告警接收人 openid",
+                                      "用上面那个机器人私聊到的你的 openid（不是 QQ 号）；"
+                                      "各机器人的 openid 不能混用"),
+    "security.alert_cooldown_seconds": _f("int", "告警冷却（秒）",
+                                          "同一类问题在这段时间内只通知一次，避免刷屏",
+                                          min=60, max=86400),
 
     # ---------------- context（兼容项） ----------------
     "context.enabled": _f("bool", "启用上下文（兼容项）", "与「回复与消息」里的开关同步"),
@@ -612,7 +632,8 @@ SECTION_FIELDS: Dict[str, List[str]] = {
               "cloud_sync.startup_buffer", "cloud_sync.startup_buffer_minutes",
               "cloud_sync.startup_buffer_max_mb", "cloud_sync.startup_buffer_keep_remote"],
     "security": ["security.admin_openids", "security.alert_enabled",
-                 "security.alert_owner_openid"],
+                 "security.alert_bot_id", "security.alert_owner_openid",
+                 "security.alert_cooldown_seconds"],
     "logging": ["logging.level", "logging.max_size_mb", "logging.console_color",
                 "logging.keep_days"],
     "ui": ["ui.theme", "ui.animation", "ui.poll_interval_ms", "ui.message_bubbles",

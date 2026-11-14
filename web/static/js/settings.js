@@ -420,7 +420,10 @@
         var kind = target.getAttribute('data-addrow');
         var box = target.parentNode;
         var html = kind === 'dict' ? dictRowHtml('', '') : itemRowHtml('');
-        box.insertAdjacentHTML('beforeend', html);
+        /* 新行插在**按钮之前**：按钮本身也在容器里，用 beforeend 会插到按钮后面，
+           看起来像"点在按钮上、内容跑到按钮下方"。
+           insertBefore(按钮) 让新行紧跟已有行，按钮始终留在最后。 */
+        target.insertAdjacentHTML('beforebegin', html);
         return;
       }
       if (target.matches('[data-delrow]')) {
@@ -429,7 +432,8 @@
         return;
       }
       if (target.matches('[data-addbot]')) {
-        U.el('settingsForm').querySelector('[data-botsbox]').insertAdjacentHTML('beforeend',
+        /* 同样插在按钮之前：按钮在容器里，beforeend 会把它挤到新行上面 */
+        target.insertAdjacentHTML('beforebegin',
           botEditorHtml({ id: 'bot' + (Date.now() % 1000), name: '', enabled: false,
                           intents: 100663296, reconnect_attempts: 5, reconnect_interval: 10 }));
         return;
@@ -440,13 +444,11 @@
         return;
       }
       if (target.matches('[data-addtask]')) {
-        U.el('settingsForm').querySelector('[data-tasksbox]').insertAdjacentHTML('beforeend',
-          taskRowHtml({}));
+        target.insertAdjacentHTML('beforebegin', taskRowHtml({}));
         return;
       }
       if (target.matches('[data-addcmd]')) {
-        U.el('settingsForm').querySelector('[data-cmdsbox]').insertAdjacentHTML('beforeend',
-          commandRowHtml({}));
+        target.insertAdjacentHTML('beforebegin', commandRowHtml({}));
       }
     });
     form.addEventListener('change', function () {

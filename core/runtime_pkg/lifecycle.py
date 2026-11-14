@@ -51,6 +51,40 @@ class RuntimeLifecycleMixin:
     NAME_REFRESH_FIRST_DELAY = 12        # 启动后多久开始第一轮（等机器人连接就绪）
     NAME_REFRESH_TICK = 60               # 之后每隔多久检查一次
 
+    def _start_alert_watcher(self):
+        """定期检查严重问题并私聊通知主人（见 core/alerts.py 顶部说明）。
+
+        只在「启用告警 + 选了发送机器人 + 填了该机器人下的 openid」时才真的发。
+        """
+        if getattr(self, "_alert_thread", None) is not None:
+            return
+        try:
+            from core import alert_checks, alerts
+            self._alerter = alerts.Alerter(self.config_manager,
+                                           runtime_getter=lambda: self,
+                                           logger_obj=self.log)
+
+            def loop():
+                # 启动后先等一会，避免刚起来就误报（机器人还在连接中）
+                for _ in range(alert_checks.CHECK_INTERVAL * 2):
+                    if not self._watching:
+                        return
+                    time.sleep(0.5)
+                while self._watching:
+                    try:
+                        alert_checks.check_and_notify(self, self._alerter)
+                    except Exception as exc:
+                        self.log.debug("告警检查异常：%s", exc)
+                    for _ in range(alert_checks.CHECK_INTERVAL * 2):
+                        if not self._watching:
+                            return
+                        time.sleep(0.5)
+
+            self._alert_thread = threading.Thread(target=loop, name="alerts", daemon=True)
+            self._alert_thread.start()
+        except Exception as exc:
+            self.log.debug("启动告警检查失败：%s", exc)
+
     def _start_bot_name_refresher(self):
         """每小时把机器人显示名称与开放平台对齐（平台改名后跟着变）。
 
@@ -155,6 +189,7 @@ class RuntimeLifecycleMixin:
         self.start_port_watcher()
         self.start_name_refresher()
         self._start_bot_name_refresher()
+        self._start_alert_watcher()
         if self.cloud_sync is not None and self.cloud_sync.enabled:
             self.cloud_sync.start(immediate=self.config.bool_of("cloud_sync", "pull_on_start",
                                                                default=True))
