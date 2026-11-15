@@ -288,7 +288,7 @@ class MessageProcessor:
             "attachments": attachments,
             "mentions": mentions,
             "is_at_bot": bool(message.get("is_at_bot")),
-            "is_admin": self._is_admin(message),
+            "is_admin": self._is_admin(message, bot_id),
             "ts": message.get("ts") or time.time(),
         })
         if plugin_result and plugin_result.get("handled"):
@@ -323,8 +323,8 @@ class MessageProcessor:
         if not content.startswith("/"):
             return False
         command = content.split()[0].lower() if content.split() else content.lower()
-        admin_ids = runtime.config.list_of("security", "admin_openids", default=[])
-        is_admin = bool(admin_ids) and (message.get("openid") in admin_ids)
+        # 管理员名单按机器人取（见 _is_admin 的说明）
+        is_admin = self._is_admin(message, bot_id)
 
         if command in ("/帮助", "/help", "/菜单", "/指令"):
             runtime.stats.record("commands")
@@ -455,9 +455,19 @@ class MessageProcessor:
         runtime.mark_replied(f"{bot_id}:{target_id}:{message.get('openid') or ''}")
 
     # ================================================================== 发送
-    def _is_admin(self, message: Dict[str, Any]) -> bool:
+    def _is_admin(self, message: Dict[str, Any], bot_id: str = "") -> bool:
+        """判断发消息的人是不是**当前这个机器人**的管理员。
+
+        必须按机器人取管理员名单：`security.admin_openids` 在 v1.4.1 起是
+        **按机器人隔离**的（openid 本身就是按机器人隔离的，同一个人在不同机器人下
+        的 openid 完全不同）。以前这里读全局配置，导致
+          · 各机器人单独配的管理员名单不生效；
+          · 旧配置里遗留的全局名单会作用于**所有**机器人 —— 跨机器人越权；
+          · 插件收到的 is_admin 也跟着错。
+        """
         try:
-            admin_ids = self.runtime.config.list_of("security", "admin_openids", default=[])
+            admin_ids = self.runtime.bot_config(bot_id).list_of(
+                "security", "admin_openids", default=[])
         except Exception:
             admin_ids = []
         return bool(admin_ids) and (message.get("openid") in admin_ids)

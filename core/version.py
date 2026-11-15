@@ -29,7 +29,7 @@ from typing import List, Optional, Tuple
 # （该版本新增了出错告警功能，因此升次版本号并把修订号归零）。
 #
 # 注意：版本号必须**严格递增**，否则已装旧版的用户收不到更新提示（按版本号比较）。
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 
 APP_NAME = "QQBotMerged"
 APP_TITLE = "QQ 机器人合并版"
