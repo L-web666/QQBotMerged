@@ -544,6 +544,23 @@ class ConfigManager:
                 for part in parts[:-1]:
                     node = node.setdefault(part, {})
                 node[parts[-1]] = copy.deepcopy(value_node)
+        # **security 段不继承全局**（审计 AUTH-SCOPE-001）：
+        # `security` 自 v1.4.1 起按机器人隔离，但升级前的配置文件里可能还留着
+        # 全局的 `admin_openids` / `alert_owner_openid`。如果让没单独配过的机器人
+        # "继承全局"，结果是：
+        #   · 旧配置里的全局管理员名单对**所有**机器人继续有效（跨机器人越权）；
+        #   · openid 本身就是按机器人隔离的，全局那份对别的机器人通常是错的。
+        # 所以这里把没被 overrides 覆盖的 security 键清成**默认值**（= 没有管理员 /
+        # 不启用告警），逼用户给每个机器人单独配 —— 宁可不生效，也不要意外放权。
+        # 显式配空列表（`[]`）同样表示"这个机器人没有管理员"，与未配置区分开。
+        merged_security = merged.get("security")
+        if isinstance(merged_security, dict):
+            defaults = schema.default_config().get("security") or {}
+            override_security = overrides.get("security") \
+                if isinstance(overrides.get("security"), dict) else {}
+            for key in list(merged_security.keys()):
+                if key not in override_security:
+                    merged_security[key] = copy.deepcopy(defaults.get(key))
         merged["active_bot_id"] = bot_id
         return Config(merged, self._file_data, self.config_path)
 

@@ -1,4 +1,13 @@
 # 合并版 QQ 机器人后台 运行依赖
+#
+# **为什么要显式约束 Werkzeug**：Flask 把它当传递依赖，而 `flask>=2.0` 允许装到
+# 受影响的版本。Werkzeug <3.1.9 在 Windows NTFS 上存在设备名路径处理问题
+# （GHSA-g6x2-hccm-hh4m / CVE-2026-102598）：形如 `NUL:` 的空 ADS 标记设备名
+# 可能让静态文件请求挂起，影响服务可用性。Flask 的默认静态路由正好走它。
+# 这里直接钉死下限，不再依赖 Flask 的传递解析。
+#
+# 注意：Werkzeug 3.1.9 要求 Python >=3.9，所以本项目的最低 Python 也提高到 3.9。
 flask>=2.0
+Werkzeug>=3.1.9
 requests>=2.28.0
 websocket-client>=1.5.0

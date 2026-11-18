@@ -41,8 +41,64 @@ from core.storage import conversation_key, conv_key_for
 logger = logging.getLogger(__name__)
 
 
+# 静态资源白名单：只放行这些目录/扩展名组合。
+# **为什么需要**：Flask 的默认静态路由不做令牌校验（GET 是"安全方法"），
+# 而 Werkzeug 的 safe_join 在 Windows NTFS 上曾被报出设备名路径问题
+# （GHSA-g6x2-hccm-hh4m / CVE-2026-102598，形如 `NUL:` 的空 ADS 标记设备名
+# 可能让请求挂起）。即便升级到已修复版本，静态路由也不该接受任意文件名 ——
+# 它只需要服务这几个前端资源。
+_STATIC_ALLOWED_SUFFIXES = (".css", ".js", ".png", ".svg", ".ico", ".woff", ".woff2")
+# Windows 保留设备名（不区分大小写，且带扩展名也生效：NUL.txt 同样是设备）
+_WINDOWS_DEVICE_NAMES = {
+    "con", "prn", "aux", "nul",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+}
+
+
+def _static_path_allowed(filename: str) -> bool:
+    """判断静态资源路径是否可以交给 Flask/Werkzeug 去读。
+
+    拒绝：设备名、ADS（`name:stream`）、控制字符、反斜杠、`..`、
+    以及不在白名单里的扩展名。
+    """
+    raw = str(filename or "")
+    if not raw or len(raw) > 200:
+        return False
+    # 反斜杠在 Windows 上是分隔符，Flask 只认正斜杠 → 一律拒绝，避免绕过
+    if "\\" in raw:
+        return False
+    # 冒号：Windows 的 ADS 分隔符（`file.txt:hidden`）与设备名（`NUL:`）
+    if ":" in raw:
+        return False
+    # 控制字符（含 NUL 字节）
+    if any(ord(ch) < 32 for ch in raw):
+        return False
+    # 不允许跳出静态目录
+    parts = raw.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return False
+    # 目录名也不能是设备名
+    for part in parts[:-1]:
+        if part.lower().split(".")[0] in _WINDOWS_DEVICE_NAMES:
+            return False
+    name = parts[-1]
+    lowered = name.lower()
+    # 文件名主干是设备名就拒绝（NUL、NUL.txt、con.js 都算）
+    if lowered.split(".")[0] in _WINDOWS_DEVICE_NAMES:
+        return False
+    # 尾随空格/点：Windows 会静默去掉，可能造成"看起来不同其实是同一个文件"
+    if name != name.rstrip(" ."):
+        return False
+    return lowered.endswith(_STATIC_ALLOWED_SUFFIXES)
+
+
 def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
-    app = Flask(__name__, template_folder=paths.TEMPLATE_DIR, static_folder=paths.STATIC_DIR)
+    # **不要在这里传 static_folder**：Flask 在构造时就会注册 `/static/<path:filename>`
+    # 路由（endpoint=static），之后再改 app.config["static_folder"] 也撤不掉它 ——
+    # 那会导致两条同名路由并存，而 Flask 走的是先注册的那条（不带白名单检查）。
+    # 静态资源统一由下面的 static_file() 提供（见 _static_path_allowed）。
+    app = Flask(__name__, template_folder=paths.TEMPLATE_DIR, static_folder=None)
     # 上传上限：QQ 官方对图片/视频/语音/文件的硬限制都是 200MB，
     # 这里留一点余量给 multipart 包头（业务上限由 send.max_file_mb 再控一次）
     app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
@@ -520,6 +576,32 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
                 (rt.store.media_stats().get("done") or {}).get("count", 0) if rt is not None else 0),
             "ai_usable": bool(rt is not None and rt.ai_status().get("usable")),
         })
+
+    # ---------------- 静态资源（受限） ----------------
+    @app.route("/static/<path:filename>")
+    def static_file(filename: str):
+        """前端资源（CSS/JS/图标）。
+
+        **为什么不直接用 Flask 自动注册的静态路由**：
+        Flask 的默认静态路由不经过令牌校验（GET 属于"安全方法"，CSRF 钩子直接放行），
+        而它最终交给 Werkzeug 做路径解析。Werkzeug <3.1.9 在 Windows NTFS 上
+        存在设备名路径问题（GHSA-g6x2-hccm-hh4m / CVE-2026-102598）：
+        形如 `NUL:` 的空 ADS 标记设备名会让请求挂起，拖垮服务可用性。
+
+        这里做两件事：
+          1. 路径先过 `_static_path_allowed()` 白名单（拒设备名 / ADS / 控制字符 /
+             反斜杠 / `..` / 非白名单扩展名），**不合法的请求根本不会碰到文件系统**；
+          2. 直接用 `send_from_directory` 并限定在 `paths.STATIC_DIR` 内。
+        即便装上已修复的 Werkzeug，这层白名单也把攻击面收窄到"只能取这几个前端文件"。
+        """
+        if not _static_path_allowed(filename):
+            logger.debug("拒绝可疑的静态资源路径：%r", filename)
+            return jsonify({"success": False, "message": "资源不存在"}), 404
+        try:
+            return send_from_directory(paths.STATIC_DIR, filename)
+        except Exception:
+            # 不存在 / 是目录 / 读不了，一律 404（不泄漏细节）
+            return jsonify({"success": False, "message": "资源不存在"}), 404
 
     # ---------------- 静态媒体 ----------------
     @app.route("/media/<path:filename>")

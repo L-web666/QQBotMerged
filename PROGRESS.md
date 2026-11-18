@@ -20,7 +20,7 @@
 
 ## 当前状态
 
-- 程序版本：**v1.4.2**（唯一来源 `core/version.py` 的 `__version__`；
+- 程序版本：**v1.4.3**（唯一来源 `core/version.py` 的 `__version__`；
   网页侧栏/关于页/接口都从这里取）
 
 ### 常用命令
@@ -69,6 +69,7 @@ python tests/test_instance_lock.py # 单实例锁
 | `test_plugin_scope.py` | 插件范围写白名单 / 添加行按钮位置 |
 | `test_alerts.py` | 出错告警 / openid 按机器人隔离 |
 | `test_admin_scope.py` | 管理员权限按机器人隔离 |
+| `test_static_deps.py` | Werkzeug 依赖下限 / 静态路由白名单 / 管理员不继承全局 |
 | `test_readme_toc.py` | README 目录锚点与排版 / 统计数字 |
 
 DOM 测试（`node`）：
@@ -178,8 +179,8 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 
 按优先级：
 
-1. `core/qq_api.py` 单文件仍偏大（> 1100 行），群管理相关可再拆
-2. `tests/test_offline.py` 单文件过大（> 4700 行），跑一次慢（**新用例请放 `tests/unit/`**）
+1. `core/qq_api.py` 单文件仍偏大（约 900 行），群管理相关可再拆
+2. `tests/test_offline.py` 单文件过大（约 4800 行），跑一次慢（**新用例请放 `tests/unit/`**）
 3. 插件是任意 Python 代码，`PluginRuntime` 门面拦不住越权（`import os` 仍可读 config.json）；
     `core/plugin_safety.py` 只是**提示**，`plugin_sandbox` 只是**软限制**，都不是真沙箱
 4. 云同步的敏感字段扫描**只按字段名**判断；密钥直接写进正文（不是字段）时扫不出来
@@ -210,9 +211,13 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 
 ## 下一步（按优先级）
 
+- [x] P1：依赖安全基线（2026-11-18）：`requirements.txt` 显式钉 `Werkzeug>=3.1.9`
+      （CVE-2026-102598），最低 Python 提到 3.9；静态路由改为白名单实现
+- [x] P1：管理员旧配置不再继承全局（2026-11-18，审计 AUTH-SCOPE-001）
 - [ ] P2：指令标签真机验证（`reference=true` 的引用行为、urlencode 后客户端点击发送的
       到底是解码文本还是编码串；官方都未写），以及 @ 标签在纯文本消息里的渲染结论再确认一次
 - [ ] P2：给 `core/alerts.py` 补"发不出去时怎么办"（见技术债第 7 条，具体方案待定）
+- [ ] P3：生成依赖锁文件 / SBOM，在 CI 里做安全公告扫描（现在只钉了 Werkzeug 一个）
 - [ ] P3：`tests/test_offline.py` 逐节迁移到 `tests/unit/`（老用例没有搬动过）
 
 ---
@@ -262,6 +267,35 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 > 真实数据规模（群数/成员数/消息条数等）、实例环境的操作过程、截图来源。
 >
 > **只保留最近若干轮**；更早的记录已在归档文件里，本文件不再堆叠。
+
+- 2026-11-18：**修 Werkzeug 设备名路径风险（CVE-2026-102598）+ 静态路由白名单 + 管理员旧配置不再继承全局**：
+  - **① 依赖约束**：`requirements.txt` 原来只声明 `flask>=2.0`，把 Werkzeug 当传递依赖，
+    允许装到受影响的版本。本机实测装的是 **3.1.8**，正好落在受影响范围。
+    Werkzeug <3.1.9 在 Windows NTFS 上，形如 `NUL:` 的空 ADS 标记设备名会让
+    静态文件请求**挂起**（GHSA-g6x2-hccm-hh4m）。现在显式钉 `Werkzeug>=3.1.9`，
+    并把本机升级到 3.1.9。因为 3.1.9 要求 Python ≥3.9，README 的最低 Python 从 3.8+ 改为 **3.9+**。
+  - **② 静态路由白名单**：Flask 自动注册的 `/static/<path:filename>` 不做令牌校验
+    （GET 属安全方法，CSRF 钩子直接放行），最终交给 Werkzeug 解析路径。
+    改成自己实现的受限路由：先过 `_static_path_allowed()` 白名单
+    （拒 Windows 设备名 / ADS / 控制字符 / 反斜杠 / `..` / 非白名单扩展名），
+    再 `send_from_directory`。**不合法的请求根本不会碰到文件系统**。
+    **踩到的坑**：只在构造后设 `app.config["static_folder"] = None` **撤不掉**
+    Flask 在构造时注册的路由，会并存两条同名路由，而 Flask 走先注册的那条（不受限）——
+    实测 `/static/js/util.js::$DATA` 仍返回 200。必须在 `Flask(...)` 构造时就不传 `static_folder`。
+  - **③ 管理员旧配置不再继承全局**（审计 AUTH-SCOPE-001）：
+    `security` 自 v1.4.1 起按机器人隔离，但升级前的旧配置里可能还留着全局
+    `admin_openids`。`resolve_for_bot()` 从全局深拷贝再覆盖，于是**没单独配过的机器人
+    会继承全局名单** —— 旧名单对所有机器人继续有效（跨机器人越权）。
+    现在 `security` 段中**没被该机器人 overrides 覆盖的键，一律取默认值**
+    （没有管理员 / 不启用告警），逼用户给每个机器人单独配；
+    显式配 `[]` 表示"这个机器人没有管理员"，与未配置区分开。
+    其它 per-bot 分组（ai/reply/...）仍照旧继承全局，没有误伤。
+  - **怎么验证**：新增 `tests/unit/test_static_deps.py`（59 项）：依赖下限、
+    README 的 Python 版本声明、白名单函数逐项（设备名/ADS/穿越/控制字符/扩展名）、
+    **只有一条 static 路由且 endpoint 是受限版本**、正常资源无令牌可取、
+    可疑路径带令牌也 404、以及管理员旧配置不继承 / 各机器人自己的配置仍生效 /
+    非 security 段照旧继承。全套回归：`test_offline` 576 项、`check_frontend`、
+    `run.py --check` 全绿（升级 Werkzeug 后复跑通过）。
 
 - 2026-11-15：**统一 README 的三级标题编号，修正失效的目录锚点**：
   - 问题：第三章用 `### 1. 安装依赖`（像章号），第五/七/十章用 `### 5.1 xxx`，两套并存；
