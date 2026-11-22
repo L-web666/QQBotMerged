@@ -104,6 +104,31 @@ def main():
                     "COM1.js", "LPT1.css", "js/CON.js"):
             check(f"拒绝 {bad}", _static_path_allowed(bad) is False, "")
 
+        # 审计 SEC-STATIC-001：Windows 还认 **上标数字**写法（COM¹/LPT²…）。
+        # 这些不是 ASCII，早期实现用字符串精确匹配会漏掉，`COM¹.js` 能通过白名单。
+        print("\n[B2b] 白名单函数：上标数字设备名（SEC-STATIC-001）")
+        for digit in ("\u00b9", "\u00b2", "\u00b3"):
+            for base in ("COM", "LPT", "com", "lpt"):
+                for suffix in (".js", ".css", ""):
+                    bad = base + digit + suffix
+                    check(f"拒绝 {bad!r}", _static_path_allowed(bad) is False, "")
+
+        print("\n[B2c] 白名单函数：其它 Unicode 绕过写法")
+        for bad in ("\uff23\uff2f\uff2e.js",      # 全角 CON
+                    "COM\u2074.js",                # 上标 4
+                    "NUL\u200b.js",                # 零宽空格
+                    "NUL\u00a0.txt",               # 不换行空格
+                    "con\u0301.js",                # 组合重音
+                    "nul\u00ad.js"):               # 软连字符
+            check(f"拒绝 {bad!r}", _static_path_allowed(bad) is False, "")
+
+        print("\n[B2d] 这些加固不能误伤正常资源")
+        for good in ("css/app.css", "css/anim.css", "js/util.js", "js/chat.js",
+                     "js/settings.js", "js/admin.js", "js/groups.js",
+                     "js/app.js", "js/effects.js", "favicon.ico",
+                     "img/logo.png", "img/icon.svg", "a_b-c.d.js"):
+            check(f"仍放行 {good}", _static_path_allowed(good) is True, "")
+
         print("\n[B3] 白名单函数：ADS / 穿越 / 其它异常一律拒绝")
         for bad in ("css/app.css:stream", "js/util.js::$DATA",
                     "../config.json", "css/../../config.json",
@@ -134,6 +159,15 @@ def main():
                     "/static/config.json", "/static/no_such_file.css"):
             response = client.get(url + "?token=" + token)
             check(f"{url} -> 404", response.status_code == 404,
+                  str(response.status_code))
+
+        print("\n[B6b] 带令牌时上标数字设备名也 404（SEC-STATIC-001 的 HTTP 面）")
+        for url in ("/static/COM\u00b9.js", "/static/COM\u00b2.js",
+                    "/static/COM\u00b3.js", "/static/LPT\u00b9.css",
+                    "/static/LPT\u00b2.css", "/static/LPT\u00b3.css",
+                    "/static/com\u00b9.js", "/static/lpt\u00b3.css"):
+            response = client.get(url + "?token=" + token)
+            check(f"{url!r} -> 404", response.status_code == 404,
                   str(response.status_code))
 
         print("\n[B7] 不带令牌时可疑路径也不会拿到内容")

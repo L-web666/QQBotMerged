@@ -54,13 +54,37 @@ _WINDOWS_DEVICE_NAMES = {
     "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
     "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 }
+# Windows 还认这些**上标数字**写法：`COM¹` / `COM²` / `COM³` / `LPT¹` 等
+# （U+00B9 ¹、U+00B2 ²、U+00B3 ³）。它们不是 ASCII，用字符串精确匹配会漏掉，
+# 所以下面先把这些字符归一成普通数字，再判设备名。
+_SUPERSCRIPT_DIGITS = {"\u00b9": "1", "\u00b2": "2", "\u00b3": "3"}
+# 文件名里**只允许**这些 ASCII 字符：字母、数字、点、横线、下划线。
+# 用"允许清单"而不是"禁止清单"：设备名/上标/全角/组合字符等怪写法一律进不来，
+# 不必逐个枚举（`COM¹`、`ＣＯＮ`、`NUL`+零宽字符 这类都是这么挡住的）。
+_ALLOWED_NAME_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789._-")
+
+
+def _normalize_device_stem(text: str) -> str:
+    """把文件名主干归一成用于判设备名的形式：上标数字转普通数字 + 转小写。"""
+    out = []
+    for ch in text:
+        out.append(_SUPERSCRIPT_DIGITS.get(ch, ch))
+    return "".join(out).lower()
+
+
+def _is_windows_device_name(stem: str) -> bool:
+    """判断某个文件名主干是不是 Windows 保留设备名（含上标数字写法）。"""
+    return _normalize_device_stem(stem) in _WINDOWS_DEVICE_NAMES
 
 
 def _static_path_allowed(filename: str) -> bool:
     """判断静态资源路径是否可以交给 Flask/Werkzeug 去读。
 
-    拒绝：设备名、ADS（`name:stream`）、控制字符、反斜杠、`..`、
-    以及不在白名单里的扩展名。
+    拒绝：设备名（含 `COM¹` 这类上标写法）、ADS（`name:stream`）、控制字符、
+    非 ASCII 字符、反斜杠、`..`、以及不在白名单里的扩展名。
     """
     raw = str(filename or "")
     if not raw or len(raw) > 200:
@@ -78,14 +102,18 @@ def _static_path_allowed(filename: str) -> bool:
     parts = raw.split("/")
     if any(part in ("", ".", "..") for part in parts):
         return False
+    # 只允许 ASCII 字母/数字/点/横线/下划线：上标数字、全角字母、零宽字符等
+    # 一律进不来（比逐个枚举设备名可靠）
+    if any(ch not in _ALLOWED_NAME_CHARS for ch in raw.replace("/", "")):
+        return False
     # 目录名也不能是设备名
     for part in parts[:-1]:
-        if part.lower().split(".")[0] in _WINDOWS_DEVICE_NAMES:
+        if _is_windows_device_name(part.split(".")[0]):
             return False
     name = parts[-1]
     lowered = name.lower()
-    # 文件名主干是设备名就拒绝（NUL、NUL.txt、con.js 都算）
-    if lowered.split(".")[0] in _WINDOWS_DEVICE_NAMES:
+    # 文件名主干是设备名就拒绝（NUL、NUL.txt、con.js、COM¹.js 都算）
+    if _is_windows_device_name(name.split(".")[0]):
         return False
     # 尾随空格/点：Windows 会静默去掉，可能造成"看起来不同其实是同一个文件"
     if name != name.rstrip(" ."):
