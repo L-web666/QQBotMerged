@@ -207,9 +207,21 @@ def do_install(install_dir: str = "", force_wizard: bool = False,
         try:
             config = wizard.run_wizard(install_dir, tag, existing)
         except (EOFError, KeyboardInterrupt):
+            # 用户中途按了 Ctrl+C / 输入被关掉（管道里跑、CI）。
+            # **程序文件已经装好了，必须照常写 marker**，否则 `is_installed()`
+            # 判为没装，下次 `qqbot` 会重新下载一遍 —— 白费一次下载和装依赖。
+            # 但 config.json 没写成，所以一个劲儿启动也没用，改为提示补配置。
             print()
+            runner.write_marker(install_dir, {
+                "tag": tag,
+                "sha256": result.get("sha256") or "",
+                "cli_version": __version__,
+                "needs_config": True,
+            })
+            paths.remember_install_dir(install_dir)
             _info("向导已取消，程序文件已经装好了。")
-            _info("之后运行 qqbot 会继续问配置。")
+            _info("还没写配置，所以暂时不能直接启动。")
+            _info("运行 `qqbot init` 补完配置即可（不会重新下载）。")
             return 0
         wizard.write_config(install_dir, config)
         _ok("已生成 config.json")
@@ -497,6 +509,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         remembered = paths.remembered_install_dir()
         if not dir_given and remembered and runner.is_installed(remembered) \
                 and not args.upgrade:
+            # 装过但上次向导被取消了（没写 config.json）→ 补配置，而不是启动个空程序
+            marker = runner.read_marker(remembered)
+            if marker.get("needs_config") and \
+                    not os.path.exists(os.path.join(remembered, "config.json")):
+                _info("上次没写配置，先补一下（不会重新下载）。")
+                return do_install(remembered, force_wizard=True,
+                                  upgrade=False, dir_given=True)
             return do_run(remembered)
         return do_install(install_dir, upgrade=args.upgrade, dir_given=dir_given)
     except KeyboardInterrupt:

@@ -229,9 +229,8 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 - [ ] P2：指令标签真机验证（`reference=true` 的引用行为、urlencode 后客户端点击发送的
       到底是解码文本还是编码串；官方都未写），以及 @ 标签在纯文本消息里的渲染结论再确认一次
 - [ ] P2：给 `core/alerts.py` 补"发不出去时怎么办"（见技术债第 7 条，具体方案待定）
-- [ ] P1：PyPI 上配好 Trusted Publisher 后，用 GitHub Actions 发出 `qqbot-cli` 首个版本
-      （工作流与步骤已就绪：`.github/workflows/publish-cli.yml` + `docs/PUBLISHING.md`，
-      **只差 PyPI 网页上那一步配置**，见下面「最近变更」）
+- [x] P1：`qqbot-cli` 已发布到 PyPI 并实测可装（2026-11-25）。
+      以后发新版：改 `pyproject.toml` 的 `version` → 推 `cli-v*` tag 或在 Actions 手动触发
 - [ ] P3：生成依赖锁文件 / SBOM，在 CI 里做安全公告扫描（现在只钉了 Werkzeug 一个）
 - [ ] P3：`tests/test_offline.py` 逐节迁移到 `tests/unit/`（老用例没有搬动过）
 
@@ -282,6 +281,24 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 > 真实数据规模（群数/成员数/消息条数等）、实例环境的操作过程、截图来源。
 >
 > **只保留最近若干轮**；更早的记录已在归档文件里，本文件不再堆叠。
+
+- 2026-11-25：**`qqbot-cli` 已发到 PyPI，并修掉实测发现的一个 bug（1.0.0 → 1.0.1）**：
+  - **发布结果**：`pypi.org/project/qqbot-cli/1.0.0` 已上线（GitHub Actions 两次
+    `workflow_dispatch` 都 success）。从 PyPI 真装一遍验证过：
+    `pip install qqbot-cli` → `qqbot --version` 正常；
+    用这个从 PyPI 装的启动器完整跑通「下载 v1.5.0 → 建 venv → 装依赖」。
+  - **实测发现的 bug**：**向导被取消时不写 marker**。`do_install()` 的
+    `except (EOFError, KeyboardInterrupt)` 分支直接 `return 0`，跳过了后面的
+    `write_marker()`。后果是程序文件明明装好了，`is_installed()` 却判为没装 ——
+    下次运行 `qqbot` 会**重新下载一遍并重装依赖**（白费几分钟）。
+    在管道/CI 里跑更容易撞上（输入被关掉就是 EOF）。
+  - **改了什么**：取消分支现在也写 marker，但带上 `"needs_config": True`；
+    `main()` 的 auto 分支看到这个标记且没有 `config.json` 时，
+    走「补配置」而不是 `do_run` —— 既不重复下载，也不会启动一个空配置的程序。
+    提示语改成「运行 `qqbot init` 补完配置即可（不会重新下载）」。
+  - **怎么验证**：`test_launcher.py` 新增 [E4] 6 项（取消前判未安装 / 取消后仍判已安装 /
+    marker 带 needs_config / 缺 config 时要求补配置 / 有 config 后不再要求 /
+    正常安装不带该标记），总项数 **60 → 66**。另外真机端到端验证过整个流程。
 
 - 2026-11-25：**加好 PyPI 自动发布（GitHub Actions + Trusted Publishing），本地实测打包通过**：
   - **要解决什么**：启动器要能被 `pipx install qqbot-cli` 装上，就得发到 PyPI。

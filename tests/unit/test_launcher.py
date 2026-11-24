@@ -332,6 +332,47 @@ def main():
                 os.remove(one)
             except OSError:
                 pass
+        # 注意：这里不删 work，[E4] 还要用；最后统一清理
+
+    print("\n[E4] 向导被取消时仍要记成「已安装」（否则下次会重新下载）")
+    try:
+        cancelled = os.path.join(work, "cancelled")
+        os.makedirs(cancelled, exist_ok=True)
+        with open(os.path.join(cancelled, "run.py"), "w", encoding="utf-8") as fh:
+            fh.write("print('hi')\n")
+        os.makedirs(os.path.join(cancelled, ".venv", "Scripts"), exist_ok=True)
+        with open(os.path.join(cancelled, ".venv", "Scripts", "python.exe"), "w") as fh:
+            fh.write("")
+        check("取消前：判为未安装", runner.is_installed(cancelled) is False, "")
+        # 取消分支现在会做的事
+        runner.write_marker(cancelled, {
+            "tag": "v1.5.0", "sha256": "x", "cli_version": "1.0.0",
+            "needs_config": True,
+        })
+        check("取消后：仍判为已安装（不会再下载一遍）",
+              runner.is_installed(cancelled) is True, "")
+        marker = runner.read_marker(cancelled)
+        check("marker 里记了 needs_config", marker.get("needs_config") is True, "")
+        # auto 分支据此判断要不要先补配置
+        config_path = os.path.join(cancelled, "config.json")
+        needs = marker.get("needs_config") and not os.path.exists(config_path)
+        check("缺 config.json 时会被要求补配置", bool(needs) is True, "")
+        with open(config_path, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        needs_after = marker.get("needs_config") and not os.path.exists(config_path)
+        check("有 config.json 后不再要求补配置", bool(needs_after) is False, "")
+        # 正常安装不该带这个标记
+        normal = os.path.join(work, "normal")
+        os.makedirs(normal, exist_ok=True)
+        with open(os.path.join(normal, "run.py"), "w", encoding="utf-8") as fh:
+            fh.write("print('hi')\n")
+        runner.write_marker(normal, {"tag": "v1.5.0", "sha256": "y",
+                                     "cli_version": "1.0.0"})
+        check("正常安装没有 needs_config", 
+              runner.read_marker(normal).get("needs_config") is None, "")
+    except Exception as exc:
+        check("取消流程没抛异常", False, str(exc))
+    finally:
         shutil.rmtree(work, ignore_errors=True)
 
     print("\n" + "=" * 70)
