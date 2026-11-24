@@ -10,7 +10,7 @@
 现在：能从消息里拿到真实身份就存下来；真拿不到才显示「未知」。
 
 链路：gateway 解析 → runtime 落库（group_members）→ 群管理页读出来显示。
-分层约定见 `PROGRESS.md`：`tests/unit/` 快、只依赖被测模块；不连网、不碰真实 `data/`。
+分层约定见 `AGENTS.md`：`tests/unit/` 快、只依赖被测模块；不连网、不碰真实 `data/`。
 
 运行：`python tests/unit/test_member_role.py`
 """

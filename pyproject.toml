@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qqbot-cli"
+version = "1.0.0"
+description = "QQBotMerged 启动器：一条命令装好并启动 QQ 官方机器人多开后台"
+readme = "PACKAGING.md"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0" }
+authors = [{ name = "L-web666" }]
+keywords = ["qq", "bot", "qqbot", "astrbot", "nonebot"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: Console",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Intended Audience :: End Users/Desktop",
+]
+# **启动器自己只依赖 requests**：主程序的 flask/werkzeug 等装进它自己的虚拟环境，
+# 不污染安装启动器的那个环境（这也正是推荐用 pipx 的原因）。
+dependencies = ["requests>=2.28.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/L-web666/QQBotMerged"
+Repository = "https://github.com/L-web666/QQBotMerged"
+Issues = "https://github.com/L-web666/QQBotMerged/issues"
+Releases = "https://github.com/L-web666/QQBotMerged/releases"
+
+# 命令名就叫 qqbot（包名是 qqbot-cli，两者不必一致 —— NoneBot 的 nb-cli / nb 也是这样）
+[project.scripts]
+qqbot = "qqbot_cli.cli:main"
+
+[tool.setuptools]
+# **只打包启动器目录**：core/ web/ plugins/ 等主程序代码不进 pip 包，
+# 它们由启动器运行时从 GitHub Release 拉取。
+packages = ["qqbot_cli"]
+
+[tool.setuptools.package-data]
+qqbot_cli = ["py.typed"]

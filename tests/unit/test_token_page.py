@@ -107,7 +107,7 @@ def main():
         # 说明：`check_token()` 本身在"令牌为空"时仍然放行 —— 这是历史行为，
         # 真正的把关在启动阶段（run.py 的 ensure_access_token + 拒绝启动）。
         # 这条用例只描述**服务层**语义，不再把"无鉴权可用"当成推荐配置：
-        # 启动侧由 test_auth.py / 本轮新增用例保证"生成失败即拒绝启动"。
+        # 启动侧由 test_auth.py 与 test_security_v135.py 保证"生成失败即拒绝启动"。
         open_client = make_client(root, "")
         response = open_client.get("/")
         check("服务层：无令牌配置不做门禁", response.status_code == 200,

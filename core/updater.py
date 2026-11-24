@@ -68,7 +68,7 @@ REQUIRED_FILES = ("run.py", os.path.join("core", "__init__.py"),
 # 安装时**永不覆盖**的路径（用户数据与本地配置）
 PROTECTED_DIRS = ("data", "plugins", ".git", "__pycache__", "dist", "build",
                   ".venv", "venv", ".idea", ".vscode")
-# 注意：`README.md` / `PROGRESS.md` 是正常仓库文件，**允许**随版本更新；
+# 注意：`README.md` / `AGENTS.md` 是正常仓库文件，**允许**随版本更新；
 # 这里保护的是"用户本地才有、覆盖了会丢东西"的文件。
 PROTECTED_FILES = ("config.json", "config.example.json", "config配置说明文件.txt")
 PROTECTED_SUFFIXES = (".bak", ".pyc", ".log", ".db")

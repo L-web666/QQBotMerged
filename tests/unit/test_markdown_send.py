@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """单元测试：QQ 原生 markdown 发送 + 纯文本/markdown 切换（`core/qq_api.py` / `core/qq_errors.py`）
 
-分层约定见 `PROGRESS.md`：`tests/unit/` 快、只依赖被测模块；**不联网、不碰真实 `data/`**。
+分层约定见 `AGENTS.md`：`tests/unit/` 快、只依赖被测模块；**不联网、不碰真实 `data/`**。
 做法：`QQApiClient` 的子类覆盖 `request()`，把每次请求的 payload 记下来，再照契约断言
 （接口契约见 `.recon/md-plan.md` 第 1.2 / 1.6 节，官方字段见 `.recon/md-send-api.md` 第 1.2 节）。
 

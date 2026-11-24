@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """单元测试：插件安全扫描（`core/plugin_safety.py`）
 
-分层约定（见 `PROGRESS.md`）：
+分层约定（见 `AGENTS.md`）：
 - `tests/unit/`：快、只依赖被测模块本身；
 - `tests/test_offline.py`：集成/端到端（跑全链路）；
 - `tests/dom_test_*.js`：前端行为。

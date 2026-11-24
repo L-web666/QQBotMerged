@@ -8,7 +8,7 @@
   ② 两条线程同时发现"还没存过"，然后各写一份文件（查重与落盘之间没有锁）。
 所以现在去重改成按**内容 sha256**，并且把"查重 → 落盘 → 登记"这一段串行起来。
 
-分层约定见 `PROGRESS.md`：`tests/unit/` 快、只依赖被测模块；不连网、不碰真实 `data/`
+分层约定见 `AGENTS.md`：`tests/unit/` 快、只依赖被测模块；不连网、不碰真实 `data/`
 （临时文件只写 `data/_selftest/`）。
 
 运行：`python tests/unit/test_media_dedup.py`

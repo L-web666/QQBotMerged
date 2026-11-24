@@ -2,7 +2,7 @@
 """单元测试：安全审计修复回归（对应《QQBotMerged 安全审计报告》）
 
 每一节对应报告里的一个编号，断言"修好的行为"，防止后续改动把它改回去。
-分层约定见 `PROGRESS.md`：`tests/unit/` 快、只依赖被测模块；不连网、不碰真实 `data/`
+分层约定见 `AGENTS.md`：`tests/unit/` 快、只依赖被测模块；不连网、不碰真实 `data/`
 （临时文件只写 `data/_selftest/`）。**本文件不读取 config.json。**
 
 运行：`python tests/unit/test_security_fixes.py`

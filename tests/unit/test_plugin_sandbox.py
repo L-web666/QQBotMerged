@@ -10,7 +10,7 @@
   · off：完全不干预
   · 离开上下文后所有补丁**必须还原**（不能污染宿主与其它插件）
 
-分层约定见 `PROGRESS.md`：不连网、不碰真实 `data/`，临时文件只写 `data/_selftest/`。
+分层约定见 `AGENTS.md`：不连网、不碰真实 `data/`，临时文件只写 `data/_selftest/`。
 
 运行：`python tests/unit/test_plugin_sandbox.py`
 """

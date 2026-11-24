@@ -587,7 +587,7 @@ QQBotMerged/
 ```
 
 二次开发请先读这两份文档：`docs/AI_INDEX.md`（函数/类清单，只列名字与位置）与
-`PROGRESS.md`（进度、关键设计决策、禁止事项）；QQ 平台接口的字段与错误码依据见
+`AGENTS.md`（进度、关键设计决策、禁止事项）；QQ 平台接口的字段与错误码依据见
 `docs/QQ_MESSAGE_NOTES.md`（markdown / @ 标签等，每条带官方来源）。
 
 ### 10.1 版本号规则（语义化版本 2.0.0）

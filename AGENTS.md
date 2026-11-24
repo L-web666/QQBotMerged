@@ -1,6 +1,16 @@
-# QQBotMerged 项目进度
+# AGENTS.md —— 面向 AI 开发者的项目说明
 
-> 每次开新 AI 会话 / 派新子代理前，先读这份文件，不要读全历史。
+> **这份文件是给 AI 编码代理 / 新接手的开发者看的。**
+> 动这个项目之前先读它：里面写了**现在是什么状态**、**哪些设计不能改**、
+> **有哪些坑踩过了**、**下一步该做什么**。
+>
+> 建议用法：
+> - 开新会话 / 派子代理时，把这份文件（和 `docs/AI_INDEX.md`）一起给它；
+> - **不要**让它去读完整对话历史或整个仓库，按下面的「会话预算规则」来；
+> - 改完代码后按「最近变更」的格式补一条记录。
+>
+> 面向**使用者**的文档是 `README.md`（怎么安装、怎么用）；
+> 本文件面向**改代码的人**。打包发布的说明见 `PACKAGING.md`。
 >
 > **历史变更记录已归档**：`docs/PROGRESS-archive-2026-11-15.md`
 > （2026-10-06 ~ 2026-11-07 的 47 条记录，日常不需要读；只有想查"某个改动是哪次、
@@ -20,7 +30,7 @@
 
 ## 当前状态
 
-- 程序版本：**v1.4.4**（唯一来源 `core/version.py` 的 `__version__`；
+- 程序版本：**v1.5.0**（唯一来源 `core/version.py` 的 `__version__`；
   网页侧栏/关于页/接口都从这里取）
 
 ### 常用命令
@@ -70,6 +80,8 @@ python tests/test_instance_lock.py # 单实例锁
 | `test_alerts.py` | 出错告警 / openid 按机器人隔离 |
 | `test_admin_scope.py` | 管理员权限按机器人隔离 |
 | `test_static_deps.py` | Werkzeug 依赖下限 / 静态路由白名单 / 管理员不继承全局 |
+| `test_launcher.py` | qqbot-cli 启动器：下载安全 / tarball 壳目录 / 向导 / 安装目录可选 |
+| `test_uninstall.py` | qqbot-cli 卸载 / 数据导出 / Windows·Linux·macOS 跨平台 |
 | `test_readme_toc.py` | README 目录锚点与排版 / 统计数字 |
 
 DOM 测试（`node`）：
@@ -228,7 +240,7 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 - 不要删除 `tests/` 下任何测试
 - 不要改自带插件对外暴露的指令名（`/astrbot`、`/骰子`、`/签到`、`/积分`、`/抽奖`）
 - 不要动 `data/` 下真实数据（测试用 `data/_selftest/`）
-- 不要在没有更新 PROGRESS.md 的情况下开新会话
+- 不要在没有更新 AGENTS.md 的情况下开新会话
 - 不要全量读超过 300 行的文件，用片段读取
 - 不要改 `config.json` 里默认值（改 `core/config_schema.py` 的 DEFAULT_CONFIG）
 - 不要把密钥写进代码或测试
@@ -255,7 +267,7 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 
 【上下文规则】
 
-只读 PROGRESS.md + docs/AI_INDEX.md + 相关代码片段
+只读 AGENTS.md + docs/AI_INDEX.md + 相关代码片段
 
 ---
 
@@ -267,6 +279,64 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 > 真实数据规模（群数/成员数/消息条数等）、实例环境的操作过程、截图来源。
 >
 > **只保留最近若干轮**；更早的记录已在归档文件里，本文件不再堆叠。
+
+- 2026-11-25：**新增 `qqbot-cli` 启动器（`qqbot` 命令），可以 `pipx install qqbot-cli` 装**：
+  - **要解决什么**：本项目原来只能「克隆仓库 / 下载压缩包 → 手动装依赖 → 改 config.json」，
+    对只想用的人门槛太高。参照 NoneBot 的 `nb-cli` 做法，加一个独立的启动器：
+    ```bash
+    pipx install qqbot-cli
+    qqbot                # 首次：选目录 → 下载 → 建 venv → 装依赖 → 问几个必填项 → 启动
+    ```
+  - **核心取舍：启动器不打包主程序**。主程序仍然是从 GitHub Release 拉下来的
+    **完整项目目录**，所以 `core/paths.py`、自动更新、插件机制全都原样工作 ——
+    **主程序一行代码都不用改**（避免把 `core` 改名的 253 处 `from core` 连锁改动，
+    也避免数据写进 site-packages 的问题）。
+  - **新增文件**：`qqbot_cli/`（`cli.py` 入口、`fetch.py` 下载解压、`runner.py` 建环境、
+    `wizard.py` 向导、`paths.py` 常量）、`pyproject.toml`、`PACKAGING.md`。
+    启动器**只依赖 requests**，主程序的 flask/werkzeug 装在它自己建的 `.venv` 里。
+  - **踩到的坑（都写成了测试）**：
+    ① `_strip_root()` 判断 tarball 壳目录时不能只看「第一段」—— GitHub 顶层目录名是
+    `L-web666-QQBotMerged-<sha>`（含 `-`），而且没有壳目录时 `core/` 会被误当成壳；
+    ② `_safe_member()` 会去掉末尾的 `/`，导致目录条目认不出来、壳目录剥不掉，
+    结果所有文件被埋进 `xxx-<sha>/` 子目录。两处都在 `test_launcher.py` 里留了用例；
+    ③ 下载缓冲原来用 `tempfile.mkdtemp()`，在 `%TEMP%` 不可写的机器上直接失败 ——
+    改为优先放在安装目录里的临时子目录。
+  - **安装目录由用户自己选**：向导第一步就问（回车用 `~/QQBotMerged`），
+    也支持 `--dir` 直接指定、相对路径、带引号的路径（资源管理器粘贴）；
+    上级目录不存在会要求重问；目录里已有别的东西时**先提示、要求确认**再动，
+    不闷头覆盖。装完会把进目录的 `cd` 命令打印出来。
+  - **记住装在哪**：`qqbot` 不带参数时按「`--dir` > 上次记住的 > 默认目录」选目录。
+    记录分好几处落盘（用户配置目录 / 主目录隐藏文件 / 当前工作目录），
+    因为前两处在受限环境里可能不可写 —— 只记一处会导致用户的目录"下次就找不到了"。
+    记住的目录被删掉时会自动回落。
+  - **卸载与数据导出**：`qqbot uninstall` 先列出装了什么/占多大，再问
+    「先导出 config.json + data/ 吗（默认要）」「确认删除吗（默认否）」。
+    导出的 zip 里**只含配置与数据**，不含程序代码、`.venv`、`__pycache__`；
+    导出目标不允许落在 `data/` 里面（边写边打包会把自己装进去）。
+    `qqbot export` 可以只备份不卸载。
+    **删除前有硬性安全检查**：目录里必须有 `run.py` / 安装记录 / `config.json` 之一，
+    否则拒绝删；再挡一次根目录、盘符、用户主目录，防止手滑把整个盘删掉。
+    删不掉的文件会被列出来（Windows 上文件被占用很常见）。
+    卸载成功后清掉「记住装在哪」的记录。
+  - **跨平台（Windows / Linux / macOS）**：平台判断集中在 `paths._platform()` 一处
+    （可用环境变量 `QQBOT_CLI_FORCE_PLATFORM` 覆盖，便于测试），
+    因此 `cd /d` vs `cd`、`Scripts/python.exe` vs `bin/python`、
+    `activate.bat` vs `source` 都能自动切换。
+    **注意**：`venv_python()` 用 `os.path.join`，路径分隔符跟随**真实运行系统** ——
+    在 Windows 上模拟 Linux 时它仍是反斜杠，这是对的。
+  - **安全边界**：主机白名单（同主程序）、压缩包大小/成员数/解压总量上限、
+    拒绝绝对路径与 `..`、跳过链接与设备文件。向导生成的 `config.json` 只写用户填的项，
+    其余由主程序 schema 自动补全（已验证 `reply.max_segment_length` 等会被补上）。
+  - **怎么验证**：新增 `tests/unit/test_launcher.py`（**60 项**）：主机白名单、路径穿越、
+    壳目录识别（7 种结构）、真实 tar.gz 解压后壳目录被剥掉、向导产出能被
+    `load_config()` 正常加载、留空也能装完、marker 判定、路径展开，
+    以及 [E1] 安装目录询问（回车/绝对/相对/带引号/上级不存在重问）、
+    [E2] 目录非空要确认、[E3] 记住与回落。
+    新增 `tests/unit/test_uninstall.py`（**43 项**）：导出内容正确（含消息库且逐字节一致、
+    不含程序代码/缓存/.venv）、导出路径安全、陌生目录拒绝删除、
+    卸载的三种路径（不导出/先导出/取消）、清理记录、三种平台的命令差异与模块导入。
+    另外做过一次联网端到端：下载真实 v1.4.4 → 向导 → `run.py --check` 通过。
+    全套回归 `test_offline` 576 项全绿。
 
 - 2026-11-22：**静态路由白名单补齐 Windows 上标数字设备名（审计 SEC-STATIC-001，中危）**：
   - **问题**：`_WINDOWS_DEVICE_NAMES` 只含 ASCII 写法，而 Windows 还认

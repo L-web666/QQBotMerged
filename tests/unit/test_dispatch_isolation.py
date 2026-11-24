@@ -11,7 +11,7 @@
   · 两条线程并发 dispatch 时，各自看到自己的 sink，互不覆盖；
   · 延迟发送时按 `(会话类型, openid)` 回查机器人（而不是"最近一次分发"）。
 
-分层约定见 `PROGRESS.md`：不连网、不碰真实 `data/`。
+分层约定见 `AGENTS.md`：不连网、不碰真实 `data/`。
 
 运行：`python tests/unit/test_dispatch_isolation.py`
 """

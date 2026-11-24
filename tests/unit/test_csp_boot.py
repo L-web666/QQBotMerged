@@ -14,7 +14,7 @@
   · 启动数据通过 `application/json` 块下发（该类型不会被执行，不受 script-src 约束）
   · 前端 JS 能从 `#boot-data` 解析出 BOOT，并仍能从 URL 取到令牌
 
-分层约定见 `PROGRESS.md`：不连网、不碰真实 `data/`，也不读取 `config.json`。
+分层约定见 `AGENTS.md`：不连网、不碰真实 `data/`，也不读取 `config.json`。
 
 运行：`python tests/unit/test_csp_boot.py`
 """

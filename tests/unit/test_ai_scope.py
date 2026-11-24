@@ -11,7 +11,7 @@
   ② `_ProviderShim.usable` —— 插件（本地 Ollama）据此决定要不要"让给内置 AI"；
   ③ `AstrBotHost.current_bot_id` —— 宿主把"正在处理哪个机器人"给插件用。
 
-分层约定见 `PROGRESS.md`：`tests/unit/` 快、只依赖被测模块；不连网、不碰真实 `data/`。
+分层约定见 `AGENTS.md`：`tests/unit/` 快、只依赖被测模块；不连网、不碰真实 `data/`。
 
 运行：`python tests/unit/test_ai_scope.py`
 """

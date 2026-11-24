@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """单元测试：云同步上传前的"敏感字段"扫描（`core/cloud_sync.py`）
 
-分层约定见 `PROGRESS.md`：`tests/unit/` 快、只依赖被测模块；不连网、不碰真实 `data/`
+分层约定见 `AGENTS.md`：`tests/unit/` 快、只依赖被测模块；不连网、不碰真实 `data/`
 （临时文件只写 `data/_selftest/`，且只测 `_upload` / 纯函数，不跑整轮同步）。
 
 运行：`python tests/unit/test_cloud_secrets.py`

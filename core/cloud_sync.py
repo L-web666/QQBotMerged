@@ -138,7 +138,7 @@ def check_text_payload(rel: str, blob: bytes) -> str:
     return ""
 
 
-# 上传前的"敏感字段"扫描：字段名像密钥的一律不往云端传（PROGRESS.md P1）。
+# 上传前的"敏感字段"扫描：字段名像密钥的一律不往云端传（AGENTS.md P1）。
 # 只认字段名，不猜值 —— 聊天记录里出现 "api_key" 这个词不会被误伤。
 #
 # 审计 SEC-06 的修正：**裸 `token` / 裸 `secret` 原来漏检**（只认 api_token、app_secret
