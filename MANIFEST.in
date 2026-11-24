@@ -1,0 +1,21 @@
+# 只把「发 pip 包需要的东西」交给 sdist。
+#
+# **为什么必须写这个文件**：这个仓库同时也是主程序（core/ web/ plugins/ …），
+# 但 PyPI 上发的只是启动器 `qqbot-cli`。不限制的话 setuptools 会把 tests/
+# 一起打进 sdist —— 里面有 4800 行的 test_offline.py，而且那些测试依赖
+# 主程序的 core/，在别人机器上根本跑不起来，白白让包变大。
+#
+# 注意：这只影响 sdist（.tar.gz）。wheel（.whl）由 pyproject.toml 里的
+# `[tool.setuptools] packages = ["qqbot_cli"]` 控制，本来就是干净的。
+
+# 默认排除一切，再显式放行需要的
+prune *
+graft qqbot_cli
+
+include pyproject.toml
+include PACKAGING.md
+include README.md
+include LICENSE
+
+# 不把构建缓存/字节码带进去
+global-exclude *.pyc *.pyo __pycache__

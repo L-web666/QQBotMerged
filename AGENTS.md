@@ -229,6 +229,9 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 - [ ] P2：指令标签真机验证（`reference=true` 的引用行为、urlencode 后客户端点击发送的
       到底是解码文本还是编码串；官方都未写），以及 @ 标签在纯文本消息里的渲染结论再确认一次
 - [ ] P2：给 `core/alerts.py` 补"发不出去时怎么办"（见技术债第 7 条，具体方案待定）
+- [ ] P1：PyPI 上配好 Trusted Publisher 后，用 GitHub Actions 发出 `qqbot-cli` 首个版本
+      （工作流与步骤已就绪：`.github/workflows/publish-cli.yml` + `docs/PUBLISHING.md`，
+      **只差 PyPI 网页上那一步配置**，见下面「最近变更」）
 - [ ] P3：生成依赖锁文件 / SBOM，在 CI 里做安全公告扫描（现在只钉了 Werkzeug 一个）
 - [ ] P3：`tests/test_offline.py` 逐节迁移到 `tests/unit/`（老用例没有搬动过）
 
@@ -279,6 +282,35 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 > 真实数据规模（群数/成员数/消息条数等）、实例环境的操作过程、截图来源。
 >
 > **只保留最近若干轮**；更早的记录已在归档文件里，本文件不再堆叠。
+
+- 2026-11-25：**加好 PyPI 自动发布（GitHub Actions + Trusted Publishing），本地实测打包通过**：
+  - **要解决什么**：启动器要能被 `pipx install qqbot-cli` 装上，就得发到 PyPI。
+    手打 token 上传既要保管密钥、又容易漏。改用 PyPI 的 **Trusted Publishing（OIDC）**：
+    GitHub 运行时给 job 签一张短期身份票据，PyPI 验过发一次性上传令牌 ——
+    **仓库里不存任何 token**。
+  - **新增文件**：`.github/workflows/publish-cli.yml`（构建 → `twine check` → 校验包内容 →
+    发布）、`docs/PUBLISHING.md`（配 PyPI 的步骤与常见失败原因）、`MANIFEST.in`。
+  - **触发方式**：Actions 页面手动 `Run workflow`（带 `dry_run` 开关可只构建不发），
+    或推 `cli-v*` tag。**刻意与主程序的 `v*` 前缀区分开**，两套版本号互不影响。
+  - **踩到的坑（都已修正）**：
+    ① `[tool.setuptools.sdist]` **不是合法配置**（schema 里没有这个键），
+    想限制 sdist 内容只能用 `MANIFEST.in`；
+    ② 不限制的话 sdist 会把 `tests/` 打进去 —— 里面有 4800 行的 `test_offline.py`，
+    且那些测试依赖主程序的 `core/`，在别人机器上跑不起来。加 `MANIFEST.in` 后
+    **sdist 从 125.9 KB 降到 53.8 KB**；
+    ③ `license = { text = "AGPL-3.0" }` 这种写法**已弃用**（官方公告 2027-02 后构建直接失败），
+    改成 SPDX 表达式 `license = "AGPL-3.0-or-later"` + `license-files`，
+    同时把 `setuptools>=61` 提到 `>=77`；
+    ④ **仓库里的 `build/` 目录会遮蔽 pip 的 `build` 包** —— 在仓库根跑
+    `python -m build` 会报 `No module named build.__main__`。本地构建要从仓库**外面**
+    调用（`python -m build <项目路径>`）；GitHub Actions 是干净环境，不受影响。
+  - **怎么验证**：本地实跑 `python -m build` 成功，`twine check` 两个产物都 `PASSED`；
+    打开 wheel 确认顶层**只有 `qqbot_cli/` 与 dist-info**（主程序代码没进去）；
+    把 wheel 装进干净 venv，`qqbot --version` / `qqbot --help` 正常输出。
+  - **还差一步（在 PyPI 网页上，代码侧做不了）**：注册账号 → Account settings → Publishing
+    → Add a new pending publisher，填 `qqbot-cli` / `L-web666` / `QQBotMerged` /
+    `publish-cli.yml` / `pypi`。**这五项必须与工作流完全一致**。
+    注意 pending publisher **不会预留名字**，所以配好后要尽快发一次。
 
 - 2026-11-25：**新增 `qqbot-cli` 启动器（`qqbot` 命令），可以 `pipx install qqbot-cli` 装**：
   - **要解决什么**：本项目原来只能「克隆仓库 / 下载压缩包 → 手动装依赖 → 改 config.json」，

@@ -1,0 +1,101 @@
+# 把启动器 `qqbot-cli` 发布到 PyPI。
+#
+# **不需要在仓库里存任何 token**：用的是 PyPI 的 Trusted Publishing（OIDC）。
+# 触发时 GitHub 给这个 job 签一张短期身份票据，PyPI 验过就发一个一次性上传令牌。
+#
+# 前提（在 PyPI 网页上配一次，见 docs/PUBLISHING.md）：
+#   PyPI → Account settings → Publishing → Add a new pending publisher
+#     PyPI Project Name : qqbot-cli
+#     Owner             : L-web666
+#     Repository name   : QQBotMerged
+#     Workflow name     : publish-cli.yml
+#     Environment name  : pypi
+#   **这三项必须与下面完全一致**，否则 OIDC 校验会失败。
+#
+# 触发方式：
+#   ① 在 GitHub 的 Actions 页面手动点 "Run workflow"（推荐先这样验证）
+#   ② 推一个 `cli-v*` 的 tag，比如 `cli-v1.0.1`
+#
+# 注意：这里发的是**启动器**（PyPI 包名 qqbot-cli），
+# 和主程序的版本号（core/version.py）是两套号，互不影响。
+
+name: Publish qqbot-cli to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只构建不发布（检查打包是否正常）"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "cli-v*"
+
+jobs:
+  build:
+    name: 构建并检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装打包工具
+        run: python -m pip install --upgrade build twine
+
+      - name: 构建
+        run: python -m build
+
+      - name: 检查元数据
+        run: python -m twine check dist/*
+
+      - name: 确认只打包了启动器（主程序代码不该进包）
+        run: |
+          set -e
+          echo "--- 包里有哪些顶层模块 ---"
+          python - <<'PY'
+          import glob, zipfile
+          wheels = glob.glob("dist/*.whl")
+          assert wheels, "没有生成 whl"
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          tops = sorted({n.split("/")[0] for n in names})
+          print(tops)
+          # 只应该有 qqbot_cli 与 dist-info
+          bad = [t for t in tops if t != "qqbot_cli" and not t.endswith(".dist-info")]
+          assert not bad, "包里混进了不该有的东西：%s" % bad
+          assert "qqbot_cli/cli.py" in names, "缺 qqbot_cli/cli.py"
+          print("OK：只打包了 qqbot_cli")
+          PY
+
+      - name: 保存构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: 发布到 PyPI
+    needs: build
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    # 与 PyPI 上配置的 Environment name 必须一致
+    environment: pypi
+    permissions:
+      # Trusted Publishing 必需：允许 job 向 GitHub 要一张 OIDC 身份票据
+      id-token: write
+    steps:
+      - name: 取回构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: 上传到 PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # 只传 sdist + whl，不额外生成
+          packages-dir: dist/
