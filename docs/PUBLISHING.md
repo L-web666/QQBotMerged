@@ -1,7 +1,7 @@
 # 发布启动器到 PyPI（`qqbot-cli`）
 
 > 这份讲的是**启动器**（`qqbot_cli/`，PyPI 包名 `qqbot-cli`）怎么发到 PyPI。
-> 主程序自己的发布（打 tag、建 GitHub Release）见 `AGENTS.md` 的「最近变更」里历次记录。
+> 主程序自己的发布（打 tag、建 GitHub Release）见 `docs/CHANGELOG.md` 里历次记录。
 
 ## 一次配好，以后自动
 
