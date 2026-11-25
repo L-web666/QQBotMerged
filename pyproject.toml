@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qqbot-cli"
-version = "1.0.2"
+version = "1.0.3"
 description = "QQBotMerged 启动器：一条命令装好并启动 QQ 官方机器人多开后台"
 readme = "PACKAGING.md"
 requires-python = ">=3.9"
