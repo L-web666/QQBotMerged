@@ -13,7 +13,15 @@
 # 本程序的媒体下载（core/media_store.py）用的是默认 requests.Session()，
 # 会继承环境里的 `.netrc`，所以在共享主机/有凭据的环境里这个风险是真实的。
 # 2.32.4 是该公告的修复版本；再往上升（2.33.0+）会不再支持 Python 3.9，所以不升。
+#
+# **为什么需要 PyYAML**：插件的 `metadata.yaml` 要用它解析
+# （`core/astrbot_shim/compat_utils.py` 的 `_load_yaml`）。没有它时会退回一个
+# 极简的"只认 key: value"解析，遇到 YAML 的多行块写法（`description: |`）
+# 就会把值读成字面量 `|` —— 插件的显示名/描述/平台列表全都不对。
+# 以前开发机碰巧装着 PyYAML，所以这个问题一直没暴露；干净的 venv 里
+# `test_offline.py` 会因此有 1 项失败。
 flask>=2.0
 Werkzeug>=3.1.9
 requests>=2.32.4
 websocket-client>=1.5.0
+PyYAML>=6.0

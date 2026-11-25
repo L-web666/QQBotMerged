@@ -38,6 +38,9 @@ PROGRAM_REQUIRES = (
     "Werkzeug>=3.1.9",
     "requests>=2.32.4",
     "websocket-client>=1.5.0",
+    # 插件的 metadata.yaml 要靠它解析；缺了会退化成只认 "key: value"，
+    # 遇到 YAML 多行块（description: |）就解析错
+    "PyYAML>=6.0",
 )
 
 # 最低 Python 版本：Werkzeug 3.1.9 要求 >=3.9

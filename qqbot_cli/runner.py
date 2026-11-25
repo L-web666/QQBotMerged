@@ -147,12 +147,16 @@ def install_requirements(install_dir: str, python: str,
 
 
 def verify_dependencies(python: str) -> Dict[str, str]:
-    """确认关键依赖真的能导入；返回 {包名: 版本}。"""
+    """确认关键依赖真的能导入；返回 {包名: 版本}。
+
+    PyYAML 也要查：插件的 metadata.yaml 靠它解析，缺了不报错但会**静默解析错**
+    （退回"只认 key: value"的兜底，YAML 多行块会读成字面量）。
+    """
     script = (
         "import json\n"
         "from importlib.metadata import version\n"
         "out = {}\n"
-        "for name in ('Flask', 'Werkzeug', 'requests', 'websocket-client'):\n"
+        "for name in ('Flask', 'Werkzeug', 'requests', 'websocket-client', 'PyYAML'):\n"
         "    try:\n"
         "        out[name] = version(name)\n"
         "    except Exception:\n"
