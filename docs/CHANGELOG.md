@@ -27,6 +27,30 @@
 
 ---
 
+- 2026-11-25：**启动器说明随包分发（`qqbot_cli/PACKAGING.md`）**：
+  - **为什么**：`pipx install qqbot-cli` 装完后，`PACKAGING.md` 只在仓库根，
+    不在 site-packages 里。用户想查"有哪些命令、怎么卸载、装到哪了"，
+    要么回 GitHub，要么只能看 `qqbot --help` 里那几行。
+  - **怎么做的**：把 `PACKAGING.md` **复制**一份到 `qqbot_cli/`。
+    是复制不是移动 —— `pyproject.toml` 的 `readme = "PACKAGING.md"` 指的是仓库根那份
+    （PyPI 页面的长描述靠它），`MANIFEST.in` 也 include 了它（sdist 要带上），
+    这两处不能动。
+  - **配套改动**：
+    ① `[tool.setuptools.package-data]` 加上 `PACKAGING.md` ——
+    不声明的话 setuptools **不会**把这个 `.md` 打进 wheel（实测确认过）；
+    ② `qqbot --help` 的 epilog 末尾打出说明文件的实际路径，
+    用户在终端就知道去哪儿读；
+    ③ 测试里加了 [J] 节校验**两份文件内容完全一致** ——
+    改了根那份忘了同步包里的，用户装完看到的还是旧说明。
+  - **没影响的**：`.md` 不是 `.py`，不会被当成模块 import；
+    wheel 顶层目录仍是 `qqbot_cli` + dist-info，发布工作流里那条
+    「只打包启动器」的断言照常通过。
+  - **怎么验证**：真实 `python -m build` 后开 wheel 确认
+    `qqbot_cli/PACKAGING.md` 在里面、顶层目录没多；
+    装进干净 venv 后文件落在 `site-packages/qqbot_cli/PACKAGING.md`，
+    `qqbot --help` 末行打出了这个路径。
+    `test_cli_hardening` 81 → **87 项**全部通过。
+
 - 2026-11-25：**补上缺失的 PyYAML 依赖（CI 的干净环境发现的）**：
   - **问题**：项目一直用 `yaml` 解析插件的 `metadata.yaml`
     （`core/astrbot_shim/compat_utils.py` 的 `_load_yaml`），

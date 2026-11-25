@@ -49,4 +49,9 @@ qqbot = "qqbot_cli.cli:main"
 packages = ["qqbot_cli"]
 
 [tool.setuptools.package-data]
-qqbot_cli = ["py.typed"]
+qqbot_cli = [
+    "py.typed",
+    # 包里也放一份启动器说明：装完后用户在本地就能读到（命令、卸载、常见问题），
+    # 不用回 GitHub 找。内容与仓库根的 PACKAGING.md 相同，有测试校验一致性。
+    "PACKAGING.md",
+]

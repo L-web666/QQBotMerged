@@ -414,6 +414,35 @@ def main():
         source = io.open(os.path.join(PROJECT, "qqbot_cli", "wizard.py"),
                          encoding="utf-8").read()
         check("用 os.open 带 0o600 创建", "0o600" in source, "")
+
+        # ============ 包里的说明文件 ============
+        print("\n[J] 启动器说明随包分发")
+        root_doc = os.path.join(PROJECT, "PACKAGING.md")
+        package_doc = os.path.join(PROJECT, "qqbot_cli", "PACKAGING.md")
+        check("仓库根有 PACKAGING.md", os.path.exists(root_doc), root_doc)
+        check("包里也有一份（qqbot_cli/PACKAGING.md）",
+              os.path.exists(package_doc), package_doc)
+        if os.path.exists(root_doc) and os.path.exists(package_doc):
+            # **两份必须一模一样**：改了根那份忘了同步包里的，
+            # 用户装完看到的还是旧的
+            root_text = io.open(root_doc, encoding="utf-8").read()
+            package_text = io.open(package_doc, encoding="utf-8").read()
+            check("两份内容完全一致",
+                  root_text == package_text,
+                  "不一致（改了根目录那份要同步复制到 qqbot_cli/）")
+
+        pyproject_text = io.open(os.path.join(PROJECT, "pyproject.toml"),
+                                 encoding="utf-8").read()
+        check("pyproject 的 package-data 声明了 PACKAGING.md",
+              "PACKAGING.md" in pyproject_text, "")
+        check("pyproject 的 readme 仍指向仓库根那份",
+              'readme = "PACKAGING.md"' in pyproject_text, "")
+
+        # --help 里应打出说明文件的位置，用户才知道去哪儿看
+        help_text = io.open(os.path.join(PROJECT, "qqbot_cli", "cli.py"),
+                            encoding="utf-8").read()
+        check("--help 的 epilog 会打出说明文件路径",
+              "doc_hint" in help_text and "PACKAGING.md" in help_text, "")
     finally:
         for one in paths._state_files():
             try:

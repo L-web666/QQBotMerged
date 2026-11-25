@@ -501,10 +501,17 @@ def do_uninstall(install_dir: str, export: Optional[bool] = None,
 
 # ---------------------------------------------------------------- 入口
 def build_parser() -> argparse.ArgumentParser:
+    # 完整说明随包一起装着（qqbot_cli/PACKAGING.md），把路径打在帮助末尾，
+    # 用户不用回 GitHub 找。
+    doc_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "PACKAGING.md")
+    doc_hint = ""
+    if os.path.exists(doc_path):
+        doc_hint = "\n完整说明：%s" % doc_path
     parser = argparse.ArgumentParser(
         prog="qqbot",
         description="QQBotMerged 启动器：下载程序、建环境、走向导、启动、卸载。",
-        epilog="不给子命令时：没装过就走向导，装过了就直接启动。",
+        epilog="不给子命令时：没装过就走向导，装过了就直接启动。" + doc_hint,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", nargs="?", default="auto",
                         choices=["auto", "init", "run", "export", "uninstall",

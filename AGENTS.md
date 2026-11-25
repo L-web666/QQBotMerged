@@ -358,13 +358,13 @@ git grep --cached -n -E "gho_|sk-[A-Za-z0-9]{20,}"   # 密钥（exit 1 = 没有�
 > **本机路径**（`C:\Users\...`、`/home/...` 之类）、实例环境的操作过程、截图来源。
 > 只写「改了什么 + 为什么改 + 怎么验证」。
 
+- **2026-11-25** — 启动器说明随包分发：`qqbot_cli/PACKAGING.md` 与仓库根那份**内容必须一致**，
+  `[tool.setuptools.package-data]` 已声明，`qqbot --help` 会打出它的路径。
+  改根那份记得同步复制（测试 [J] 会查）。详见 CHANGELOG。
 - **2026-11-25** — 按第三方审计修完启动器的 9 项问题（qqbot-cli **1.0.2**）。
   重点是两项高危：解压路径穿越（`_safe_member` 只看路径开头，漏了中间组件）、
   以及不可信 cwd 状态文件可导致执行任意程序。
   详见 CHANGELOG「按审计报告修完启动器的 9 项安全问题」。
-- **2026-11-25** — 补上缺失的 **PyYAML** 依赖（CI 的干净环境发现的）。
-  插件 `metadata.yaml` 一直靠它解析，但 `requirements.txt` 里没有；
-  开发机碰巧装着所以没暴露。详见 CHANGELOG「补上缺失的 PyYAML 依赖」。
 
 ---
 
