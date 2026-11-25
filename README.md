@@ -360,33 +360,16 @@ python tests/simulate_message.py --type group --text "你好"    # 往运行中�
 | 插件数据 / 大文件 | `data/plugin_data/<插件名>/` |
 | 插件依赖 | `plugins/<插件名>/requirements.txt`（可选） |
 
-以 `_` 或 `.` 开头的目录、裸 `.py` 文件都会被忽略。最小插件：
+以 `_` 或 `.` 开头的目录、裸 `.py` 文件都会被忽略。
 
-```python
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star
-from astrbot.api import logger
+> 📖 **插件怎么写、目录长什么样、兼容了哪些接口、哪些不支持** ——
+> 全部在 [`plugins/README.md`](plugins/README.md)（含最小插件示例与要点）。
+> 这里不重复，避免两份说明写出差异。
 
+> ⚠️ **插件是任意 Python 代码，没有沙箱**：它能读写你机器上的任意文件
+> （包括 `config.json` 里的 AppSecret、AI 密钥），也能联网、起线程。
+> 只放你自己写的、或来源完全可信的插件。详见那份文档开头的警告。
 
-class MyPlugin(Star):
-    def __init__(self, context: Context, config=None):   # 有 _conf_schema.json 时官方会传 config
-        super().__init__(context)
-        self.config = config or {}
-
-    @filter.command("hello")
-    async def hello(self, event: AstrMessageEvent):
-        """这是指令说明（会显示在指令面板里）"""
-        yield event.plain_result(f"你好，{event.get_sender_name()}！")
-
-    async def terminate(self):
-        """插件卸载/停用时调用，可选"""
-        pass
-```
-
-- 兼容层实现了 `astrbot.api.*` 的常用子集：`Star` / `filter` / 事件 / 消息链 / 配置 /
-  KV 存储（`put_kv_data` 等）/ `StarTools` / provider 调用，并模拟 `ASTRBOT_VERSION = 4.9.2`。
-- **暂不支持**（插件页会逐个列出，而不是静默失败）：插件自带 Web 接口与 Pages、`register_llm_tool`、
-  文转图模板、会话控制器、知识库、Agent 执行器等 AstrBot 专有组件。
 - 仓库自带 4 个示例/实用插件：`astrbot_demo`（文字/图片/管理员指令）、`astrbot_plugin_dice`（骰子）、
   `astrbot_plugin_daily_checkin`（签到/积分/抽奖）、`astrbot_plugin_ollama`（本地 Ollama 接管普通消息）。
 - **安装**：把插件目录整个复制进 `plugins/` → 「插件管理」页点「丢弃修改并重载」；
@@ -546,18 +529,18 @@ QQ 官方限制：文件 200MB、图片 20MB；超过阈值会自动改用官方
 全部测试都是**离线**的（QQ API 客户端换成记录调用的桩，不联网、不消耗 token）：
 
 ```bash
-python tests/test_offline.py            # 端到端 575 项：收发、留存、上传、清空、禁言、配置、
+python tests/test_offline.py            # 端到端 576 项：收发、留存、上传、清空、禁言、配置、
                                         # 插件、AstrBot 官方目录、云同步、Markdown、群 @、指令标签…
 python tests/unit/test_markdown_send.py # 单元 50 项：Markdown 发送与格式回退
 python tests/unit/test_at_mentions.py   # 单元 23 项：群 @ 官方标签与旧写法转换
 python tests/unit/test_cmd_tags.py      # 单元 26 项：指令标签（回车/参数）与「只在 Markdown 生效」判定
-python tests/unit/test_plugin_safety.py # 单元 26 项：插件源码静态安全扫描
+python tests/unit/test_plugin_safety.py # 单元 28 项：插件源码静态安全扫描
 python tests/unit/test_cloud_secrets.py # 单元 19 项：云同步上传前的敏感字段扫描
 python tests/check_frontend.py          # 前端契约：元素 id、字段类型、分组完整性、机器人隔离
 node tests/dom_test_messages.js         # 消息渲染 40 项（图片去重、文件消息、@ / 指令标签展示…）
 node tests/dom_test_conversations.js    # 会话列表 7 项（防"上下跳动"）
 node tests/dom_test_globals.js          # 全局命名空间保护 24 项
-python tests/test_instance_lock.py      # 单实例保护 12 项
+python tests/test_instance_lock.py      # 单实例保护 10 项
 python run.py --check                   # 装配自检（配置、存储、路由、表情/无意义判定）
 ```
 

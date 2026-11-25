@@ -17,6 +17,7 @@
 
 import os
 import re
+import subprocess
 import sys
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +35,28 @@ def check(name, condition, detail=""):
     else:
         FAILED.append((name, detail))
         print(f"  [FAIL] {name}  {detail}")
+
+
+def run_test_count(relative_path):
+    """现跑一个测试文件，取它最后报的「通过 N 项」里的 N。
+
+    为什么要在测试里跑测试：README 里写的是**手填的数字**，
+    没有任何机制保证它和实际一致 —— `test_offline` 写了 575（实际 576）
+    就是这么漂过去的。这里只跑几十项的小文件，几百毫秒就能完成。
+    """
+    script = os.path.join(PROJECT, relative_path)
+    if not os.path.exists(script):
+        return None
+    try:
+        completed = subprocess.run([sys.executable, script],
+                                   capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace",
+                                   timeout=180)
+    except Exception:
+        return None
+    output = (completed.stdout or "") + (completed.stderr or "")
+    match = re.search(r"通过\s*(\d+)\s*项", output)
+    return int(match.group(1)) if match else None
 
 
 def slug(text):
@@ -186,6 +209,41 @@ def main():
         if pages_stated:
             check("页面数一致", int(pages_stated.group(1)) == actual_pages,
                   "写了 %s，实际 %d" % (pages_stated.group(1), actual_pages))
+
+        # ---- 测试项数：README 里每个「# ... N 项」都要和真实数量对上
+        #
+        # 这一项以前漏了，导致 `test_offline` 写了 575（实际 576）一直没人发现。
+        # **只校验能快速跑完的测试**（`test_offline` 要跑好几分钟，不适合在
+        # 单元测试里现跑）—— 它的数字改为跟 AGENTS.md 交叉比对。
+        print("\n[9] README 里声明的测试项数")
+        quick = [
+            ("tests/unit/test_markdown_send.py", r"test_markdown_send\.py\s*#\s*单元\s*(\d+)\s*项"),
+            ("tests/unit/test_at_mentions.py", r"test_at_mentions\.py\s*#\s*单元\s*(\d+)\s*项"),
+            ("tests/unit/test_cmd_tags.py", r"test_cmd_tags\.py\s*#\s*单元\s*(\d+)\s*项"),
+            ("tests/unit/test_plugin_safety.py", r"test_plugin_safety\.py\s*#\s*单元\s*(\d+)\s*项"),
+            ("tests/unit/test_cloud_secrets.py", r"test_cloud_secrets\.py\s*#\s*单元\s*(\d+)\s*项"),
+        ]
+        for script, pattern in quick:
+            stated_count = re.search(pattern, text)
+            if not stated_count:
+                check("%s 声明了项数" % os.path.basename(script), False, "README 里没写")
+                continue
+            stated_n = int(stated_count.group(1))
+            real_n = run_test_count(script)
+            check("%s 项数一致" % os.path.basename(script),
+                  real_n is not None and stated_n == real_n,
+                  "README 写了 %d，实际 %s" % (stated_n, real_n))
+
+        # test_offline 跑得慢：这里不现跑，改为和 AGENTS.md 交叉比对
+        readme_offline = re.search(r"test_offline\.py\s*#\s*端到端\s*(\d+)\s*项", text)
+        agents_text = open(os.path.join(PROJECT, "AGENTS.md"), encoding="utf-8").read()
+        agents_offline = re.search(r"test_offline\.py\s*#\s*端到端\s*(\d+)\s*项",
+                                   agents_text)
+        if readme_offline and agents_offline:
+            check("test_offline 项数在 README 与 AGENTS 里一致",
+                  readme_offline.group(1) == agents_offline.group(1),
+                  "README %s / AGENTS %s"
+                  % (readme_offline.group(1), agents_offline.group(1)))
     except Exception as exc:
         check("统计数字校验没抛异常", False, str(exc))
 

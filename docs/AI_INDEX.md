@@ -447,24 +447,35 @@
 
 ## 十八、测试
 
-| 名称 | 文件 | 说明 |
-|---|---|---|
-| `main()` | `tests/test_offline.py` | 离线端到端（40+ 场景，覆盖全部主链路） |
-| `check(name, condition, detail)` | `tests/test_offline.py` | 断言辅助 |
-| `FakeClient` / `FakeAI` / `FakeResponse` | `tests/test_offline.py` | 测试桩 |
-| `main()` | `tests/test_instance_lock.py` | 单实例锁测试 |
-| `main()` | `tests/check_frontend.py` | 前端契约校验（元素 id / 字段类型 / 机器人隔离） |
-| `main()` | `tests/dom_test_conversations.js` | 会话列表"不跳动"回归测试（Node + DOM 桩） |
-| `main()` | `tests/dom_test_messages.js` | 消息渲染细节测试（图片去重 / 文件消息 / @ 与指令标签展示 / 格式自动切换，40 项） |
-| `main()` | `tests/dom_test_globals.js` | 全局命名空间保护测试（不可替换/删除，内部字段可改） |
-| `main()` | `tests/unit/test_cloud_secrets.py` | 单元测试：云同步敏感字段扫描（19 项） |
-| `main()` | `tests/simulate_message.py` | 往运行中的程序注入模拟消息 |
-| `main()` | `tests/unit/test_plugin_safety.py` | 单元测试：插件安全扫描（26 项，只依赖 `core/plugin_safety.py`） |
-| `main()` | `tests/unit/test_cloud_secrets.py` | 单元测试：云同步敏感字段扫描（19 项，不连网、不碰真实 `data/`） |
-| `main()` | `tests/unit/test_at_mentions.py` | 单元测试：@ 标签生成/旧写法转换/幂等（23 项） |
-| `main()` | `tests/unit/test_cmd_tags.py` | 单元测试：指令标签生成/解析/展示 + 「只在 markdown 生效」判定（26 项） |
+> **测试文件的完整清单只在 `AGENTS.md` 的「测试」表格里维护**，这里不再重复。
+> 之前两边各写一份，结果这份只列了 4 个、实际有 30 个，
+> 同一个文件还列了两次 —— 与其维护一份注定会过期的副本，不如只留入口。
 
-> **测试分层（2026-10-06 起）**：`tests/unit/` 放快、只依赖单个模块的单元测试；
+| 文件 | 说明 |
+|---|---|
+| `tests/test_offline.py` | 离线端到端 576 项，覆盖全部主链路 |
+| `tests/check_frontend.py` | 前端契约校验（元素 id / 字段类型 / 机器人隔离） |
+| `tests/test_instance_lock.py` | 单实例锁 |
+| `tests/unit/*.py` | 单元测试（30 个文件，清单见 `AGENTS.md`） |
+| `tests/dom_test_*.js` | 前端行为测试（Node + DOM 桩） |
+| `tests/simulate_message.py` | 往运行中的程序注入模拟消息 |
+
+找测试的常用命令：
+
+```bash
+grep -rn "某个断言文字" tests/          # 某个断言在哪个测试文件
+grep -rn "通过 .* 项" tests/            # 各测试文件自报的项数
+```
+
+测试里的公用辅助：
+
+| 名称 | 位置 | 说明 |
+|---|---|---|
+| `check(name, condition, detail)` | 各测试文件开头 | 断言辅助，统一打印 `[OK]` / `[FAIL]` |
+| `run_test_count(relative_path)` | `tests/unit/test_readme_toc.py` | 现跑一个测试文件并取它报的项数，用来核对 README 里写的数字 |
+| `FakeClient` / `FakeAI` / `FakeResponse` | `tests/test_offline.py` | 测试桩 |
+
+> **测试分层**：`tests/unit/` 放快、只依赖单个模块的单元测试；
 > `tests/test_offline.py` 是集成/端到端；`tests/dom_test_*.js` 是前端行为测试；
 > `tests/check_frontend.py` 是契约/静态检查。约定与命令见 `tests/README.md`。
 > 老的集成用例**没有移动**（避免动历史用例引入风险），新用例优先放 `tests/unit/`。
