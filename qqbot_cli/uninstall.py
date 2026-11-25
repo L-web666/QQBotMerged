@@ -148,21 +148,50 @@ def export_data(install_dir: str, target: str,
         progress("正在打包配置与数据 …")
     files = 0
     skipped: List[str] = []
+    root_real = os.path.realpath(os.path.abspath(install_dir))
+
+    def _safe_to_export(full: str) -> bool:
+        """这个文件能不能进备份包。
+
+        **符号链接一律拒绝**：链接指向可能是安装目录外的任意文件，
+        打进备份后用户一分享就泄露了。用 `islink`（即 lstat 语义）而不是
+        `exists` —— 后者会跟随链接，看起来"存在"就把外部内容读进来了。
+        """
+        try:
+            if os.path.islink(full):
+                return False
+            real = os.path.realpath(full)
+            if os.path.commonpath([root_real, real]) != root_real:
+                return False
+        except (OSError, ValueError):
+            return False
+        return True
+
     try:
         with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED,
                              compresslevel=6) as bundle:
-            if os.path.exists(config):
-                try:
-                    bundle.write(config, "config.json")
-                    files += 1
-                except OSError:
-                    skipped.append("config.json")
+            if os.path.lexists(config):
+                if not _safe_to_export(config):
+                    # 是符号链接或越界：不导，但要让用户知道
+                    skipped.append("config.json（符号链接或越界，已跳过）")
+                else:
+                    try:
+                        bundle.write(config, "config.json")
+                        files += 1
+                    except OSError:
+                        skipped.append("config.json")
             if os.path.isdir(data_dir):
                 for base, dirs, names in os.walk(data_dir):
-                    dirs[:] = [d for d in dirs if d not in EXPORT_SKIP_DIRS]
+                    # 目录这一层也挡：链接目录不进去（否则会遍历到外部）
+                    dirs[:] = [d for d in dirs
+                               if d not in EXPORT_SKIP_DIRS
+                               and not os.path.islink(os.path.join(base, d))]
                     for name in names:
                         full = os.path.join(base, name)
                         relative = os.path.relpath(full, install_dir).replace("\\", "/")
+                        if not _safe_to_export(full):
+                            skipped.append("%s（符号链接或越界，已跳过）" % relative)
+                            continue
                         try:
                             bundle.write(full, relative)
                             files += 1
@@ -198,23 +227,74 @@ def uninstall(install_dir: str, progress: Optional[Callable[[str], None]] = None
     install_dir = os.path.abspath(install_dir)
     if not os.path.isdir(install_dir):
         raise UninstallError("安装目录不存在：%s" % install_dir)
-    # 安全检查：必须是本程序的安装目录
-    looks_like_ours = (
-        os.path.exists(os.path.join(install_dir, "run.py"))
-        or os.path.exists(os.path.join(install_dir, paths.MARKER_FILE))
-        or os.path.exists(os.path.join(install_dir, "config.json")))
-    if not looks_like_ours:
+
+    # **安全检查：必须是本程序真正的安装目录**
+    #
+    # 以前这里是「run.py / 安装记录 / config.json 有一个就算」—— 太松了：
+    # `run.py` 和 `config.json` 都是很常见的文件名，用户 `--dir` 指错目录
+    # （比如某个恰好有 run.py 的项目）再带上 `-y`，就会把整个目录删掉。
+    #
+    # 现在要求：
+    #   ① 有 `.qqbot-install.json`（启动器自己的安装记录）；
+    #   ② 记录里的 install_dir 与目标路径指向同一个真实位置；
+    #   ③ run.py 也在，且不是符号链接。
+    # 三条同时满足才算「是本程序的安装目录」。
+    marker_file = os.path.join(install_dir, paths.MARKER_FILE)
+    entry_file = os.path.join(install_dir, "run.py")
+    if not os.path.exists(marker_file):
         raise UninstallError(
-            "这个目录看起来不是 QQBotMerged 的安装目录（没有 run.py / 安装记录），"
-            "为安全起见没有删除：%s" % install_dir)
-    # 再挡一次：不允许删到根目录/盘符/用户主目录
-    guarded = {os.path.abspath(os.sep), os.path.abspath(os.path.expanduser("~"))}
+            "这个目录没有 QQBotMerged 的安装记录（%s），无法确认是本程序的安装目录，"
+            "为安全起见没有删除：\n  %s\n"
+            "如果确实要删，请手动删除这个目录。"
+            % (paths.MARKER_FILE, install_dir))
+    if os.path.islink(marker_file):
+        raise UninstallError("安装记录是符号链接，拒绝据此删除：%s" % marker_file)
+
+    import json as _json
     try:
-        guarded.add(os.path.abspath(os.path.dirname(os.path.expanduser("~"))))
+        with open(marker_file, "r", encoding="utf-8") as handle:
+            recorded_data = _json.load(handle)
+        recorded = str((recorded_data or {}).get("install_dir") or "")
+    except Exception:
+        raise UninstallError("安装记录读不出来（可能已损坏），为安全起见没有删除：\n"
+                             "  %s" % marker_file)
+    if not recorded:
+        raise UninstallError("安装记录里没有 install_dir，无法确认是本程序的安装目录，"
+                             "没有删除：\n  %s" % install_dir)
+    # 用真实路径比较：消掉符号链接、大小写、相对路径带来的差异
+    real_target = os.path.realpath(install_dir)
+    real_recorded = os.path.realpath(os.path.abspath(recorded))
+    if os.name == "nt":
+        same = real_target.lower() == real_recorded.lower()
+    else:
+        same = real_target == real_recorded
+    if not same:
+        raise UninstallError(
+            "安装记录指向的是别的目录，拒绝删除：\n"
+            "  要删的    %s\n  记录里是  %s\n"
+            "（如果这是从别处复制来的安装记录，这个目录不是有效的安装。）"
+            % (real_target, real_recorded))
+    if not os.path.exists(entry_file) or os.path.islink(entry_file):
+        raise UninstallError("安装目录里没有正常的 run.py，拒绝删除：\n  %s"
+                             % install_dir)
+
+    # 再挡一次：不允许删到根目录/盘符/用户主目录（用真实路径比较，
+    # 这样符号链接指向这些位置时也能挡住）
+    guarded = {
+        os.path.realpath(os.sep),
+        os.path.abspath(os.sep),
+        os.path.realpath(os.path.expanduser("~")),
+        os.path.abspath(os.path.expanduser("~")),
+    }
+    try:
+        home_parent = os.path.expanduser("~")
+        guarded.add(os.path.realpath(os.path.dirname(home_parent)))
+        guarded.add(os.path.abspath(os.path.dirname(home_parent)))
     except Exception:
         pass
-    if install_dir in guarded or len(install_dir) <= 3:
-        raise UninstallError("拒绝删除这个路径（太靠近根目录）：%s" % install_dir)
+    if (real_target in guarded or os.path.abspath(install_dir) in guarded
+            or len(real_target) <= 3):
+        raise UninstallError("拒绝删除这个路径（太靠近根目录）：%s" % real_target)
 
     if progress:
         progress("正在删除 …")

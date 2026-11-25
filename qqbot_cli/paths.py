@@ -28,12 +28,15 @@ MARKER_FILE = ".qqbot-install.json"
 # 虚拟环境目录名（放在安装目录下）
 VENV_DIR = ".venv"
 
+# "记住装在哪"的状态文件名（放在用户配置目录 / 主目录 / 安装目录里）
+STATE_FILENAME = ".qqbot-cli.json"
+
 # 主程序需要的依赖（和主程序 requirements.txt 保持一致；
 # 启动器自己只需要 requests）
 PROGRAM_REQUIRES = (
     "flask>=2.0",
     "Werkzeug>=3.1.9",
-    "requests>=2.28.0",
+    "requests>=2.32.4",
     "websocket-client>=1.5.0",
 )
 
@@ -120,18 +123,23 @@ def current_python() -> str:
 
 # ---------------------------------------------------------------- 记住装在哪
 def _state_files(install_dir: str = "") -> list:
-    """启动器记住"装到哪"的几个候选位置，按优先级排列。
+    """启动器记住"装到哪"的位置，按优先级排列。
 
-    **为什么要好几个**：`%APPDATA%` / `$XDG_CONFIG_HOME` 在有些环境里不可写
-    （受限的用户目录、容器、CI）；用户主目录也可能只读（只读家目录、企业策略）。
-    只记一处，用户在向导里选的目录下次就找不到 —— `qqbot` 会默默回落到默认目录，
-    看起来像"装丢了"。
+    **只用受保护的用户目录 + 安装目录本身，绝不读当前工作目录。**
+    曾经加过 `cwd/.qqbot-cli.json` 作为兜底（前两处不可写时用），
+    但那是个安全漏洞：攻击者只要放一个伪造的状态文件到一个目录里，
+    用户从那儿运行 `qqbot` 就会去执行攻击者指定的目录 —— 本地代码执行。
+    便利性不能换安全性，这个兜底已移除。
 
-    所以依次尝试几个位置，任何一处写成功就够用：
-      ① 用户配置目录（最"正规"的位置）
-      ② 用户主目录下的隐藏文件（配置目录写不了时的兜底）
-      ③ **当前工作目录**下的隐藏文件（前两处都写不了时用；用户一般在自己
-         常用的目录里运行 `qqbot`，下次也在那儿跑，所以找得回来）
+    现在的候选：
+      ① 用户配置目录（`%APPDATA%` / `$XDG_CONFIG_HOME`）
+      ② 用户主目录下的隐藏文件（配置目录写不了时兜底）
+      ③ **安装目录里面**（前两处都写不了时用；安装目录一定可写，
+         否则程序也装不进去）
+
+    ③ 是"受限环境"（只读家目录、CI、容器）下唯一能成的那个。
+    下一轮 `qqbot` 不带参数时怎么找到它？靠 `_find_state_by_default_dir()`
+    去默认安装目录里找 —— 因为那样装的用户几乎都是装在默认位置。
     """
     home = os.path.expanduser("~")
     if os.name == "nt":
@@ -142,17 +150,10 @@ def _state_files(install_dir: str = "") -> list:
         os.path.join(base, "qqbot-cli", "state.json"),
         os.path.join(home, ".qqbot-cli.json"),
     ]
-    try:
-        cwd = os.getcwd()
-    except OSError:
-        cwd = ""
-    if cwd:
-        candidates.append(os.path.join(cwd, ".qqbot-cli.json"))
     if install_dir:
-        parent = os.path.dirname(os.path.abspath(install_dir).rstrip("/\\")) or "."
-        marker = os.path.join(parent, ".qqbot-cli.json")
-        if marker not in candidates:
-            candidates.append(marker)
+        inside = os.path.join(os.path.abspath(install_dir), STATE_FILENAME)
+        if inside not in candidates:
+            candidates.append(inside)
     return candidates
 
 
@@ -161,29 +162,79 @@ def _state_file() -> str:
     return _state_files()[0]
 
 
+def _write_state_file(path: str, payload: dict) -> bool:
+    """安全地写状态文件：拒绝符号链接、原子替换、POSIX 下 0600。"""
+    import json
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return False
+    # 已存在且是符号链接 → 拒绝（否则会写到链接指向的文件，可能覆盖别人的东西）
+    if os.path.islink(path):
+        return False
+    temp = path + ".tmp"
+    try:
+        if os.path.islink(temp):
+            os.remove(temp)
+        if os.name != "nt":
+            # 先建好再写权限，避免中间态被别人读到
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        else:
+            with open(temp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(temp, path)
+        return True
+    except OSError:
+        try:
+            if os.path.exists(temp):
+                os.remove(temp)
+        except OSError:
+            pass
+        return False
+
+
 def remember_install_dir(install_dir: str) -> bool:
     """记下这次装到了哪，下次 `qqbot` 不带参数就能直接启动。
 
     返回是否至少有一处写成功（写失败不影响本次使用，只是下次要带 --dir）。
     """
-    import json
-    payload = {"install_dir": install_dir}
+    payload = {"install_dir": os.path.abspath(str(install_dir))}
     written = False
     for path in _state_files(install_dir):
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        if _write_state_file(path, payload):
             written = True
-        except OSError:
-            continue
     return written
 
 
+def _scan_state_dir(root: str) -> str:
+    """在 root 下找 `.qqbot-cli.json`，读回它记的安装目录；找不到返回空串。"""
+    import json
+    candidate = os.path.join(root, STATE_FILENAME)
+    if os.path.islink(candidate):
+        return ""
+    try:
+        with open(candidate, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return ""
+    value = str((data or {}).get("install_dir") or "")
+    return value if value and os.path.isdir(value) else ""
+
+
 def remembered_install_dir(install_dir: str = "") -> str:
-    """读回上次装的目录；没有就返回空串。多个位置依次尝试。"""
+    """读回上次装的目录；没有就返回空串。多个位置依次尝试。
+
+    **读到之后不做信任判断**：调用方还要过 `runner.is_installed()` +
+    marker 校验，才会真的去执行那个目录里的东西。
+    """
     import json
     for path in _state_files(install_dir):
+        # 状态文件本身是符号链接 → 不信任（可能是攻击者做的跳板）
+        if os.path.islink(path):
+            continue
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
@@ -192,6 +243,19 @@ def remembered_install_dir(install_dir: str = "") -> str:
                 return value
         except Exception:
             continue
+
+    # 前两处都写不了时（受限环境），状态会落在**安装目录里面**（第 ③ 处）。
+    # 那种情况下一轮不知道装在哪，所以直接去"默认安装目录"里看一眼 ——
+    # 受限环境下用到的几乎都是默认位置。找到之后仍有 marker 校验兜底。
+    try:
+        fallback_dir = default_install_dir()
+    except Exception:
+        return ""
+    found = _scan_state_dir(fallback_dir)
+    if found:
+        return found
+    # 用户用 --dir 装到了默认位置以外时，这里找不到就会回落到默认目录，
+    # 由调用方提示"要不要重新指定"（见 cli 的 auto 分支）。
     return ""
 
 

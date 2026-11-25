@@ -7,7 +7,13 @@
 # 这里直接钉死下限，不再依赖 Flask 的传递解析。
 #
 # 注意：Werkzeug 3.1.9 要求 Python >=3.9，所以本项目的最低 Python 也提高到 3.9。
+#
+# **为什么 requests 要 >=2.32.4**：低于这个版本存在 CVE-2024-47081
+# （GHSA-9hjg-9r4m-mvj7）—— 特制 URL 可能让 `.netrc` 里的凭据被发到错误的主机。
+# 本程序的媒体下载（core/media_store.py）用的是默认 requests.Session()，
+# 会继承环境里的 `.netrc`，所以在共享主机/有凭据的环境里这个风险是真实的。
+# 2.32.4 是该公告的修复版本；再往上升（2.33.0+）会不再支持 Python 3.9，所以不升。
 flask>=2.0
 Werkzeug>=3.1.9
-requests>=2.28.0
+requests>=2.32.4
 websocket-client>=1.5.0

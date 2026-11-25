@@ -82,6 +82,7 @@ python tests/test_instance_lock.py # 单实例锁
 | `test_static_deps.py` | Werkzeug 依赖下限 / 静态路由白名单 / 管理员不继承全局 |
 | `test_launcher.py` | qqbot-cli 启动器：下载安全 / tarball 壳目录 / 向导 / 安装目录可选 |
 | `test_uninstall.py` | qqbot-cli 卸载 / 数据导出 / Windows·Linux·macOS 跨平台 |
+| `test_cli_hardening.py` | 启动器安全加固（审计 2026-11-25 的 9 项：解压越界 / 状态文件 / 权限 / 导出链接 / 重定向 / 依赖下限 / 卸载 / CI / pip） |
 | `test_readme_toc.py` | README 目录锚点与排版 / 统计数字 |
 
 DOM 测试（`node`）：
@@ -281,6 +282,61 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 > 真实数据规模（群数/成员数/消息条数等）、实例环境的操作过程、截图来源。
 >
 > **只保留最近若干轮**；更早的记录已在归档文件里，本文件不再堆叠。
+
+- 2026-11-25：**按审计报告修完启动器的 9 项安全问题（qqbot-cli 1.0.1 → 1.0.2）**：
+  - **报告来源**：第三方审查（基线 `ddf6763` → HEAD `98bb5f6`），9 项里
+    2 项高危、5 项中危、2 项低危、1 项条件性严重。**报告的证据全部核实成立**。
+  - **① CLI-ARCHIVE-001（高危）解压可越出安装目录**：
+    `_safe_member()` **只检查整个路径开头是不是盘符**（`^[A-Za-z]:`），
+    所以 `a/D:outside.txt` 能通过；而 Windows 的
+    `ntpath.join('C:\\install', 'a', 'D:outside.txt')` **直接得到 `D:outside.txt`**
+    —— 路径被重置到别的盘去了。这与上一轮 `COM¹` 的漏网是同一类错误：
+    **开头匹配挡不住中间组件**。
+    改法：新增 `_bad_component()` **逐组件**校验（盘符 / 冒号ADS / 设备名含上标 /
+    控制字符 / 尾随点空格 / `..`），并在 TAR 与 ZIP 落盘前再做一次
+    `_within()` 真实路径包含性检查 + `_has_symlink_parent()` 拒绝链接父目录。
+  - **② CLI-STATE-001（高危）不可信工作目录状态文件**：
+    上一轮为了让受限环境也能记住安装目录，加了 `cwd/.qqbot-cli.json` 兜底 ——
+    **这正是漏洞**：攻击者往一个目录放伪造状态文件，用户从那儿跑 `qqbot`
+    就会执行攻击者指定的程序。
+    改法：**删掉 cwd 候选**；状态文件改为写到安装目录内部（肯定可写）；
+    写入用原子替换 + 拒绝符号链接 + POSIX 0600；
+    `is_installed()` 现在要求 **marker 里的 `install_dir` 与实际路径一致**
+    （以前只看"文件存不存在"，抄一份 marker 就能冒充）；
+    `launch()` 执行前再确认解释器和 `run.py` 都在安装目录内。
+  - **③ CLI-REDIRECT-001（中危）重定向未复核**：`requests.get()` 默认自动跟随重定向，
+    白名单只校验了第一个 URL。改成 `allow_redirects=False` + 逐跳 `_check_host()`，
+    并且**只允许 HTTPS**、拒绝内网/回环/链路本地地址（`169.254.169.254` 这类云元数据端点）。
+  - **④ CLI-EXPORT-001（中危）导出跟随符号链接**：`bundle.write()` 会读链接目标内容，
+    备份里可能混进安装目录外的任意文件。现在用 `islink` 拒绝链接文件、链接目录不遍历、
+    真实路径必须在安装目录内，跳过的项列给用户看。
+  - **⑤ CLI-CONFIG-001（中危）config.json 权限**：以前按 umask 建成 0644，
+    共享主机上别人能读到 AppSecret/API Key/令牌。POSIX 下改用
+    `os.open(..., 0o600)` 一步创建（不留中间窗口），并补 `chmod` 修正已存在的文件。
+  - **⑥ DEP-REQUESTS-001（中危）requests 下限**：4 处清单从 `>=2.28.0` 提到
+    **`>=2.32.4`**（CVE-2024-47081 的修复版本）。**这一条上一轮报告就提过，当时漏修了。**
+  - **⑦ CLI-UNINSTALL-001（低危）卸载识别过宽**：以前「`run.py` / marker / `config.json`
+    有一个就算」，`run.py` 这么常见的名字很容易误删别人的项目。现在要求
+    **marker 存在 + 里面记录的路径与目标一致 + `run.py` 正常存在**，
+    三条同时满足；错误提示会写出两个路径便于排查。
+  - **⑧ CI-PUBLISH-001（低危）工作流加固**：7 个 `uses:` 全部固定到 **40 位 commit SHA**
+    （可移动的 `@v4` 被替换时不会悄悄换成别的代码）；默认权限只给 `contents: read`，
+    发布 job 才加 `id-token: write`；`persist-credentials: false`；
+    **新增独立的 `test` job，构建前先跑测试**（报告指出"构建成功不等于测试通过"）。
+  - **⑨ DEP-PIP-001（条件性严重）pip 版本**：新建 venv 用的是 `ensurepip` 自带的 pip，
+    低于 26.2.2 的 pip 内置证书库仍信任已出事的证书。
+    **刻意只提示、不自动升级** —— 升级本身要联网装包，在信任链有问题时
+    "自动去装一个包"反而扩大风险面。安装时会打印 pip 版本并写进 marker
+    （同时记录 Python 版本与依赖版本，方便审计）。
+  - **顺手修的**：装好后向导被取消的状态下再跑 `qqbot`，现在走
+    `_finish_config_only()` **只补配置不重新下载**；`launch()` 遇到跑不起来的解释器
+    会给出友好错误（以前抛裸 `OSError`）。
+  - **怎么验证**：新增 `tests/unit/test_cli_hardening.py`（**81 项**）逐条覆盖上述 9 项，
+    含真实 tar/zip 包验证危险成员不落盘、伪造 marker/状态文件的三种情形、
+    内网地址拒绝、SHA 固定检查等。`test_launcher.py` 60 → **67 项**
+    （[E3] 断言改为"传 install_dir 能读回来"，因为受限环境下状态落在安装目录内部）。
+    全套：`test_offline` 576、`test_uninstall` 43、`test_cli_hardening` 81、
+    `test_launcher` 67，全部通过。
 
 - 2026-11-25：**`qqbot-cli` 已发到 PyPI，并修掉实测发现的一个 bug（1.0.0 → 1.0.1）**：
   - **发布结果**：`pypi.org/project/qqbot-cli/1.0.0` 已上线（GitHub Actions 两次

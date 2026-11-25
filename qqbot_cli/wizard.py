@@ -137,7 +137,14 @@ def run_wizard(install_dir: str, tag: str = "",
 
 
 def write_config(install_dir: str, config: Dict) -> str:
-    """写 config.json；已有的先备份一份。返回文件路径。"""
+    """写 config.json；已有的先备份一份。返回文件路径。
+
+    **文件里是机器人的 AppSecret、AI 的 API Key 和后台访问令牌**，
+    所以不能按默认 umask（常见 022）建成 0644 —— 共享主机上别的本地用户
+    就能读到。POSIX 下用 `os.open(..., 0o600)` 一步创建，不留中间窗口；
+    Windows 上 `os.open` 的 mode 不影响 ACL，退化为普通写（那边的权限
+    由目录 ACL 决定，不是 umask）。
+    """
     target = os.path.join(install_dir, "config.json")
     if os.path.exists(target):
         backup = target + ".bak"
@@ -146,8 +153,20 @@ def write_config(install_dir: str, config: Dict) -> str:
             print("  原 config.json 已备份为 config.json.bak")
         except OSError:
             pass
-    with open(target, "w", encoding="utf-8") as handle:
-        json.dump(config, handle, ensure_ascii=False, indent=2)
+    payload = json.dumps(config, ensure_ascii=False, indent=2)
+    if os.name == "nt":
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+    else:
+        # 0600：只有自己能读写。O_TRUNC 保证覆盖旧内容。
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        # 文件已存在时 O_CREAT 不会改权限，这里补一次
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
     return target
 
 

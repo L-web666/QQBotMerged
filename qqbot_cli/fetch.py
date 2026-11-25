@@ -10,6 +10,7 @@
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -17,9 +18,13 @@ import tarfile
 import tempfile
 import zipfile
 from typing import Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from . import paths
+
+logger = logging.getLogger("qqbot_cli")
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
 
 # 压缩包上限：程序本体约 1~2 MB，给足余量但不允许无限大
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
@@ -42,23 +47,78 @@ def _requests():
     return requests
 
 
+# 内网/回环地址前缀：即使出现在白名单主机的 Location 里也要拒绝。
+# （白名单主机不会重定向到这些地址；出现就是异常或攻击。）
+_PRIVATE_PREFIXES = (
+    "10.", "127.", "0.", "169.254.",          # 私有网段 / 回环 / 链路本地
+    "192.168.", "172.16.", "172.17.", "172.18.", "172.19.",
+    "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+    "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+)
+
+
+def _host_looks_private(host: str) -> bool:
+    host = (host or "").lower().strip("[]")
+    if host in ("localhost", "::1", "0.0.0.0"):
+        return True
+    return any(host.startswith(prefix) for prefix in _PRIVATE_PREFIXES)
+
+
 def _check_host(url: str) -> None:
+    """校验一个 URL 是否可以从这里发起请求。
+
+    **只允许 HTTPS**，且主机必须在白名单里、不能是内网地址。
+    重定向的每一跳都要单独过这个检查（见 `_get_following_redirects`）。
+    """
     parsed = urlparse(str(url or ""))
-    if parsed.scheme not in ("https", "http"):
-        raise FetchError("只允许 http/https 地址：%s" % url)
+    if parsed.scheme != "https":
+        raise FetchError("只允许 https 地址：%s" % url)
     host = (parsed.hostname or "").lower()
+    if not host:
+        raise FetchError("地址里没有主机名：%s" % url)
+    if _host_looks_private(host):
+        raise FetchError("拒绝访问内网地址：%s" % host)
     if host not in paths.ALLOWED_HOSTS:
         raise FetchError("拒绝从非白名单主机下载：%s" % host)
+
+
+def _get_following_redirects(requests, url: str, timeout: int,
+                             stream: bool = False, headers: Optional[Dict] = None,
+                             max_hops: int = 5):
+    """GET 一个 URL，**手动**跟随重定向，每一跳都重新校验。
+
+    为什么不直接用 `requests` 的自动重定向：它只校验第一次请求的地址，
+    白名单主机返回一个 `Location: http://内网/...` 时会被静默跟随 ——
+    白名单形同虚设。这里关掉自动跟随，逐跳 `_check_host()`。
+    """
+    current = url
+    for _hop in range(max_hops + 1):
+        _check_host(current)
+        response = requests.get(current, timeout=timeout, stream=stream,
+                                headers=headers, allow_redirects=False)
+        if response.status_code not in (301, 302, 303, 307, 308):
+            return response
+        location = response.headers.get("Location") or ""
+        try:
+            response.close()
+        except Exception:
+            pass
+        if not location:
+            raise FetchError("重定向缺少 Location 头：%s" % current)
+        current = urljoin(current, location)
+    raise FetchError("重定向次数过多（超过 %d 次）" % max_hops)
 
 
 def list_releases(timeout: int = 30) -> List[Dict]:
     """取发布列表（新的在前）。"""
     requests = _requests()
-    _check_host(paths.RELEASES_API)
     try:
-        response = requests.get(paths.RELEASES_API, timeout=timeout,
-                                headers={"User-Agent": USER_AGENT,
-                                         "Accept": "application/vnd.github+json"})
+        response = _get_following_redirects(
+            requests, paths.RELEASES_API, timeout,
+            headers={"User-Agent": USER_AGENT,
+                     "Accept": "application/vnd.github+json"})
+    except FetchError:
+        raise
     except Exception as exc:
         raise FetchError("连不上 GitHub：%s" % exc)
     if response.status_code == 404:
@@ -112,12 +172,18 @@ def pick_latest(releases: List[Dict]) -> Optional[Dict]:
 # ---------------------------------------------------------------- 下载
 def download(url: str, target: str, timeout: int = 60,
              progress: Optional[Callable[[int, int], None]] = None) -> str:
-    """把 url 下载到 target，返回 sha256。超过上限立即中止。"""
+    """把 url 下载到 target，返回 sha256。超过上限立即中止。
+
+    重定向**逐跳校验**（见 `_get_following_redirects`），不会跟着
+    白名单主机跳到内网或别的主机去。
+    """
     requests = _requests()
-    _check_host(url)
     try:
-        response = requests.get(url, timeout=timeout, stream=True,
-                                headers={"User-Agent": USER_AGENT})
+        response = _get_following_redirects(
+            requests, url, timeout, stream=True,
+            headers={"User-Agent": USER_AGENT})
+    except FetchError:
+        raise
     except Exception as exc:
         raise FetchError("下载失败：%s" % exc)
     if response.status_code != 200:
@@ -165,17 +231,93 @@ def _quiet_remove(path: str) -> None:
 
 
 # ---------------------------------------------------------------- 解压
+# Windows 保留设备名（组件名主干命中即拒绝，带扩展名也算：NUL.txt 同样是设备）
+_WINDOWS_DEVICE_NAMES = {
+    "con", "prn", "aux", "nul",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+}
+# 上标数字写法也算设备名（COM¹ / LPT² …）
+_SUPERSCRIPT_DIGITS = {"\u00b9": "1", "\u00b2": "2", "\u00b3": "3"}
+
+
+def _bad_component(part: str) -> bool:
+    """单个路径组件是否危险（盘符、ADS、设备名、控制字符、尾随点空格等）。
+
+    **必须逐组件检查，不能只看整个路径的开头**。反例：
+    `a/D:outside.txt` 开头不是盘符，但 Windows 的 `ntpath.join('C:\\x', 'a',
+    'D:outside.txt')` 会得到 `'D:outside.txt'` —— **直接跳出目标目录**。
+    同类还有 `dir/C:/x.txt`、`a/b/c:stream`（ADS）。
+    """
+    if not part:
+        return True
+    if part in (".", ".."):
+        return True
+    # 盘符 / ADS / 任何位置的冒号
+    if ":" in part:
+        return True
+    # 控制字符
+    if any(ord(ch) < 32 for ch in part):
+        return True
+    # Windows 会静默去掉尾随的点与空格，导致"看起来不同其实是同一个文件"
+    if part != part.rstrip(" ."):
+        return True
+    # 设备名：主干（第一个点之前）归一化后命中就是设备
+    stem = part.split(".")[0]
+    normalized = "".join(_SUPERSCRIPT_DIGITS.get(ch, ch) for ch in stem).lower()
+    if normalized in _WINDOWS_DEVICE_NAMES:
+        return True
+    return False
+
+
 def _safe_member(name: str) -> str:
-    """把压缩包成员名规范化成相对路径；不安全的返回空串。"""
+    """把压缩包成员名规范化成相对路径；不安全的返回空串。
+
+    **每个组件都要单独过一遍 `_bad_component()`** —— 只看开头会漏掉
+    「中间组件是盘符」这种能把路径带出目标目录的写法。
+    """
     raw = str(name or "").replace("\\", "/")
     if not raw or raw.startswith("/") or raw.startswith("~"):
         return ""
-    if re.match(r"^[A-Za-z]:", raw):
-        return ""
     parts = [part for part in raw.split("/") if part not in ("", ".")]
-    if any(part == ".." for part in parts):
+    if not parts:
         return ""
+    for part in parts:
+        if _bad_component(part):
+            return ""
     return "/".join(parts)
+
+
+def _within(root: str, target: str) -> bool:
+    """target 规范化后是否仍在 root 之内（防 `..`、盘符、符号链接绕过）。"""
+    try:
+        real_root = os.path.realpath(root)
+        real_target = os.path.realpath(target)
+        return os.path.commonpath([real_root, real_target]) == real_root
+    except (ValueError, OSError):
+        # 不同盘符时 commonpath 会抛 ValueError → 一定不在同一棵树里
+        return False
+
+
+def _has_symlink_parent(root: str, target: str) -> bool:
+    """target 的任一父目录（相对 root）是否是符号链接。
+
+    攻击者可以事先在安装目录里布置 `data -> /etc` 这样的链接，
+    解压时文件就顺着链接写到了外面。
+    """
+    try:
+        root_real = os.path.realpath(root)
+    except OSError:
+        return True
+    current = os.path.dirname(os.path.abspath(target))
+    while True:
+        if os.path.islink(current):
+            return True
+        if os.path.abspath(current) == root_real or \
+                os.path.dirname(current) == current:
+            break
+        current = os.path.dirname(current)
+    return False
 
 
 def _strip_root(names: List[str]) -> str:
@@ -253,6 +395,15 @@ def _extract_tar(archive: str, target_dir: str) -> None:
                 if not relative:
                     continue
                 destination = os.path.join(target_dir, *relative.split("/"))
+                # **落盘前必须确认没跑出 target_dir**。`_safe_member()` 已经逐组件
+                # 挡了盘符/ADS/设备名，但这里再做一次真实路径包含性检查 ——
+                # 双保险，防止任何没想到的写法把文件写到安装目录外面。
+                if not _within(target_dir, destination):
+                    logger.debug("拒绝越界的解压目标：%r -> %r", name, destination)
+                    continue
+                if _has_symlink_parent(target_dir, destination):
+                    logger.debug("拒绝经过符号链接的解压目标：%r", destination)
+                    continue
                 if info.isdir():
                     os.makedirs(destination, exist_ok=True)
                     continue
@@ -294,6 +445,12 @@ def _extract_zip(archive: str, target_dir: str) -> None:
                 if not relative:
                     continue
                 destination = os.path.join(target_dir, *relative.split("/"))
+                if not _within(target_dir, destination):
+                    logger.debug("拒绝越界的解压目标：%r -> %r", name, destination)
+                    continue
+                if _has_symlink_parent(target_dir, destination):
+                    logger.debug("拒绝经过符号链接的解压目标：%r", destination)
+                    continue
                 if info.is_dir():
                     os.makedirs(destination, exist_ok=True)
                     continue

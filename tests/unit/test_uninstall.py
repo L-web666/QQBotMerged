@@ -190,12 +190,15 @@ def main():
 
         print("\n[B5] 卸载后清掉「记住装在哪」")
         paths.remember_install_dir(fourth)
-        check("先能记住", paths.remembered_install_dir() == os.path.abspath(fourth),
-              paths.remembered_install_dir())
+        # 传 install_dir 时一定能读回来 —— 这是"记住"本身是否生效的判据。
+        # （不传参时只有默认安装目录里那份能被扫到，见 paths.remembered_install_dir）
+        check("先能记住",
+              paths.remembered_install_dir(fourth) == os.path.abspath(fourth),
+              paths.remembered_install_dir(fourth))
         cleared = uninstall.forget_state(fourth)
         check("清掉了记录", cleared >= 1, str(cleared))
-        check("读不回来了", paths.remembered_install_dir() == "",
-              paths.remembered_install_dir())
+        check("读不回来了", paths.remembered_install_dir(fourth) == "",
+              paths.remembered_install_dir(fourth))
 
         # ================= C. 跨平台 =================
         print("\n[C1] 三种平台的命令差异")

@@ -119,6 +119,51 @@ def _confirm_target_dir(install_dir: str) -> bool:
         return False
 
 
+def _finish_config_only(install_dir: str, marker: Dict) -> int:
+    """装好的目录只差配置（上次向导被取消）：跑向导 + 出结果，不重新下载。
+
+    程序文件、虚拟环境、依赖都已经就位，重跑一遍下载既慢又浪费；
+    这里只补 `config.json`，然后照常打印地址/令牌并问要不要启动。
+    """
+    print()
+    _info("这个目录已经装好了，只差配置文件（不会重新下载）。")
+    tag = str(marker.get("tag") or "未知")
+    config_path = os.path.join(install_dir, "config.json")
+    existing: Dict = {}
+    try:
+        config = wizard.run_wizard(install_dir, tag, existing)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        _info("向导已取消，配置还没写。之后运行 `qqbot init` 可以接着补。")
+        return 0
+    wizard.write_config(install_dir, config)
+    _ok("已生成 config.json")
+
+    # 清掉 needs_config：配置有了，下次 `qqbot` 直接启动
+    payload = dict(marker)
+    payload.pop("needs_config", None)
+    runner.write_marker(install_dir, payload)
+    paths.remember_install_dir(install_dir)
+
+    python = paths.venv_python(install_dir)
+    versions: Dict = {}
+    if os.path.exists(python):
+        try:
+            versions = runner.verify_dependencies(python)
+        except runner.SetupError:
+            versions = {}
+    wizard.show_summary(install_dir, config, versions)
+
+    try:
+        if wizard.ask_yes("现在启动吗？", default=True):
+            return do_run(install_dir)
+    except (EOFError, KeyboardInterrupt):
+        print()
+    print()
+    _info("之后运行 `qqbot` 就能启动。")
+    return 0
+
+
 def do_install(install_dir: str = "", force_wizard: bool = False,
                upgrade: bool = False, dir_given: bool = False) -> int:
     """下载 + 建环境 + 向导。返回进程退出码。
@@ -136,6 +181,14 @@ def do_install(install_dir: str = "", force_wizard: bool = False,
     already = runner.is_installed(install_dir)
     if already and not upgrade and not force_wizard:
         return do_run(install_dir)
+
+    # **装好了但还缺配置**（上次向导被取消）→ 只补配置，不重新下载。
+    # 这也是 `qqbot` auto 模式在那种情况下的目标路径。
+    if already and not upgrade:
+        marker = runner.read_marker(install_dir)
+        config_path = os.path.join(install_dir, "config.json")
+        if marker.get("needs_config") and not os.path.exists(config_path):
+            return _finish_config_only(install_dir, marker)
 
     # 目录里有东西但不是本程序 → 问清楚再动，避免覆盖用户别的文件
     if not already and not upgrade:
@@ -185,6 +238,14 @@ def do_install(install_dir: str = "", force_wizard: bool = False,
         print()
         python = runner.ensure_venv(install_dir, progress=_info)
         _ok("虚拟环境就绪")
+        # 装依赖之前先看 pip 版本：太旧的 pip 可能信任已出事的证书，
+        # 在不可信网络里装包有被中间人顶替的风险（见 runner.MIN_PIP_VERSION）。
+        pip_info = runner.check_pip(python)
+        if pip_info.get("ok"):
+            if pip_info.get("version"):
+                _ok("pip 版本 %s" % pip_info["version"])
+        else:
+            _info("注意：pip 版本偏低，见上面的说明（不影响继续安装）")
         runner.install_requirements(install_dir, python, progress=_info)
         versions = runner.verify_dependencies(python)
         _ok("依赖安装完成")
@@ -217,6 +278,9 @@ def do_install(install_dir: str = "", force_wizard: bool = False,
                 "sha256": result.get("sha256") or "",
                 "cli_version": __version__,
                 "needs_config": True,
+                "python": "%d.%d.%d" % sys.version_info[:3],
+                "pip": pip_info.get("version") or "",
+                "dependencies": versions,
             })
             paths.remember_install_dir(install_dir)
             _info("向导已取消，程序文件已经装好了。")
@@ -233,6 +297,10 @@ def do_install(install_dir: str = "", force_wizard: bool = False,
         "tag": tag,
         "sha256": result.get("sha256") or "",
         "cli_version": __version__,
+        # 把运行环境记下来：审计和安全排查时不用再猜装的是什么版本
+        "python": "%d.%d.%d" % sys.version_info[:3],
+        "pip": pip_info.get("version") or "",
+        "dependencies": versions,
     })
     # 记下装到了哪：下次 `qqbot` 不带参数就知道去哪启动
     paths.remember_install_dir(install_dir)

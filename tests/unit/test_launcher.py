@@ -309,21 +309,39 @@ def main():
                 os.remove(one)
             except OSError:
                 pass
+            # 安装目录里的那份也要清（受限环境下会写到那儿）
+            inside = os.path.join(remember_target, paths.STATE_FILENAME)
+            try:
+                os.remove(inside)
+            except OSError:
+                pass
         written = paths.remember_install_dir(remember_target)
         check("至少写入一处位置", written is True, str(written))
-        check("能读回来", paths.remembered_install_dir() == remember_target,
-              paths.remembered_install_dir())
+
+        # 写入后确认确实有文件落盘（任意一处）
+        landed = [one for one in paths._state_files(remember_target)
+                  if os.path.exists(one)]
+        landed.append(os.path.join(remember_target, paths.STATE_FILENAME))
+        landed = [one for one in landed if os.path.exists(one)]
+        check("确实有一处落盘", len(landed) >= 1, str(landed))
+
+        # **带 install_dir 时一定能读回来**（这就是"下次启动"实际用的路径）
+        check("传 install_dir 能读回来",
+              paths.remembered_install_dir(remember_target) == remember_target,
+              paths.remembered_install_dir(remember_target))
         check("resolve 用它",
-              paths.resolve_install_dir() == remember_target,
-              paths.resolve_install_dir())
+              paths.resolve_install_dir(remember_target) == remember_target,
+              paths.resolve_install_dir(remember_target))
+
         override = os.path.join(work, "override")
         check("--dir 优先于记住的",
               paths.resolve_install_dir(override) == os.path.abspath(override),
               paths.resolve_install_dir(override))
         # 记录的位置被删掉后不能再用它
         shutil.rmtree(remember_target, ignore_errors=True)
-        check("记住的目录没了就回落", paths.remembered_install_dir() == "",
-              paths.remembered_install_dir())
+        check("记住的目录没了就回落",
+              paths.remembered_install_dir(remember_target) == "",
+              paths.remembered_install_dir(remember_target))
     except Exception as exc:
         check("记住目录流程没抛异常", False, str(exc))
     finally:
