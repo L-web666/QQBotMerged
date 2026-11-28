@@ -161,6 +161,18 @@ class MessageProcessor:
     def process(self, message: Dict[str, Any]):
         runtime = self.runtime
         bot_id = message.get("bot_id") or ""
+
+        # ---------- 0. 机器人自己发的消息：只丢弃，不入库、不回复 ----------
+        #
+        # 平台会把机器人发出的消息也作为群消息事件推回来（author.bot=true）。
+        # 这类事件以前会被当成用户消息入库，导致同一条回复在库里存两份
+        # （out + in），聊天记录里机器人自己的话显示成"用户说的"，
+        # "收到消息数"也虚高。这里在**最前面**拦掉，后面所有统计都不受影响。
+        if message.get("author_is_bot"):
+            self.log.debug("忽略机器人自己发的消息（author.bot=true）bot=%s content=%.40s",
+                           bot_id, (message.get("content") or ""))
+            return
+
         # 一切设置都取"这个机器人自己的配置"（全局配置 + 该机器人的覆盖），
         # 这样在网页上选中哪个机器人，就精确用哪个机器人的 AI/过滤/限速等
         config = runtime.bot_config(bot_id)
@@ -301,7 +313,22 @@ class MessageProcessor:
             self._send_plugin_result(message, plugin_result)
             return
 
-        # ---------- 10. 限速 ----------
+        # ---------- 10. 回复门卫：这条消息值不值得回 ----------
+        # **放在限速和 AI 之前**：
+        #   · 前面的指令/关键词/插件已经处理完了，不该被门卫拦掉；
+        #   · 放在这里能省下一次 AI 调用（省钱也省延迟）；
+        #   · 「只记录不拦截」模式下什么都不影响，消息照常往下走。
+        # 私聊不设门卫 —— 一对一聊天，对方说话就该回应。
+        if is_group:
+            verdict = self._gate_should_reply(message, content, bot_id,
+                                              context_type, context_openid, is_group)
+            if verdict is False:
+                runtime.stats.record("gate_blocked")
+                self.log.info("[%s] 门卫判定不必回复，已跳过：%s", bot_id,
+                              (content or "")[:40])
+                return
+
+        # ---------- 11. 限速 ----------
         interval = float(runtime.group_manager.effective(
             group_openid, "rate_limit_seconds",
             config.float_of("filters", "rate_limit_seconds", default=3)) or 0)
@@ -364,6 +391,74 @@ class MessageProcessor:
             return True
 
         return False
+
+    # ================================================================== 回复门卫
+    def _gate_should_reply(self, message, content, bot_id, context_type,
+                           context_openid, is_group) -> Optional[bool]:
+        """问门卫：这条消息该不该回。
+
+        返回 True=该回（继续往下走）/ False=不该回（丢弃）/ None=照常处理。
+
+        **三种情况一律放行（返回 None）**，不交给门卫判断：
+          · 门卫没开（默认）；
+          · 这条消息 @ 了机器人 —— 人家明确叫你，再判断就是多此一举；
+          · 门卫自己判断失败且配置是 on_error=reply。
+
+        **observe 模式下无论判断结果是什么都返回 None** ——
+        只把判断结果记进日志和统计，不影响实际行为。
+        先跑几天看准不准，再切 enforce。
+        """
+        runtime = self.runtime
+        try:
+            gate = runtime.bot_ai_gate(bot_id)
+        except Exception as exc:
+            self.log.debug("取门卫失败（忽略，照常回复）：%s", exc)
+            return None
+
+        if not gate.enabled:
+            return None
+
+        # @ 了机器人就不再判断：用户已经明确点名了
+        if message.get("is_at_bot"):
+            self.log.debug("[%s] 消息 @ 了机器人，跳过门卫", bot_id)
+            return None
+
+        if not gate.usable():
+            self.log.warning("[%s] 门卫开了但没配置完整（模式=%s，方式=%s），"
+                             "本次按「该回」处理。请到网页「设置 → 回复门卫」检查。",
+                             bot_id, gate.mode, gate.backend)
+            return None
+
+        # 取最近几条上下文 —— 判"怎么办""对"这类消息必须带上下文
+        history = []
+        try:
+            for item in runtime.context_manager.get(bot_id, context_type,
+                                                    context_openid):
+                text = (item.get("content") or "").strip()
+                if not text:
+                    continue
+                history.append(text)
+            history = history[-3:]        # 只要最近 3 条，多了反而干扰
+        except Exception as exc:
+            self.log.debug("门卫取上下文失败（不带上下文继续）：%s", exc)
+
+        decision = gate.judge(content, history)
+
+        if decision is None:
+            # 判断失败：按配置决定。默认当"该回"，避免模型挂了机器人就哑了。
+            if gate.on_error == "skip":
+                self.log.warning("[%s] 门卫判断失败，按配置跳过这条消息", bot_id)
+                return False if gate.mode == "enforce" else None
+            self.log.warning("[%s] 门卫判断失败，按配置照常回复", bot_id)
+            return None
+
+        if gate.mode == "observe":
+            # 只记录不拦截：把判断结果和实际处理都打到日志，方便事后核对
+            self.log.info("[%s] 门卫（观察模式）判断：%s | 实际仍照常处理 | %s",
+                          bot_id, "该回" if decision else "不回", (content or "")[:40])
+            return None
+
+        return decision
 
     # ================================================================== AI
     def _ai_reply(self, message, content, bot_id, target_id, is_group, context_type,

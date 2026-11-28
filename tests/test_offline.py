@@ -3782,8 +3782,16 @@ class GroupPlugin(Star):
           "send.max_file_mb" in (_fill36.missing or [])
           and "send.max_image_mb" in (_fill36.missing or []),
           f"missing={(_fill36.missing or [])[:6]}")
+    # 断言的是"日志里带了键名"这个行为本身，而不是某个具体键必须出现：
+    # 日志按分组归类输出，每个分组超过 3 个键就只列前两个 + "等 N 项"，
+    # 具体哪个键被省略会随默认配置的分组增减而变 —— 绑定具体键名会被
+    # 无关改动打断（加一组配置就挂）。
     check("补全日志带上了键名（不再只报数量）",
-          any("配置已补全" in msg and "send.max_file_mb" in msg for msg in _msgs36),
+          any("配置已补全" in msg and "." in msg and "组" in msg
+              for msg in _msgs36),
+          str(_msgs36)[:200])
+    check("补全日志按分组归类（能看出补了哪几组）",
+          any("配置已补全" in msg and "；" in msg for msg in _msgs36),
           str(_msgs36)[:200])
     check("missing 里记的键确实写进了配置文件（不是只记不写）",
           (_saved36.get("send") or {}).get("max_file_mb")
@@ -4776,6 +4784,85 @@ class GroupPlugin(Star):
           config_manager.get_for_bot(bot_id, "send.message_format")
           == (_ov_back44.get("send") or {}).get("message_format", "text"),
           str(config_manager.get_for_bot(bot_id, "send.message_format")))
+
+    # ------------------------------------------------------------------ [47]
+    print("\n[47] 机器人自己发的消息被平台推回来时不能当用户消息入库")
+    # 平台会把机器人发出的消息也作为群消息事件推回（author.bot=true）。
+    # 发送时已经记了一份 direction="out"，如果这里再当"收到"入库，
+    # 库里就会出现两份一样的内容，聊天记录里机器人自己的话显示成"用户说的"。
+    _grp47 = "GROUP_SELFBOT_47"
+    _conv47 = f"{bot_id}:" + conversation_key("group", _grp47, "MEMBER_47")
+
+    def _count47():
+        return len(runtime.store.get_conversation(_conv47, limit=200))
+
+    _before47 = _count47()
+    _calls_before47 = len(fake.calls)
+    _stats_before47 = dict(runtime.stats.today())
+
+    # ① 机器人自己的消息（author.bot = true）→ 整条丢弃
+    runtime._handle_incoming({
+        "bot_id": bot_id, "type": "group", "group_openid": _grp47,
+        "openid": "BOT_SELF_47", "member_openid": "BOT_SELF_47",
+        "username": "某机器人", "content": "✅ 签到成功！我是机器人发的话",
+        "msg_id": "SELFBOT_47_1", "attachments": [], "quote": {}, "mentions": [],
+        "raw_event": "{}", "author_is_bot": True, "is_at_bot": False,
+    })
+    time.sleep(0.4)
+    check("机器人自己的消息没有入库", _count47() == _before47,
+          "before=%d after=%d" % (_before47, _count47()))
+    check("机器人自己的消息没有被当成用户消息回复",
+          len(fake.calls) == _calls_before47,
+          "新增调用 %d 次" % (len(fake.calls) - _calls_before47))
+    _stats_after47 = dict(runtime.stats.today())
+    check("机器人自己的消息没有算进「收到消息数」",
+          _stats_after47.get("messages", 0) == _stats_before47.get("messages", 0),
+          "before=%s after=%s" % (_stats_before47.get("messages"),
+                                  _stats_after47.get("messages")))
+
+    # ② 真人消息（没有 author_is_bot）→ 照常入库（不能误伤）
+    #    注意：测试环境里配了多个机器人，同一条群消息会按每个机器人各存一份，
+    #    所以这里比较的是"**有没有增加**"，不看具体条数。
+    runtime._handle_incoming({
+        "bot_id": bot_id, "type": "group", "group_openid": _grp47,
+        "openid": "MEMBER_47", "member_openid": "MEMBER_47",
+        "username": "真人", "content": "我是真人说的话 47",
+        "msg_id": "HUMAN_47_1", "attachments": [], "quote": {}, "mentions": [],
+        "raw_event": "{}", "is_at_bot": True,
+    })
+    time.sleep(0.4)
+    _after_human = _count47()
+    check("真人消息照常入库", _after_human > _before47,
+          "before=%d after=%d" % (_before47, _after_human))
+
+    # ③ 显式 author_is_bot=False 也不是"机器人"（默认值不能被误读）
+    runtime._handle_incoming({
+        "bot_id": bot_id, "type": "group", "group_openid": _grp47,
+        "openid": "MEMBER_47", "member_openid": "MEMBER_47",
+        "username": "真人", "content": "作者不是机器人 47",
+        "msg_id": "HUMAN_47_2", "attachments": [], "quote": {}, "mentions": [],
+        "raw_event": "{}", "author_is_bot": False, "is_at_bot": True,
+    })
+    time.sleep(0.4)
+    check("author_is_bot=False 的消息照常入库", _count47() > _after_human,
+          "before=%d after=%d" % (_after_human, _count47()))
+
+    # ④ 网关真的会把 author.bot 传下来（不是只在测试里手填）
+    import inspect as _inspect47
+    from core.gateway import QQGateway as _QQGateway47
+    from core.runtime_pkg import messaging as _messaging47
+
+    _gsrc47 = _inspect47.getsource(_QQGateway47)
+    check("网关从 author.bot 读出 author_is_bot",
+          'author.get("bot")' in _gsrc47 and '"author_is_bot"' in _gsrc47, "")
+
+    # 拦截必须在落库之前（放进 _handle_incoming 开头，而不是只放 process 里）
+    _msg_src = _inspect47.getsource(_messaging47)
+    _idx_check = _msg_src.find("author_is_bot")
+    _idx_save = _msg_src.find("self.store.add(")
+    check("入库入口在落库前就拦掉了机器人消息",
+          _idx_check != -1 and _idx_save != -1 and _idx_check < _idx_save,
+          "author_is_bot@%d store.add@%d" % (_idx_check, _idx_save))
 
     # ------------------------------------------------------------------ 收尾
     runtime.processor.stop()

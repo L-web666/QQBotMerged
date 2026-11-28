@@ -71,9 +71,10 @@ class Runtime(RuntimeConfigMixin, RuntimeMessagingMixin, RuntimeNameMixin, Runti
         self._shutdown_callback = None
         # 调试模式（`--no-bots`）：为 True 时任何配置变化都不会连接 QQ
         self.bots_disabled = False
-        # 按机器人解析出来的配置 / AI 客户端 / 过滤器（配置变化时清空）
+        # 按机器人解析出来的配置 / AI 客户端 / 回复门卫 / 过滤器（配置变化时清空）
         self._bot_configs: Dict[str, Any] = {}
         self._ai_clients: Dict[str, AIClient] = {}
+        self._ai_gates: Dict[str, Any] = {}
         self._message_filters: Dict[str, MessageFilter] = {}
 
         # ---------- 存储 ----------

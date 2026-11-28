@@ -370,6 +370,16 @@ class QQGateway:
             "member_openid": member_openid,
             "unified_openid": openid,
             "username": author.get("username", ""),
+            # **这条是不是机器人发的**（官方在 author 里给了 bot 字段）。
+            #
+            # 机器人自己发的消息（签到结果、抽奖播报、AI 回复）平台也会作为
+            # 群消息事件推回来。以前这里一律标 direction="in"，于是同一条回复
+            # 在库里存两份：一份 out（发送时记的）、一份 in（事件推回来记的）。后果：
+            #   · 网页聊天里机器人自己的话被当成"用户说的话"；
+            #   · 统计里的"收到消息数"虚高；
+            #   · 拿库里的数据做分析时，还得先猜哪些是机器人的。
+            # 下游 message_processor 据此丢弃这类事件，不再入库。
+            "author_is_bot": bool(author.get("bot")),
             # 群成员身份：官方群消息的 author 里自带 member_role（owner / admin / member），
             # 每条消息都有、不需要管理员权限，比群成员接口（要白名单）可靠得多。
             # 私聊的 author 没有这个字段，拿到了就是空串。

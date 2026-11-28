@@ -17,6 +17,7 @@ from core import media_store as media_module
 from core import message_text
 from core import paths
 from core.ai_client import AIClient, load_ai_config
+from core.ai_gate import AIGate
 from core.context_manager import ContextManager
 from core.gateway import DEFAULT_INTENTS, QQGateway
 from core.group_manager import GroupManager
@@ -200,6 +201,38 @@ class RuntimeConfigMixin:
             self._ai_clients.setdefault(bot_id, client)
         return client
 
+    def bot_ai_gate(self, bot_id: str):
+        """按机器人取"回复门卫"（判断这条消息该不该回）。
+
+        **懒创建**：没配 `ai_gate` 时不建对象，也不加载任何模型 ——
+        不能因为多了个功能就让所有用户的机器多花内存。
+        接口地址/密钥留空时自动沿用「AI 服务」那一组（省得填两遍）。
+        """
+        with self._lock:
+            if bot_id in self._ai_gates:
+                return self._ai_gates[bot_id]
+
+        config = self.bot_config(bot_id)
+        # **注意：Config 只有 get(*keys)，没有 section()。**
+        # 以前写成了 config.section("ai_gate")，抛异常后被 except 吞掉，
+        # 结果永远拿到空配置 —— 表现就是"网页上配了 observe，状态里还是 off"。
+        # 这里用 get("ai_gate") 取整段。
+        try:
+            section = config.get("ai_gate") or {}
+        except Exception:
+            section = {}
+        section = dict(section) if isinstance(section, dict) else {}
+
+        if not str(section.get("base_url") or "").strip():
+            section["base_url"] = config.str_of("ai", "base_url", default="")
+        if not str(section.get("api_key") or "").strip():
+            section["api_key"] = config.str_of("ai", "api_key", default="")
+
+        gate = AIGate(section, logger_obj=self.log)
+        with self._lock:
+            self._ai_gates.setdefault(bot_id, gate)
+        return gate
+
     def ai_status(self, bot_id: str = "") -> Dict[str, Any]:
         """内置 AI 的可用状态（网页启动提示、状态页、`/health` 用）。
 
@@ -247,6 +280,52 @@ class RuntimeConfigMixin:
         base["scope"] = "none"
         return base
 
+    def ai_gate_status(self, bot_id: str = "") -> Dict[str, Any]:
+        """回复门卫的状态与判断统计（状态页显示用）。
+
+        `bot_id` 非空 → 这个机器人的门卫（模式、是否可用、问了多少次、判了哪些）。
+        `bot_id` 为空 → 给整体概况：把所有机器人的累计次数加起来，
+                        模式取"最激进"的那个（enforce > observe > off）——
+                        只要有一个机器人真在拦，总览就该显示它开着。
+        """
+        target = str(bot_id or "").strip()
+        if target:
+            try:
+                return self.bot_ai_gate(target).status()
+            except Exception as exc:
+                self.log.debug("[%s] 读取门卫状态失败：%s", target, exc)
+                return {"mode": "off", "enabled": False, "usable": False,
+                        "stats": {}, "last_error": str(exc)}
+
+        # 整体概况
+        total = {"asked": 0, "yes": 0, "no": 0, "failed": 0}
+        modes = []
+        usable_any = False
+        errors = []
+        for one in list(getattr(self, "bots", {}).keys()):
+            try:
+                status = self.bot_ai_gate(one).status()
+            except Exception:
+                continue
+            modes.append(status.get("mode") or "off")
+            if status.get("usable"):
+                usable_any = True
+            if status.get("last_error"):
+                errors.append(status["last_error"])
+            for key in total:
+                total[key] += int((status.get("stats") or {}).get(key, 0) or 0)
+
+        order = {"off": 0, "observe": 1, "enforce": 2}
+        mode = max(modes, key=lambda m: order.get(m, 0)) if modes else "off"
+        return {
+            "mode": mode,
+            "enabled": mode != "off",
+            "usable": usable_any,
+            "stats": total,
+            "scopes": "all",
+            "last_error": errors[0] if errors else "",
+        }
+
     def bot_message_filter(self, bot_id: str) -> MessageFilter:
         """按机器人取消息过滤器（关键词回复/敏感词可以各自配置）。"""
         with self._lock:
@@ -272,6 +351,8 @@ class RuntimeConfigMixin:
         with self._lock:
             self._bot_configs.clear()
             self._ai_clients.clear()
+            # 门卫也要重建：模式/提示词/模型路径都可能改了
+            self._ai_gates.clear()
             self._message_filters.clear()
 
     # ================================================================== 发送出口

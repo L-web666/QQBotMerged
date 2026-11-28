@@ -299,6 +299,8 @@ class RuntimeLifecycleMixin:
             "bot_count": len(self.bots),
             "online_count": sum(1 for bot in self.bots.values() if bot.gateway.ready),
             "ai": self.ai_status(bot_id),
+            # 回复门卫的判断统计（网页状态页要显示"该回/不回/失败"各多少次）
+            "ai_gate": self.ai_gate_status(bot_id),
             "storage": {
                 # 注意 MemoryStore 是 SQLiteStore 的子类：必须先判 MemoryStore，
                 # 否则内存库也会被报成 "sqlite"（网页上就看不出"重启即丢消息"）。

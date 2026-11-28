@@ -606,7 +606,12 @@ def create_app(config_manager, logger_obj: logging.Logger = None) -> Flask:
         })
 
     # ---------------- 静态资源（受限） ----------------
-    @app.route("/static/<path:filename>")
+    # **endpoint 必须叫 `static`**：模板里写的是 `url_for('static', filename=...)`，
+    # 而 `Flask(static_folder=None)` 之后 Flask 不再注册 `static` 端点。
+    # 不显式指定的话，这个路由的端点名会是函数名 `static_file`，
+    # `url_for('static')` 就会抛 BuildError —— 整个首页渲染失败、返回 500
+    # （页面直接打不开，但所有接口测试都是绿的，很难发现）。
+    @app.route("/static/<path:filename>", endpoint="static")
     def static_file(filename: str):
         """前端资源（CSS/JS/图标）。
 

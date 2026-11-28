@@ -21,6 +21,8 @@ SECTION_LABELS: Dict[str, Dict[str, str]] = {
     "web": {"label": "网页后台", "icon": "🌐", "desc": "后台监听地址、端口与访问令牌"},
     "bots": {"label": "机器人账号", "icon": "🤖", "desc": "支持多个 QQ 机器人（各自独立连接）"},
     "ai": {"label": "AI 服务", "icon": "🧠", "desc": "OpenAI 兼容接口、模型与人设"},
+    "ai_gate": {"label": "回复门卫", "icon": "🚦",
+                "desc": "先判断「这条消息值不值得回」，避免对凑热闹的话乱接"},
     "reply": {"label": "回复与消息", "icon": "💬", "desc": "回复策略、分段、队列、无意义过滤"},
     "filters": {"label": "过滤与安全", "icon": "🛡️", "desc": "关键词回复、敏感词、回复限速"},
     "features": {"label": "功能开关", "icon": "🎛️", "desc": "群聊 @ 要求、图片留存、群成员管理"},
@@ -96,6 +98,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "no_ai_reply": "抱歉，我暂时没办法回答这个问题。",
         "vision_enabled": True,
         "vision_prompt": "请用中文描述这张图片的内容。",
+    },
+
+    # ---------------- 回复门卫（该不该回） ----------------
+    # 用一个小模型先判断「这条消息值不值得回」，避免机器人对"666""哈哈哈"
+    # 这类消息也一本正经地接话。默认关闭，行为和以前完全一样。
+    "ai_gate": {
+        "mode": "off",
+        "backend": "llm",
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "timeout_seconds": 10,
+        "on_error": "reply",
+        "prompt": "",
+        "local_model": "",
+        "local_config": "",
     },
 
     # ---------------- 回复与消息 ----------------
@@ -321,6 +339,34 @@ FIELDS: Dict[str, Dict[str, Any]] = {
     "ai.vision_enabled": _f("bool", "图片识别", "收到图片时交给多模态模型描述"),
     "ai.vision_prompt": _f("str", "图片识别提示词", "发给多模态模型的默认提示"),
 
+    # ---------------- ai_gate（回复门卫） ----------------
+    "ai_gate.mode": _f("enum", "工作模式",
+                       "建议先选「只记录不拦截」跑几天，看判断准不准再改成「真的拦」",
+                       options=[["off", "不启用"],
+                                ["observe", "只记录不拦截"],
+                                ["enforce", "真的拦"]]),
+    "ai_gate.backend": _f("enum", "判断方式",
+                          "llm 不用训练数据，现在就能用；local 更快更省但要自己训",
+                          options=[["llm", "用对话模型判断"],
+                                   ["local", "用本地小模型"]]),
+    "ai_gate.base_url": _f("str", "判断模型接口地址",
+                           "留空=沿用上面「AI 服务」的地址"),
+    "ai_gate.api_key": _f("secret", "判断模型密钥", "留空=沿用上面「AI 服务」的密钥"),
+    "ai_gate.model": _f("str", "判断模型名称",
+                        "建议用便宜或本地的小模型（判断任务不需要大模型）"),
+    "ai_gate.timeout_seconds": _f("int", "判断超时", "秒；超时就按下面的失败策略处理",
+                                  min=3, max=120),
+    "ai_gate.on_error": _f("enum", "判断失败时",
+                           "推荐「当成该回」：模型挂了机器人还能正常工作",
+                           options=[["reply", "当成该回"],
+                                    ["skip", "当成不回"]]),
+    "ai_gate.prompt": _f("textarea", "判断提示词",
+                         "留空用内置规则。想调判断标准就改这里"),
+    "ai_gate.local_model": _f("str", "本地模型文件",
+                              "tools/train_gate.py 产出的 .pkl 路径（判断方式选 local 时用）"),
+    "ai_gate.local_config": _f("str", "本地模型配置",
+                               "与 .pkl 同名的 .json 路径"),
+
     # ---------------- reply ----------------
     "reply.require_mention": _f("bool", "群聊需 @ 才回复", "关闭后回复群内所有消息（需平台权限）"),
     "reply.context_enabled": _f("bool", "启用上下文记忆", "按用户/群分别保存历史"),
@@ -507,7 +553,7 @@ SECRET_MASK = "********"
 
 # 每个机器人自己的设置（在「设置」页里，这些分组作用于**当前选中的机器人**）
 # 未列出的分组都是全局设置（网页后台 / 存储 / 日志 / 界面 / 云同步 …）
-PER_BOT_SECTIONS = ("ai", "reply", "filters", "features", "send", "scheduler",
+PER_BOT_SECTIONS = ("ai", "ai_gate", "reply", "filters", "features", "send", "scheduler",
                     "panels", "plugins", "security")
 
 # 分组虽然按机器人隔离，但这两项是"整台程序"的开关/目录：按机器人覆盖它们没有意义
@@ -518,6 +564,8 @@ GLOBAL_ONLY_PATHS = {"plugins.enabled", "plugins.dir", "plugins.sandbox"}
 SCOPE_HINTS: Dict[str, str] = {
     "bots": "这里配置每个机器人的账号与连接参数；选中的机器人会作用于整个后台",
     "ai": "以下设置只作用于**当前选中的机器人**",
+    "ai_gate": "以下设置只作用于**当前选中的机器人**：每个机器人可以有各自的判断模型与提示词。"
+               "建议先用「只记录不拦截」跑几天，看判断准不准再改成「真的拦」",
     "reply": "以下设置只作用于**当前选中的机器人**",
     "filters": "以下设置只作用于**当前选中的机器人**",
     "features": "以下设置只作用于**当前选中的机器人**",
@@ -593,6 +641,9 @@ SECTION_FIELDS: Dict[str, List[str]] = {
     "ai": ["ai.enabled", "ai.api_key", "ai.base_url", "ai.model", "ai.temperature", "ai.max_tokens",
            "ai.timeout_seconds", "ai.no_ai_reply", "ai.system_prompt",
            "ai.vision_enabled", "ai.vision_prompt"],
+    "ai_gate": ["ai_gate.mode", "ai_gate.backend", "ai_gate.base_url", "ai_gate.api_key",
+                "ai_gate.model", "ai_gate.timeout_seconds", "ai_gate.on_error",
+                "ai_gate.prompt", "ai_gate.local_model", "ai_gate.local_config"],
     "reply": ["reply.require_mention", "reply.context_enabled", "reply.max_history",
               "reply.max_segment_length", "reply.max_queue_size", "reply.filter_meaningless",
               "reply.strip_markdown", "reply.quote_reply"],
@@ -637,9 +688,9 @@ SECTION_FIELDS: Dict[str, List[str]] = {
     "context": ["context.enabled", "context.max_history"],
 }
 
-SECTION_ORDER = ["bots", "web", "ai", "reply", "filters", "features", "send", "storage",
-                 "receiver", "scheduler", "panels", "plugins", "update", "cloud", "security",
-                 "logging", "ui", "context"]
+SECTION_ORDER = ["bots", "web", "ai", "ai_gate", "reply", "filters", "features", "send",
+                 "storage", "receiver", "scheduler", "panels", "plugins", "update", "cloud",
+                 "security", "logging", "ui", "context"]
 
 
 def sections_payload() -> List[Dict[str, Any]]:

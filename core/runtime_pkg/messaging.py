@@ -65,6 +65,19 @@ class RuntimeMessagingMixin:
                             "event": message.get("event")})
             return
 
+        # **机器人自己发的消息：整个丢掉，不入库、不计统计、不回复。**
+        #
+        # 平台会把机器人发出的消息也作为群消息事件推回来（author.bot=true）。
+        # 发送时 `_record_outgoing()` 已经记了一份 out，如果这里再当"收到"入库，
+        # 库里就会出现两份一样的内容（一份 out、一份 in）。
+        #
+        # 这个判断必须放在**落库和统计之前** —— 只放在 message_processor.process()
+        # 里是不够的：那是 submit 之后才跑的，那时消息已经写进库了。
+        if message.get("author_is_bot"):
+            self.log.debug("忽略机器人自己发的消息（author.bot=true）bot=%s msg_id=%s",
+                           message.get("bot_id"), message.get("msg_id"))
+            return
+
         bot_id = message.get("bot_id") or ""
         msg_type = message.get("type") or "private"
         group_openid = message.get("group_openid") or ""

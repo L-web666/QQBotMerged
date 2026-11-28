@@ -143,8 +143,20 @@ def main():
         check("static 路由恰好 1 条", len(static_rules) == 1,
               str([str(r) for r in static_rules]))
         if static_rules:
-            check("走的是受限版本（endpoint=static_file）",
-                  static_rules[0].endpoint == "static_file", static_rules[0].endpoint)
+            # 真正要验证的是"**走的函数是受限的那个**"，而不是端点叫什么名字。
+            #
+            # 端点名必须叫 `static`：模板里写的是 `url_for('static', ...)`，
+            # 而 Flask(static_folder=None) 之后 Flask 不再注册 static 端点，
+            # 自定义路由不显式指定 endpoint 的话 url_for 会抛 BuildError ——
+            # 首页整页 500（这个故障真实发生过）。所以这里改判"函数是 static_file"。
+            view = app.view_functions.get(static_rules[0].endpoint)
+            check("走的是受限版本（函数是 static_file）",
+                  getattr(view, "__name__", "") == "static_file",
+                  f"endpoint={static_rules[0].endpoint} "
+                  f"func={getattr(view, '__name__', '?')}")
+            check("端点名是 static（模板 url_for 要用）",
+                  static_rules[0].endpoint == "static",
+                  static_rules[0].endpoint)
 
         print("\n[B5] 不带令牌也能取正常资源（前端 <link>/<script> 带不了头）")
         for url in ("/static/css/app.css", "/static/js/util.js"):
@@ -237,6 +249,74 @@ def main():
             json.dump(cfg3, handle, ensure_ascii=False)
         kept = load_config(path3).config.list_of("security", "admin_openids", default=[])
         check("config 本体的全局值没被抹掉", kept == ["GLOBAL-ONLY"], str(kept))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # ================================================================== D
+    # 首页能渲染（这是真实的线上故障：页面打不开返回 500，但接口测试全绿）
+    print("\n[D] 首页渲染与静态资源端点名")
+    root = os.path.join(PROJECT, "data", "_selftest", "unit_static_index")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root, exist_ok=True)
+    try:
+        import logging
+        from core.config_manager import load_config as _load
+        from core.runtime import Runtime
+        from web.server import create_app
+
+        cfg_path = os.path.join(root, "config.json")
+        cfg = _load(cfg_path)
+        cfg.set_path("web.token", "")
+        cfg.set_path("storage.db_path", os.path.join(root, "messages.db"))
+        cfg.set_path("storage.media_dir", os.path.join(root, "media"))
+        log = logging.getLogger("static_index_test")
+        log.setLevel(logging.CRITICAL)
+
+        rt = Runtime(cfg, log)
+        app = create_app(cfg, log)
+        app.attach_state(rt, log)
+        client = app.test_client()
+
+        try:
+            # ① 模板里的 url_for('static') 必须能解析。
+            #    Flask(static_folder=None) 之后 Flask 不再注册 static 端点，
+            #    自定义路由若没写 endpoint="static"，url_for 就抛 BuildError，
+            #    首页整页 500 —— 这个故障曾经真实发生过。
+            with app.test_request_context():
+                from flask import url_for
+                try:
+                    built = url_for("static", filename="css/app.css")
+                    check("url_for('static') 能解析", True, "")
+                    check("解析出的地址正确", built == "/static/css/app.css", built)
+                except Exception as exc:
+                    check("url_for('static') 能解析", False, str(exc))
+                    built = ""
+
+            # ② 首页本身能打开
+            page = client.get("/")
+            check("首页返回 200", page.status_code == 200,
+                  f"status={page.status_code}")
+            html = page.data.decode("utf-8", errors="replace") \
+                if page.status_code == 200 else ""
+
+            # ③ 模板渲染出的每个 /static/ 地址都能真的取到
+            refs = re.findall(r'(?:href|src)="(/static/[^"]+)"', html)
+            check("模板渲染出了静态资源地址", len(refs) >= 5, f"count={len(refs)}")
+            missing = []
+            for ref in refs:
+                if client.get(ref).status_code != 200:
+                    missing.append(ref)
+            check("每个静态资源都能取到", missing == [], str(missing[:5]))
+
+            # ④ 白名单没被这次改动削弱（安全不能为了修 bug 让步）
+            blocked = ["/static/../config.json", "/static/js/util.js::$DATA"]
+            leaked = [p for p in blocked if client.get(p).status_code != 404]
+            check("静态白名单仍然拦截穿越与 ADS", leaked == [], str(leaked))
+        finally:
+            try:
+                rt.store.close()
+            except Exception:
+                pass
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

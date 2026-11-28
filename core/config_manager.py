@@ -361,10 +361,23 @@ class ConfigManager:
                     except OSError as exc:
                         logger.error("写入配置文件失败: %s", exc)
                 if added and not skip_write:
-                    # 只报数量时根本查不出补了哪个键，这里带上键名（最多列前 10 个）
-                    shown = "、".join(added[:10])
-                    more = f" 等 {len(added)} 项" if len(added) > 10 else ""
-                    logger.info("配置已补全 %d 个缺失项：%s%s", len(added), shown, more)
+                    # 只报数量时根本查不出补了哪个键，这里带上键名。
+                    #
+                    # **按分组归类输出**，而不是简单的"前 10 个 + 等 N 项"：
+                    # 以前只列前 10 个，分组一多（比如新加一组）后面的就看不见了，
+                    # 排查"到底补了什么"还得再去翻文件。现在每个分组最多列 3 个键，
+                    # 一眼能看出是哪几组被补了。
+                    by_section: Dict[str, List[str]] = {}
+                    for key in added:
+                        by_section.setdefault(key.split(".")[0], []).append(key)
+                    parts = []
+                    for keys in by_section.values():
+                        if len(keys) <= 3:
+                            parts.append("、".join(keys))
+                        else:
+                            parts.append("%s 等 %d 项" % ("、".join(keys[:2]), len(keys)))
+                    logger.info("配置已补全 %d 个缺失项（%d 组）：%s",
+                                len(added), len(by_section), "；".join(parts))
                 if migrated:
                     logger.info("已按 QQ 官方限制放宽媒体大小上限：%s（可在「设置 → 发送策略」调整）",
                                 "、".join(migrated))

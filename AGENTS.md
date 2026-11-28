@@ -36,7 +36,7 @@
 
 ## 当前状态
 
-- 程序版本：**v1.5.0**（唯一来源 `core/version.py` 的 `__version__`；
+- 程序版本：**v1.6.0**（唯一来源 `core/version.py` 的 `__version__`；
   网页侧栏/关于页/接口都从这里取）
 
 ### 常用命令
@@ -51,7 +51,7 @@ python run.py --port 9000      # 临时换端口
 ### 测试
 
 ```bash
-python tests/test_offline.py       # 端到端 576 项（集成/端到端，跑得慢）
+python tests/test_offline.py       # 端到端 584 项（集成/端到端，跑得慢）
 python tests/check_frontend.py     # 前端契约：元素 id / 字段类型 / 分组完整性
 python tests/test_instance_lock.py # 单实例锁
 ```
@@ -233,7 +233,7 @@ node tests/dom_test_settings_nav_render.js  # 导航真实渲染 15 项
 ### ① 常规回归（每次改代码都要跑）
 
 ```bash
-python tests/test_offline.py       # 端到端 576 项
+python tests/test_offline.py       # 端到端 584 项
 python tests/check_frontend.py     # 前端契约
 python tests/test_instance_lock.py # 单实例锁
 python run.py --check              # 装配自检
@@ -274,7 +274,7 @@ python -m venv /tmp/clean_check
 Windows 上路径是 `/tmp/clean_check/Scripts/python.exe`。
 
 **判定标准**：干净环境的结果必须和开发机**完全一致**
-（同样是 576 项通过）。少过一项，多半就是某个依赖没写进 `requirements.txt`。
+（同样是 584 项通过）。少过一项，多半就是某个依赖没写进 `requirements.txt`。
 
 > 这条已经在 CI 里自动化了：`.github/workflows/publish-cli.yml` 的 `test` job
 > 会在干净的 ubuntu runner 上跑一遍。**但 CI 只在发版时跑**，
@@ -361,15 +361,18 @@ git grep --cached -n -E "gho_|sk-[A-Za-z0-9]{20,}"   # 密钥（exit 1 = 没有�
 > **本机路径**（`C:\Users\...`、`/home/...` 之类）、实例环境的操作过程、截图来源。
 > 只写「改了什么 + 为什么改 + 怎么验证」。
 
+- **2026-11-28** — **v1.6.0**：新增「回复门卫」（`core/ai_gate.py`，判断群消息值不值得回，
+  三种模式 off/observe/enforce，网页状态页有统计）；**修首页 500**
+  （`url_for('static')` 因自定义路由没写 `endpoint="static"` 而报 BuildError，
+  整页打不开但测试全绿 —— 已补渲染测试）；**修机器人消息被当成用户消息入库**
+  （`author.bot=true` 要在落库**之前**拦）；新增 `tools/anonymize.py` + `tools/train_gate.py`。
+  `test_offline` 584 / `test_static_deps` 129 / `test_ai_gate` 69。详见 CHANGELOG。
 - **2026-11-26** — 文档全面审查，修掉 5 处问题：测试项数漂移 3 处
   （`test_offline` 575→576、`test_plugin_safety` 26→28、`test_instance_lock` 12→10）、
   README §7 与 `plugins/README.md` 重复示例代码（改为后者唯一权威）、
   CHANGELOG 5 处「上一轮」、`AI_INDEX` 测试章节只列 4/30 且重复列出、
   以及本文件「不要读超 300 行」与自身冲突（已改 500 行 + 本文件例外）。
   `test_readme_toc` 21 → **27 项**（新增测试项数校验，防复发）。详见 CHANGELOG。
-- **2026-11-25** — 启动器说明随包分发：`qqbot_cli/PACKAGING.md` 与仓库根那份**内容必须一致**，
-  `[tool.setuptools.package-data]` 已声明，`qqbot --help` 会打出它的路径。
-  改根那份记得同步复制（测试 [J] 会查）。详见 CHANGELOG。
 
 ---
 

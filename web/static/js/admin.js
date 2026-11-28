@@ -27,9 +27,36 @@
       (cls || '') + '">' + U.esc(value === undefined || value === null ? '--' : value) + '</div></div>';
   }
 
+  /* 回复门卫那一格的文案。
+     三种模式要说得让人一眼看懂"现在到底拦不拦"：
+       off      → 已关闭（老行为：来的消息都回）
+       observe  → 只记录不拦截（还没真的拦）
+       enforce  → 正在拦截（真的会不回）
+     统计只有真问过才会有数字，没问过就显示"还没判断过"。 */
+  function gateText(gate) {
+    if (!gate || !gate.enabled) {
+      return { text: '已关闭', cls: 'warn-text' };
+    }
+    var stats = gate.stats || {};
+    var asked = stats.asked || 0;
+    if (!gate.usable) {
+      return { text: '开了但没配置完整', cls: 'warn-text' };
+    }
+    var head = gate.mode === 'enforce' ? '正在拦截' : '只记录不拦截';
+    if (!asked) {
+      return { text: head + ' · 还没判断过', cls: 'ok-text' };
+    }
+    var detail = asked + ' 次：' +
+      (stats.yes || 0) + ' 该回 / ' +
+      (stats.no || 0) + ' 不回' +
+      (stats.failed ? ' / ' + stats.failed + ' 失败' : '');
+    return { text: head + ' · ' + detail, cls: stats.failed ? 'warn-text' : 'ok-text' };
+  }
+
   function loadStatus() {
     return U.getJSON('/api/admin/status').then(function (data) {
       var grid = U.el('statusGrid');
+      var _gate = gateText(data.ai_gate);
       grid.innerHTML = [
         kv('运行时长', U.humanDuration(data.uptime_seconds)),
         kv('当前访问地址', data.web_url || '--'),
@@ -39,6 +66,7 @@
            ? ((data.ai.model || '可用') + (data.ai.bot_name ? ' · ' + data.ai.bot_name : ''))
            : (data.ai && data.ai.enabled ? '未配置完整' : '已关闭'),
            data.ai && data.ai.usable ? 'ok-text' : 'warn-text'),
+        kv('回复门卫', _gate.text, _gate.cls),
         kv('存储', (data.storage && data.storage.kind === 'sqlite' ? 'SQLite' : '内存') +
            ' · ' + ((data.storage && data.storage.messages) || 0) + ' 条消息'),
         kv('会话数', (data.storage && data.storage.conversations) || 0),
@@ -52,6 +80,14 @@
            data.media && data.media.save_enabled ? 'ok-text' : 'warn-text'),
         kv('服务器时间', data.beijing_time)
       ].join('');
+
+      // 门卫出过错时单独提示一句（比如模型连不上），否则用户只能翻日志
+      if (data.ai_gate && data.ai_gate.enabled && data.ai_gate.last_error) {
+        U.el('statusGrid').insertAdjacentHTML('beforeend',
+          '<div class="hint warn-text">⚠️ 回复门卫最近一次判断失败：' +
+          U.esc(String(data.ai_gate.last_error).slice(0, 200)) +
+          '（失败的会按「设置 → 回复门卫 → 判断失败时」的策略处理）</div>');
+      }
 
       if (data.bots_disabled) {
         U.el('statusGrid').insertAdjacentHTML('beforeend',
